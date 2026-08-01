@@ -1,4 +1,5 @@
-from flask import Flask, request, jsonify, send_from_directory, abort
+# app.py (API-only, no static serving)
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 import psycopg2
@@ -8,23 +9,16 @@ import secrets
 import datetime
 import requests
 import logging
-from typing import Optional
 
-# -------------------------
-# App & logging
-# -------------------------
 logging.basicConfig(level=logging.INFO)
-app = Flask(__name__, static_folder="static", static_url_path="/static")
-CORS(app)
+app = Flask(__name__)
+# In production, restrict origins instead of "*"
+CORS(app)  
 
-# -------------------------
-# Config (set in environment)
-# -------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 FROM_EMAIL = os.getenv("FROM_EMAIL")
 PORT = int(os.getenv("PORT", 5000))
-# Optional test key for /_send-test-email route
 TEST_EMAIL_KEY = os.getenv("TEST_EMAIL_KEY")
 
 if not DATABASE_URL:
@@ -33,11 +27,7 @@ if not DATABASE_URL:
 if not RESEND_API_KEY or not FROM_EMAIL:
     logging.warning("RESEND_API_KEY and/or FROM_EMAIL not set — send_email will fail until they are provided")
 
-# -------------------------
-# Database helpers
-# -------------------------
 def get_db():
-    # psycopg2 connection; using sslmode=require matches many managed Postgres providers
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def init_db():
@@ -61,20 +51,14 @@ def init_db():
                 expires_at TIMESTAMP
             )
             """)
-        # commit on context manager exit
 
 init_db()
 
-# -------------------------
-# Utilities
-# -------------------------
 def generate_code(prefix: str, digits: int = 6) -> str:
-    """Generate a short unpredictable code with a prefix."""
     number = secrets.randbelow(10 ** digits)
     return f"{prefix}{number:0{digits}d}"
 
 def send_email(to_email: str, code: str) -> bool:
-    """Send email via Resend. Returns True on success. Logs response details for debugging."""
     if not RESEND_API_KEY or not FROM_EMAIL:
         logging.error("Email not sent: RESEND_API_KEY or FROM_EMAIL missing")
         return False
@@ -111,21 +95,10 @@ def _required_fields(data: dict, *fields):
         return False, f"Missing fields: {', '.join(missing)}"
     return True, None
 
-# -------------------------
-# Static pages (serve from static/)
-# -------------------------
 @app.route("/", methods=["GET"])
-def root():
-    # serve setup-signin.html from the static folder
-    return send_from_directory(app.static_folder, "setup-signin.html")
+def home():
+    return jsonify({"message": "API running"}), 200
 
-@app.route("/verify.html", methods=["GET"])
-def serve_verify_html():
-    return send_from_directory(app.static_folder, "verify.html")
-
-# -------------------------
-# Routes (API)
-# -------------------------
 @app.route("/register", methods=["POST"])
 def register():
     data = request.get_json(silent=True) or {}
@@ -160,7 +133,6 @@ def register():
         return jsonify({"message": "User registered; verification code sent if email delivery succeeded."}), 201
 
     except psycopg2.errors.UniqueViolation:
-        # duplicate username or email
         logging.info("Attempt to register an existing user: %s / %s", username, email)
         return jsonify({"error": "Username or email already exists"}), 409
     except Exception as e:
@@ -169,7 +141,6 @@ def register():
 
 @app.route("/verify-email", methods=["POST"])
 def verify_email():
-    """Verify a signup code. Expects json with 'email' and 'code'."""
     data = request.get_json(silent=True) or {}
     ok, err = _required_fields(data, "email", "code")
     if not ok:
@@ -238,7 +209,6 @@ def login():
         if not check_password_hash(password_hash, password):
             return jsonify({"error": "Wrong password"}), 401
 
-        # TODO: return a session token / JWT here
         return jsonify({"message": "Login successful", "user_id": user_id}), 200
 
     except Exception as e:
@@ -282,10 +252,6 @@ def request_reset():
 
 @app.route("/reset-password", methods=["POST"])
 def reset_password():
-    """
-    Expect JSON with: email, code, new_password
-    Validates the reset code before changing the password.
-    """
     data = request.get_json(silent=True) or {}
     ok, err = _required_fields(data, "email", "code", "new_password")
     if not ok:
@@ -327,12 +293,8 @@ def reset_password():
         logging.exception("Reset password failed: %s", e)
         return jsonify({"error": "Internal server error"}), 500
 
-# -------------------------
-# Optional: test email endpoint (safe-guarded)
-# -------------------------
 @app.route("/_send-test-email", methods=["POST"])
 def send_test_email():
-    """Send a test email. Protect by TEST_EMAIL_KEY env var (set this to call)."""
     if not TEST_EMAIL_KEY:
         return jsonify({"error": "Not available"}), 404
 
@@ -352,9 +314,5 @@ def send_test_email():
     else:
         return jsonify({"error": "Failed to send test email"}), 500
 
-# -------------------------
-# Run
-# -------------------------
 if __name__ == "__main__":
-    # Use 0.0.0.0 so the container is reachable; PORT can be provided by the environment
     app.run(host="0.0.0.0", port=PORT)
