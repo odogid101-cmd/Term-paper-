@@ -180,6 +180,46 @@ def verify_email():
         logging.exception("Email verification failed: %s", e)
         return jsonify({"error": "Internal server error"}), 500
 
+@app.route("/resend-verification", methods=["POST"])
+def resend_verification():
+    """
+    POST { email }
+    Generates a new signup verification code and sends it to the email.
+    """
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return jsonify({"error": "Missing email"}), 400
+
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM users WHERE email=%s", (email,))
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "User not found"}), 404
+                user_id = row[0]
+
+                # create new verification code
+                code = generate_code("ver", digits=6)
+                expires = datetime.datetime.utcnow() + datetime.timedelta(minutes=10)
+                cur.execute("""
+                    INSERT INTO email_verifications (user_id, code, purpose, expires_at)
+                    VALUES (%s, %s, %s, %s)
+                """, (user_id, code, "signup", expires))
+
+        sent = send_email(email, code)
+        if not sent:
+            logging.warning("Verification email could not be delivered to %s", email)
+            return jsonify({"error": "Failed to send email"}), 500
+
+        return jsonify({"message": "Verification code resent"}), 200
+
+    except Exception as e:
+        logging.exception("Resend verification failed: %s", e)
+        return jsonify({"error": "Internal server error"}), 500
+
+
 @app.route("/login", methods=["POST"])
 def login():
     data = request.get_json(silent=True) or {}
