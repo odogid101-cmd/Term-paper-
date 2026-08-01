@@ -1,10 +1,10 @@
 <!DOCTYPE html>
 <html>
 <head>
-<title>Verify</title>
+<title>Verify Email</title>
 <style>
 body { background:#0f172a; color:white; display:flex; justify-content:center; align-items:center; height:100vh;}
-.box { background:#1e293b; padding:25px; border-radius:10px;}
+.box { background:#1e293b; padding:25px; border-radius:10px; width:300px;}
 input, button { width:100%; padding:10px; margin:10px 0;}
 button { background:#22c55e; color:white;}
 </style>
@@ -13,9 +13,13 @@ button { background:#22c55e; color:white;}
 <body>
 
 <div class="box">
-<h2>Enter Code</h2>
-<input id="code" placeholder="ver123">
+<h2>Email Verification</h2>
+
+<input id="email" placeholder="Enter your email">
+<input id="code" placeholder="Enter code (ver123456)">
+
 <button onclick="verify()">Verify</button>
+
 <p id="msg"></p>
 </div>
 
@@ -23,10 +27,13 @@ button { background:#22c55e; color:white;}
 const API = "https://term-paper-n4kl.onrender.com";
 
 async function verify(){
-    let res = await fetch(API+"/verify",{
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({code:code.value})
+    let res = await fetch(API + "/verify-email", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+            email: email.value,
+            code: code.value
+        })
     });
 
     let r = await res.json();
