@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory, abort
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 import psycopg2
@@ -8,13 +8,14 @@ import secrets
 import datetime
 import requests
 import logging
+from typing import Optional
 
 # -------------------------
 # App & logging
 # -------------------------
-app = Flask(__name__)
-CORS(app)
 logging.basicConfig(level=logging.INFO)
+app = Flask(__name__, static_folder="static", static_url_path="/static")
+CORS(app)
 
 # -------------------------
 # Config (set in environment)
@@ -23,11 +24,12 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 FROM_EMAIL = os.getenv("FROM_EMAIL")
 PORT = int(os.getenv("PORT", 5000))
+# Optional test key for /_send-test-email route
+TEST_EMAIL_KEY = os.getenv("TEST_EMAIL_KEY")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
 
-# RESEND_API_KEY and FROM_EMAIL are needed to send emails; app can still run without them for local dev
 if not RESEND_API_KEY or not FROM_EMAIL:
     logging.warning("RESEND_API_KEY and/or FROM_EMAIL not set — send_email will fail until they are provided")
 
@@ -72,7 +74,7 @@ def generate_code(prefix: str, digits: int = 6) -> str:
     return f"{prefix}{number:0{digits}d}"
 
 def send_email(to_email: str, code: str) -> bool:
-    """Send email via Resend. Returns True on success."""
+    """Send email via Resend. Returns True on success. Logs response details for debugging."""
     if not RESEND_API_KEY or not FROM_EMAIL:
         logging.error("Email not sent: RESEND_API_KEY or FROM_EMAIL missing")
         return False
@@ -92,8 +94,13 @@ def send_email(to_email: str, code: str) -> bool:
             },
             timeout=10
         )
+        logging.info("Resend response status: %s", resp.status_code)
+        logging.info("Resend response body: %s", resp.text)
         resp.raise_for_status()
         return True
+    except requests.exceptions.HTTPError as he:
+        logging.exception("Resend HTTP error: %s", he)
+        return False
     except Exception as e:
         logging.exception("Failed to send email: %s", e)
         return False
@@ -105,12 +112,20 @@ def _required_fields(data: dict, *fields):
     return True, None
 
 # -------------------------
-# Routes
+# Static pages (serve from static/)
 # -------------------------
 @app.route("/", methods=["GET"])
-def home():
-    return jsonify({"message": "API running"}), 200
+def root():
+    # serve setup-signin.html from the static folder
+    return send_from_directory(app.static_folder, "setup-signin.html")
 
+@app.route("/verify.html", methods=["GET"])
+def serve_verify_html():
+    return send_from_directory(app.static_folder, "verify.html")
+
+# -------------------------
+# Routes (API)
+# -------------------------
 @app.route("/register", methods=["POST"])
 def register():
     data = request.get_json(silent=True) or {}
@@ -312,6 +327,34 @@ def reset_password():
         logging.exception("Reset password failed: %s", e)
         return jsonify({"error": "Internal server error"}), 500
 
+# -------------------------
+# Optional: test email endpoint (safe-guarded)
+# -------------------------
+@app.route("/_send-test-email", methods=["POST"])
+def send_test_email():
+    """Send a test email. Protect by TEST_EMAIL_KEY env var (set this to call)."""
+    if not TEST_EMAIL_KEY:
+        return jsonify({"error": "Not available"}), 404
+
+    key = request.headers.get("X-TEST-KEY") or request.args.get("key")
+    if key != TEST_EMAIL_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    to_email = data.get("email")
+    if not to_email:
+        return jsonify({"error": "Missing email"}), 400
+
+    code = generate_code("test", digits=6)
+    ok = send_email(to_email, code)
+    if ok:
+        return jsonify({"message": "Test email sent"}), 200
+    else:
+        return jsonify({"error": "Failed to send test email"}), 500
+
+# -------------------------
+# Run
+# -------------------------
 if __name__ == "__main__":
     # Use 0.0.0.0 so the container is reachable; PORT can be provided by the environment
     app.run(host="0.0.0.0", port=PORT)
