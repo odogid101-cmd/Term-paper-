@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Verify</title>
+<style>
+body { background:#0f172a; color:white; display:flex; justify-content:center; align-items:center; height:100vh;}
+.box { background:#1e293b; padding:25px; border-radius:10px;}
+input, button { width:100%; padding:10px; margin:10px 0;}
+button { background:#22c55e; color:white;}
+</style>
+</head>
+
+<body>
+
+<div class="box">
+<h2>Enter Code</h2>
+<input id="code" placeholder="ver123">
+<button onclick="verify()">Verify</button>
+<p id="msg"></p>
+</div>
+
+<script>
+const API = "https://term-paper-n4kl.onrender.com";
+
+async function verify(){
+    let res = await fetch(API+"/verify",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({code:code.value})
+    });
+
+    let r = await res.json();
+    msg.innerText = r.message || r.error;
+
+    if(r.message){
+        setTimeout(()=>location.href="index.html",1500);
+    }
+}
+</script>
+
+</body>
+</html>
