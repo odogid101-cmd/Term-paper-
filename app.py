@@ -13,7 +13,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 # In production, restrict origins instead of "*"
-CORS(app)  
+CORS(app)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
@@ -182,10 +182,6 @@ def verify_email():
 
 @app.route("/resend-verification", methods=["POST"])
 def resend_verification():
-    """
-    POST { email }
-    Generates a new signup verification code and sends it to the email.
-    """
     data = request.get_json(silent=True) or {}
     email = (data.get("email") or "").strip().lower()
     if not email:
@@ -200,7 +196,6 @@ def resend_verification():
                     return jsonify({"error": "User not found"}), 404
                 user_id = row[0]
 
-                # create new verification code
                 code = generate_code("ver", digits=6)
                 expires = datetime.datetime.utcnow() + datetime.timedelta(minutes=10)
                 cur.execute("""
@@ -218,7 +213,6 @@ def resend_verification():
     except Exception as e:
         logging.exception("Resend verification failed: %s", e)
         return jsonify({"error": "Internal server error"}), 500
-
 
 @app.route("/login", methods=["POST"])
 def login():
@@ -255,6 +249,45 @@ def login():
         logging.exception("Login failed: %s", e)
         return jsonify({"error": "Internal server error"}), 500
 
+@app.route("/me", methods=["GET"])
+def me():
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return jsonify({"error": "Missing user_id"}), 400
+
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, username, email, is_verified FROM users WHERE id=%s", (user_id,))
+                user = cur.fetchone()
+                if not user:
+                    return jsonify({"error": "User not found"}), 404
+
+                cur.execute("""
+                    SELECT id, code, purpose, expires_at
+                    FROM email_verifications
+                    WHERE user_id=%s
+                    ORDER BY id DESC LIMIT 10
+                """, (user_id,))
+                history = cur.fetchall()
+
+        return jsonify({
+            "user": {
+                "id": user[0],
+                "username": user[1],
+                "email": user[2],
+                "is_verified": user[3]
+            },
+            "history": [
+                {"id": h[0], "code": h[1], "purpose": h[2], "expires_at": h[3].isoformat() if h[3] else None}
+                for h in history
+            ]
+        }), 200
+    except Exception as e:
+        logging.exception("Me endpoint failed: %s", e)
+        return jsonify({"error": "Internal server error"}), 500
+
+# UPDATED: now accepts purpose so it works for forgot password AND change password from settings
 @app.route("/request-reset", methods=["POST"])
 def request_reset():
     data = request.get_json(silent=True) or {}
@@ -263,6 +296,7 @@ def request_reset():
         return jsonify({"error": err}), 400
 
     email = data["email"].strip().lower()
+    purpose = data.get("purpose", "reset_password") # NEW: default to reset_password
 
     try:
         with get_db() as conn:
@@ -278,7 +312,7 @@ def request_reset():
                 cur.execute("""
                 INSERT INTO email_verifications (user_id, code, purpose, expires_at)
                 VALUES (%s, %s, %s, %s)
-                """, (user_id, code, "reset_password", expires))
+                """, (user_id, code, purpose, expires))
 
         sent = send_email(email, code)
         if not sent:
@@ -333,13 +367,82 @@ def reset_password():
         logging.exception("Reset password failed: %s", e)
         return jsonify({"error": "Internal server error"}), 500
 
+# NEW ENDPOINT 1: Update Profile
+@app.route("/update-profile", methods=["POST"])
+def update_profile():
+    data = request.get_json(silent=True) or {}
+    ok, err = _required_fields(data, "user_id", "username", "email")
+    if not ok:
+        return jsonify({"error": err}), 400
+
+    user_id = data["user_id"]
+    new_username = data["username"].strip()
+    new_email = data["email"].strip().lower()
+
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                # check if username/email already taken by someone else
+                cur.execute("SELECT id FROM users WHERE (username=%s OR email=%s) AND id!=%s",
+                            (new_username, new_email, user_id))
+                if cur.fetchone():
+                    return jsonify({"error": "Username or Email already taken"}), 409
+
+                cur.execute("UPDATE users SET username=%s, email=%s WHERE id=%s",
+                            (new_username, new_email, user_id))
+
+                if cur.rowcount == 0:
+                    return jsonify({"error": "User not found"}), 404
+
+        return jsonify({"message": "Profile updated successfully"}), 200
+    except Exception as e:
+        logging.exception("Update profile failed: %s", e)
+        return jsonify({"error": "Internal server error"}), 500
+
+# NEW ENDPOINT 2: Change Password from Settings
+@app.route("/change-password", methods=["POST"])
+def change_password():
+    data = request.get_json(silent=True) or {}
+    ok, err = _required_fields(data, "user_id", "code", "new_password")
+    if not ok:
+        return jsonify({"error": err}), 400
+
+    user_id = data["user_id"]
+    code = data["code"].strip()
+    new_password = data["new_password"]
+
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                SELECT id, expires_at FROM email_verifications
+                WHERE user_id=%s AND code=%s AND purpose=%s
+                ORDER BY id DESC LIMIT 1
+                """, (user_id, code, "change_password"))
+                ver = cur.fetchone()
+                if not ver:
+                    return jsonify({"error": "Invalid code"}), 400
+
+                expires_at = ver[1]
+                if expires_at is None or expires_at < datetime.datetime.utcnow():
+                    return jsonify({"error": "Code expired"}), 400
+
+                new_hash = generate_password_hash(new_password)
+                cur.execute("UPDATE users SET password_hash=%s WHERE id=%s", (new_hash, user_id))
+                cur.execute("DELETE FROM email_verifications WHERE user_id=%s AND purpose=%s", (user_id, "change_password"))
+
+        return jsonify({"message": "Password changed successfully"}), 200
+    except Exception as e:
+        logging.exception("Change password failed: %s", e)
+        return jsonify({"error": "Internal server error"}), 500
+
 @app.route("/_send-test-email", methods=["POST"])
 def send_test_email():
     if not TEST_EMAIL_KEY:
         return jsonify({"error": "Not available"}), 404
 
     key = request.headers.get("X-TEST-KEY") or request.args.get("key")
-    if key != TEST_EMAIL_KEY:
+    if key!= TEST_EMAIL_KEY:
         return jsonify({"error": "Unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
