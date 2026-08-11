@@ -1,0 +1,175 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Signup/Signin</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { background:#0f172a; color:white; font-family:Arial, sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; margin:0; }
+    .box { background:#1e293b; padding:25px; border-radius:10px; width:320px; box-sizing:border-box; }
+    input, button { width:100%; padding:10px; margin:8px 0; border:none; border-radius:5px; box-sizing:border-box; }
+    input { background:#0b1220; color:#fff; }
+    button { background:#3b82f6; color:white; cursor:pointer; transition: opacity 0.2s ease; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .toggle { text-align:center; cursor:pointer; color:#38bdf8; user-select:none; margin-top: 5px; }
+    #msg { min-height:1.2em; color:#ffdddd; margin-top: 10px; }
+  </style>
+</head>
+<body>
+
+<div class="box">
+  <h2 id="title">Login</h2>
+
+  <input id="username" placeholder="Username" style="display:none;" autocomplete="username">
+  <input id="email" placeholder="Email" style="display:none;" type="email" autocomplete="email">
+
+  <input id="identifier" placeholder="Email or Username" autocomplete="username">
+  <input id="password" type="password" placeholder="Password" autocomplete="current-password">
+
+  <button id="submitBtn">Submit</button>
+  <div class="toggle" id="toggleLink">Switch to Register</div>
+  <a href="forgot-password.html" style="color: #94a3b8; display: block; text-align: center; margin-top: 10px;">Forgot password</a>
+  <p id="msg"></p>
+</div>
+
+<script>
+(function () {
+  const API_BASE = "https://term-paper-n4kl.onrender.com";
+
+  let isLogin = true;
+  const titleEl = document.getElementById("title");
+  const usernameEl = document.getElementById("username");
+  const emailEl = document.getElementById("email");
+  const identifierEl = document.getElementById("identifier");
+  const passwordEl = document.getElementById("password");
+  const msgEl = document.getElementById("msg");
+  const toggleLink = document.getElementById("toggleLink");
+  const submitBtn = document.getElementById("submitBtn");
+
+  function updateUI() {
+    titleEl.innerText = isLogin ? "Login" : "Register";
+    usernameEl.style.display = isLogin ? "none" : "block";
+    emailEl.style.display = isLogin ? "none" : "block";
+    identifierEl.style.display = isLogin ? "block" : "none";
+    toggleLink.innerText = isLogin ? "Switch to Register" : "Switch to Login";
+    msgEl.innerText = "";
+    msgEl.style.color = "#ffdddd";
+  }
+
+  toggleLink.addEventListener("click", () => {
+    isLogin = !isLogin;
+    updateUI();
+  });
+
+  submitBtn.addEventListener("click", submitForm);
+  [usernameEl, emailEl, identifierEl, passwordEl].forEach(el =>
+    el.addEventListener("keydown", (e) => { 
+      if (e.key === "Enter" && !submitBtn.disabled) submitForm(); 
+    })
+  );
+
+  function saveAuth(data) {
+    // Save token if present
+    if (data.token) {
+      localStorage.setItem("token", data.token);
+    }
+    // Save user_id - check 3 possible places backend might send it
+    if (data.user_id) {
+      localStorage.setItem("user_id", data.user_id);
+    } else if (data.user && data.user.id) {
+      localStorage.setItem("user_id", data.user.id);
+    } else if (data.user && data.user_id) {
+      localStorage.setItem("user_id", data.user_id);
+    }
+  }
+
+  async function submitForm() {
+    msgEl.innerText = "";
+    submitBtn.disabled = true;
+    const originalBtnText = submitBtn.innerText;
+    submitBtn.innerText = "Loading...";
+
+    try {
+      if (isLogin) {
+        const payload = {
+          identifier: identifierEl.value.trim(),
+          password: passwordEl.value
+        };
+
+        const res = await fetch(API_BASE + "/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await res.json().catch(()=>({ error: "Invalid response from server" }));
+        
+        if (res.ok) {
+          msgEl.style.color = "#c9fdd1";
+          msgEl.innerText = data.message || "Login successful";
+          saveAuth(data); // <-- THIS FIXES THE LOOP
+          
+          setTimeout(() => { window.location.href = "dashboard.html"; }, 500);
+        } else {
+          msgEl.style.color = "#ffcccc";
+          msgEl.innerText = data.error || "Login failed";
+          submitBtn.disabled = false;
+          submitBtn.innerText = originalBtnText;
+
+          if (data.error === "Verify email first") {
+            const maybeEmail = payload.identifier.includes("@") ? payload.identifier : "";
+            const url = "verify.html" + (maybeEmail ? "?email=" + encodeURIComponent(maybeEmail) : "");
+            setTimeout(() => { window.location.href = url; }, 500);
+          }
+        }
+      } else {
+        const payload = {
+          username: usernameEl.value.trim(),
+          email: emailEl.value.trim(),
+          password: passwordEl.value
+        };
+
+        if(!payload.username || !payload.email || !payload.password){
+          msgEl.innerText = "Please fill all fields";
+          submitBtn.disabled = false;
+          submitBtn.innerText = originalBtnText;
+          return;
+        }
+
+        const res = await fetch(API_BASE + "/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await res.json().catch(()=>({ error: "Invalid response from server" }));
+        
+        if (res.ok || res.status === 201) {
+          msgEl.style.color = "#c9fdd1";
+          msgEl.innerText = data.message || "Registered. Check your email";
+          saveAuth(data); // save in case backend auto-logins
+          
+          const url = "verify.html?email=" + encodeURIComponent(payload.email);
+          setTimeout(() => { window.location.href = url; }, 700);
+        } else {
+          msgEl.style.color = "#ffcccc";
+          msgEl.innerText = data.error || "Register failed";
+          submitBtn.disabled = false;
+          submitBtn.innerText = originalBtnText;
+        }
+      }
+    } catch (err) {
+      console.error(err);
+      msgEl.style.color = "#ffcccc";
+      msgEl.innerText = "Network error. Check your connection";
+      submitBtn.disabled = false;
+      submitBtn.innerText = originalBtnText;
+    }
+  }
+
+  updateUI();
+})();
+</script>
+
+</body>
+</html>

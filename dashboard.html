@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Tempaper Generator | Dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+:root{
+  --bg:#0b0d1a;--sidebar:#0a0c14;--card:#151829;--accent:#4f46e5;--text:#e2e8f0;--muted:#94a3b8;
+  --danger:#ef4444;--success:#22c55e;--gradient: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+  --font-size: 16px;
+}
+[data-theme="light"]{ --bg:#f8fafc;--sidebar:#ffffff;--card:#f1f5f9;--text:#0f172a;--muted:#64748b; }
+*{box-sizing:border-box;margin:0;padding:0;font-family:Inter,system-ui,Arial,sans-serif}
+body{background:var(--bg);color:var(--text);display:flex;min-height:100vh;font-size:var(--font-size);transition:.3s;overflow:hidden}
+.sidebar{width:260px;background:var(--sidebar);padding:20px 16px;height:100vh;position:fixed;left:0;top:0;display:flex;flex-direction:column;border-right:1px solid rgba(255,255,255,0.05);transition:transform.3s;z-index:100}
+.logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:18px;margin-bottom:24px}
+.logo-dot{width:28px;height:28px;background:var(--gradient);border-radius:8px}
+.menu-item{padding:12px;border-radius:8px;cursor:pointer;margin-bottom:4px;color:var(--muted);display:flex;align-items:center;justify-content:space-between;gap:10px;transition:.2s}
+.menu-item.active,.menu-item:hover{background:var(--card);color:var(--text)}
+.menu-left{display:flex;align-items:center;gap:10px}
+.submenu{display:none;padding-left:12px;max-height:300px;overflow-y:auto}
+.submenu.show{display:block}
+.submenu-item{padding:10px;border-radius:6px;color:var(--muted);font-size:14px;cursor:pointer;margin-bottom:4px}
+.submenu-item:hover{background:var(--card);color:var(--text)}
+.sidebar-bottom{margin-top:auto;padding-top:16px;border-top:1px solid rgba(255,255,255,0.05)}
+.profile-box{display:flex;align-items:center;gap:10px;padding:10px;cursor:pointer;border-radius:8px}
+.profile-box:hover{background:var(--card)}
+.profile-avatar{width:36px;height:36px;border-radius:8px;background:var(--gradient);display:flex;align-items:center;justify-content:center;font-weight:600;flex-shrink:0}
+.profile-info.name{font-size:14px;font-weight:500}
+.profile-info.email{font-size:12px;color:var(--muted)}
+.main{flex:1;display:flex;flex-direction:column;margin-left:260px;height:100vh}
+.topbar{height:56px;display:flex;align-items:center;justify-content:space-between;padding:0 12px;border-bottom:1px solid rgba(255,255,255,0.05);flex-shrink:0}
+.icon-btn{background:none;border:none;color:var(--text);font-size:24px;cursor:pointer;padding:8px;border-radius:8px;width:40px;height:40px;display:flex;align-items:center;justify-content:center}
+.icon-btn:hover{background:var(--card)}
+.top-actions{position:relative}
+.dots-btn{background:var(--card);border:1px solid rgba(255,255,255,0.05);color:var(--text);padding:8px 12px;border-radius:8px;cursor:pointer;font-size:20px;width:40px;height:40px}
+.dropdown-menu{position:absolute;right:0;top:45px;background:var(--card);border:1px solid rgba(255,255,255,0.05);border-radius:8px;min-width:160px;opacity:0;visibility:hidden;transform:translateY(-10px);transition:.2s;z-index:200}
+.dropdown-menu.show{opacity:1;visibility:visible;transform:translateY(0)}
+.dropdown-menu div{padding:12px 16px;cursor:pointer}
+.dropdown-menu div:hover{background:var(--bg)}
+.dropdown-menu.danger{color:var(--danger)}
+.chat-area{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
+.chat-msg{background:var(--card);padding:14px 16px;border-radius:12px;max-width:75%;border:1px solid rgba(255,255,255,0.05);position:relative}
+.chat-msg.user{align-self:flex-end;background:var(--accent);color:white}
+.chat-msg.ai{align-self:flex-start;background:rgba(79,70,229,0.1);border-color:var(--accent);padding-right:40px}
+.speak-btn{position:absolute;top:8px;right:8px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:18px}
+.speak-btn:hover{color:var(--text)}
+.input-bar{display:flex;align-items:center;gap:10px;padding:16px 20px;border-top:1px solid rgba(255,255,255,0.05);background:var(--sidebar);flex-shrink:0}
+.input{flex:1;background:var(--card);border:1px solid rgba(255,255,255,0.1);color:var(--text);padding:14px;border-radius:12px;font-size:var(--font-size);resize:none;max-height:120px}
+.btn-icon{background:var(--gradient);color:white;border:none;width:48px;height:48px;border-radius:50%;font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.btn-icon:disabled{opacity:0.5;cursor:not-allowed}
+.btn-icon.recording{background:var(--danger);animation: pulse 1s infinite}
+@keyframes pulse {0%,100%{transform:scale(1)} 50%{transform:scale(1.1)}}
+.loader{text-align:center;color:var(--muted);padding:20px}
+.overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:99}
+.overlay.show{display:block}
+@media(max-width:900px){.sidebar{transform:translateX(-100%)}.sidebar.open{transform:translateX(0)}.main{margin-left:0}}
+</style>
+</head>
+<body>
+<div class="overlay" id="overlay"></div>
+<div class="sidebar" id="sidebar">
+  <div class="logo"><div class="logo-dot"></div>Tempaper Generator</div>
+  <h4 style="color:var(--muted);font-size:12px;margin:16px 8px;text-transform:uppercase">Main Menu</h4>
+  <div class="menu-item" id="newChatBtn"><div class="menu-left">New Tempaper</div></div>
+  <div class="menu-item" id="historyToggle"><div class="menu-left">History</div><span id="historyArrow">></span></div>
+  <div class="submenu" id="historySubmenu"></div>
+  <div class="menu-item" onclick="window.location='settings.html'"><div class="menu-left">Settings</div></div>
+  <div class="sidebar-bottom">
+    <div class="profile-box" onclick="window.location='settings.html'">
+      <div class="profile-avatar" id="profileAvatar">?</div>
+      <div class="profile-info"><div class="name" id="profileName">Loading...</div><div class="email" id="profileEmail">...</div></div>
+    </div>
+  </div>
+</div>
+
+<div class="main">
+  <div class="topbar">
+    <button class="icon-btn" id="navToggle">☰</button>
+    <div class="top-actions">
+      <button class="dots-btn" id="dotsBtn">⋮</button>
+      <div class="dropdown-menu" id="dotsMenu">
+        <div id="menuNewChat">New Chat</div>
+        <div onclick="window.location='settings.html'">profile</div>
+        <div class="danger" onclick="logout()">Logout</div>
+      </div>
+    </div>
+  </div>
+  <div class="chat-area" id="chatArea"><div class="loader">Start a new conversation</div></div>
+  <div class="input-bar">
+    <textarea class="input" id="promptInput" rows="1" placeholder="Ask Tempaper anything"></textarea>
+    <button class="btn-icon" id="sendBtn">🎤</button>
+  </div>
+</div>
+
+<script>
+const API_URL = "https://term-paper-n4kl.onrender.com";
+let currentUser = null;
+let appSettings = {theme: 'system', fontSize: 16, notifications: true};
+let isGenerating = false;
+let touchStartX = 0;
+let mediaRecorder, audioChunks = [];
+let isRecording = false;
+
+document.addEventListener("DOMContentLoaded", async () => {
+  loadAppSettings();
+  const userId = localStorage.getItem("user_id");
+  if (userId) {
+    const ok = await loadProfile(userId);
+    if(ok) loadChats();
+    else window.location.href = "setup-signin.html";
+  } else { window.location.href = "setup-signin.html"; }
+
+  document.getElementById("sendBtn").onclick = handleSendOrRecord;
+  document.getElementById("promptInput").oninput = handleInputChange;
+  document.getElementById("promptInput").onkeydown = (e)=>{ if(e.key==="Enter" &&!e.shiftKey){e.preventDefault(); generatePaper()} };
+  document.getElementById("navToggle").onclick = toggleSidebar;
+  document.getElementById("overlay").onclick = toggleSidebar;
+  document.getElementById("dotsBtn").onclick = (e)=>{e.stopPropagation();document.getElementById("dotsMenu").classList.toggle("show")};
+  document.getElementById("historyToggle").onclick = toggleHistory;
+  document.getElementById("newChatBtn").onclick = startNewChat;
+  document.getElementById("menuNewChat").onclick = ()=>{startNewChat(); closeDots()};
+  document.addEventListener("click", (e)=>{ if(!e.target.closest('.top-actions')) closeDots() });
+  document.addEventListener('touchstart', e => { touchStartX = e.changedTouches[0].screenX });
+  document.addEventListener('touchend', e => {
+    if(touchStartX > 50 && e.changedTouches[0].screenX < touchStartX - 50){
+      document.getElementById("sidebar").classList.remove("open");
+      document.getElementById("overlay").classList.remove("show");
+    }
+  });
+})
+
+function handleSendOrRecord(){
+  const input = document.getElementById("promptInput");
+  if(input.value.trim().length > 0){
+    generatePaper(); // send text
+  } else {
+    toggleRecording(); // record voice
+  }
+}
+
+async function toggleRecording(){
+  if(isRecording){
+    mediaRecorder.stop();
+    return;
+  }
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+    mediaRecorder = new MediaRecorder(stream);
+    audioChunks = [];
+    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+    mediaRecorder.onstop = uploadAudio;
+    mediaRecorder.start();
+    isRecording = true;
+    document.getElementById("sendBtn").classList.add("recording");
+    document.getElementById("sendBtn").innerText = "🔴";
+  }catch(e){ alert("Microphone permission denied") }
+}
+
+async function uploadAudio(){
+  isRecording = false;
+  document.getElementById("sendBtn").classList.remove("recording");
+  document.getElementById("sendBtn").innerText = "⏳";
+
+  const audioBlob = new Blob(audioChunks, {type: 'audio/webm'});
+  const formData = new FormData();
+  formData.append('audio', audioBlob, 'voice.webm');
+
+  try{
+    const res = await fetch(`${API_URL}/transcribe`, { method: 'POST', body: formData });
+    const data = await res.json();
+    if(data.text){
+      document.getElementById("promptInput").value = data.text;
+      handleInputChange();
+    } else {
+      alert("Failed to transcribe: " + (data.error || "Unknown error"))
+    }
+  }catch(e){ alert("Failed to upload audio") }
+
+  document.getElementById("sendBtn").innerText = "🎤";
+  mediaRecorder.stream.getTracks().forEach(track => track.stop());
+}
+
+function closeDots(){ document.getElementById("dotsMenu").classList.remove("show") }
+function toggleSidebar(){ document.getElementById("sidebar").classList.toggle("open"); document.getElementById("overlay").classList.toggle("show"); }
+function loadAppSettings(){ const saved = localStorage.getItem("app_settings"); if(saved) appSettings = JSON.parse(saved); applyTheme(); document.documentElement.style.setProperty('--font-size', appSettings.fontSize + 'px'); }
+function applyTheme(){ if(appSettings.theme === 'system'){ const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches; document.documentElement.setAttribute('data-theme', prefersDark? 'dark' : 'light'); } else { document.documentElement.setAttribute('data-theme', appSettings.theme); } }
+async function loadProfile(userId) { try{ const res = await fetch(`${API_URL}/me?user_id=${userId}`); const data = await res.json(); if(res.ok && data.user){ currentUser = data.user; currentUser.id = currentUser.id || currentUser.user_id; const name = currentUser.username || currentUser.email.split('@')[0]; document.getElementById("profileAvatar").innerText = name[0].toUpperCase(); document.getElementById("profileName").innerText = name; document.getElementById("profileEmail").innerText = currentUser.email; return true; } else { return false; }catch(e){ return false; } }
+function handleInputChange(){ const input = document.getElementById("promptInput"); const btn = document.getElementById("sendBtn"); if(!isRecording) btn.innerText = input.value.trim().length > 0? "➤" : "🎤"; }
+function startNewChat(){ document.getElementById("chatArea").innerHTML = `<div class="loader">Start a new conversation</div>`; document.getElementById("promptInput").value = ""; handleInputChange(); }
+
+async function generatePaper(){
+  if(isGenerating) return;
+  const input = document.getElementById("promptInput");
+  const prompt = input.value.trim();
+  if(!prompt) return;
+
+  isGenerating = true;
+  document.getElementById("sendBtn").disabled = true;
+  addMessage("user", prompt);
+  input.value = "";
+  handleInputChange();
+  addMessage("ai", "Generating... This may take 10-20s", true);
+
+  // TODO: Replace this with real API call to /construct-paper
+  setTimeout(()=>{
+    const fakeResult = `This is a generated termpaper for: "${prompt}"\n\nLorem ipsum dolor sit amet...`;
+    updateLastAiMessage(fakeResult);
+    saveChat(prompt, fakeResult);
+    isGenerating = false;
+    document.getElementById("sendBtn").disabled = false;
+  }, 2000)
+}
+
+function addMessage(role, text, isTemp=false){
+  const chatArea = document.getElementById("chatArea");
+  if(chatArea.querySelector(".loader")) chatArea.innerHTML = "";
+  const div = document.createElement("div");
+  div.className = `chat-msg ${role}`;
+  div.style.whiteSpace = "pre-wrap";
+  div.innerText = text;
+  if(role === "ai"){
+    const speakBtn = document.createElement("button");
+    speakBtn.className = "speak-btn";
+    speakBtn.innerText = "🔊";
+    speakBtn.onclick = () => speakText(text);
+    div.appendChild(speakBtn);
+  }
+  if(isTemp) div.id = "tempAiMsg";
+  chatArea.appendChild(div);
+  chatArea.scrollTop = chatArea.scrollHeight;
+}
+function updateLastAiMessage(text){ const temp = document.getElementById("tempAiMsg"); if(temp) { temp.innerText = text; const speakBtn = document.createElement("button"); speakBtn.className = "speak-btn"; speakBtn.innerText = "🔊"; speakBtn.onclick = () => speakText(text); temp.appendChild(speakBtn); temp.removeAttribute("id"); } }
+function speakText(text){ if('speechSynthesis' in window){ window.speechSynthesis.cancel(); const utter = new SpeechSynthesisUtterance(text); utter.lang = 'en-US'; utter.rate = 1; window.speechSynthesis.speak(utter); } else { alert("Text-to-speech not supported in this browser"); } }
+function getChatKey(){ return "chats_" + (currentUser?.id || "guest") }
+function saveChat(prompt, result){ let chats = JSON.parse(localStorage.getItem(getChatKey())||"[]"); chats = chats.filter(c=>Date.now()-c.time < 86400000); chats.unshift({prompt,result,time:Date.now()}); localStorage.setItem(getChatKey(),JSON.stringify(chats.slice(0,20))); loadChats(); }
+function loadChats(){ let chats = JSON.parse(localStorage.getItem(getChatKey())||"[]"); chats = chats.filter(c=>Date.now()-c.time < 86400000); const submenu = document.getElementById("historySubmenu"); if(chats.length){ submenu.innerHTML = chats.map((c,i)=>`<div class="submenu-item" onclick="openChat(${i})"><b>${c.prompt.substring(0,40)}</b></div>`).join(""); } else { submenu.innerHTML = `<div class="submenu-item" style="color:var(--muted)">No history</div>`; } }
+function openChat(index){ let chats = JSON.parse(localStorage.getItem(getChatKey())||"[]"); const chat = chats[index]; document.getElementById("chatArea").innerHTML = ""; addMessage("user", chat.prompt); addMessage("ai", chat.result); toggleHistory(); }
+function toggleHistory(){ document.getElementById("historySubmenu").classList.toggle("show"); document.getElementById("historyArrow").innerText = document.getElementById("historySubmenu").classList.contains("show")? "v" : ">"; }
+function logout(){localStorage.removeItem("user_id");window.location.href="setup-signin.html"}
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
+</script>
+</body>
+</html>

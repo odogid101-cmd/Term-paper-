@@ -1,0 +1,138 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Verify Email</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Arial, sans-serif; background:#0f172a; color:white; display:flex; justify-content:center; align-items:center; height:100vh; margin:0; }
+    .wrap { background:#1e293b; padding:24px; border-radius:10px; width:320px; box-sizing:border-box; }
+    input, button { width:100%; padding:10px; margin:8px 0; border-radius:6px; border:none; box-sizing:border-box; }
+    input { background:#0b1220; color:#fff; }
+    .btn-primary { background:#10b981; color:#062; cursor:pointer; }
+    .btn-secondary { background:#3b82f6; color:#fff; cursor:pointer; }
+    #msg { min-height:1.2em; color:#ffdddd; }
+    .row { display:flex; gap:8px; }
+    .row button { flex:1; padding:10px; }
+  </style>
+</head>
+<body>
+
+<div class="wrap">
+  <h2>Email Verification</h2>
+
+  <input type="email" id="email" placeholder="Email" autocomplete="email">
+  <input type="text" id="code" placeholder="Enter verification code" autocomplete="one-time-code">
+
+  <div class="row">
+    <button id="verifyBtn" class="btn-primary">Verify</button>
+    <button id="resendBtn" class="btn-secondary">Resend code</button>
+  </div>
+
+  <p id="msg"></p>
+</div>
+
+<script>
+(function () {
+
+  const API_BASE = "https://term-paper-n4kl.onrender.com";
+
+  const emailEl = document.getElementById("email");
+  const codeEl = document.getElementById("code");
+  const verifyBtn = document.getElementById("verifyBtn");
+  const resendBtn = document.getElementById("resendBtn");
+  const msgEl = document.getElementById("msg");
+
+  // Prefill email from ?email= query param if present
+  const params = new URLSearchParams(window.location.search);
+  const emailParam = params.get("email");
+  if (emailParam) emailEl.value = decodeURIComponent(emailParam);
+
+  verifyBtn.addEventListener("click", verify);
+  resendBtn.addEventListener("click", resendCode);
+  [emailEl, codeEl].forEach(el => el.addEventListener("keydown", (e) => { if (e.key === "Enter") verify(); }));
+
+  async function verify() {
+    msgEl.style.color = "#ffcccc";
+    msgEl.innerText = "";
+    verifyBtn.disabled = true;
+
+    const payload = {
+      email: emailEl.value.trim().toLowerCase(),
+      code: codeEl.value.trim()
+    };
+
+    if (!payload.email || !payload.code) {
+      msgEl.innerText = "Fill both fields";
+      verifyBtn.disabled = false;
+      return;
+    }
+
+    try {
+      const res = await fetch(API_BASE + "/verify-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+
+      const data = await res.json().catch(()=>({ error: "Invalid response" }));
+      if (res.ok) {
+        msgEl.style.color = "#c9fdd1";
+        msgEl.innerText = data.message || "Verified";
+        // go back to index (same folder) after success
+        setTimeout(() => { window.location.href = "setup-signin.html"; }, 900);
+      } else {
+        msgEl.style.color = "#ffcccc";
+        msgEl.innerText = data.error || "Verification failed";
+      }
+    } catch (err) {
+      console.error(err);
+      msgEl.style.color = "#ffcccc";
+      msgEl.innerText = "Network error";
+    } finally {
+      verifyBtn.disabled = false;
+    }
+  }
+
+  async function resendCode() {
+    msgEl.style.color = "#ffcccc";
+    msgEl.innerText = "";
+    resendBtn.disabled = true;
+
+    const email = emailEl.value.trim().toLowerCase();
+    if (!email) {
+      msgEl.innerText = "Enter email to resend code";
+      resendBtn.disabled = false;
+      return;
+    }
+
+    try {
+      // Calls the server endpoint to generate & send a new signup verification code.
+      // Server must implement POST /resend-verification { email }
+      const res = await fetch(API_BASE + "/resend-verification", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email })
+      });
+
+      const data = await res.json().catch(()=>({ error: "Invalid response" }));
+      if (res.ok) {
+        msgEl.style.color = "#c9fdd1";
+        msgEl.innerText = data.message || "Verification code resent";
+      } else {
+        msgEl.style.color = "#ffcccc";
+        msgEl.innerText = data.error || "Could not resend code";
+      }
+    } catch (err) {
+      console.error(err);
+      msgEl.style.color = "#ffcccc";
+      msgEl.innerText = "Network error";
+    } finally {
+      resendBtn.disabled = false;
+    }
+  }
+})();
+</script>
+
+</body>
+</html>

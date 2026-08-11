@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Settings | Tempaper Generator</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+:root{
+  --bg:#0b0d1a;--card:#151829;--text:#e2e8f0;--muted:#94a3b8;
+  --accent:#4f46e5;--success:#22c55e;--danger:#ef4444;
+  --gradient: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+  --font-size: 16px; /* default */
+}
+[data-theme="light"]{
+  --bg:#f8fafc;--card:#ffffff;--text:#0f172a;--muted:#64748b;
+}
+*{box-sizing:border-box;margin:0;padding:0;font-family:Inter,system-ui,Arial,sans-serif}
+body{background:var(--bg);color:var(--text);padding:20px;max-width:600px;margin:0 auto;font-size:var(--font-size);transition:.3s}
+
+.header{display:flex;align-items:center;gap:10px;margin-bottom:20px;font-size:18px;font-weight:600}
+.back-btn{background:var(--card);border:none;color:var(--text);padding:8px 10px;border-radius:8px;cursor:pointer}
+
+.profile-card{background:var(--card);padding:16px;border-radius:12px;display:flex;align-items:center;gap:12px;margin-bottom:16px;border:1px solid rgba(255,255,255,0.1)}
+.avatar{width:48px;height:48px;border-radius:50%;background:var(--gradient);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px;position:relative}
+.avatar-badge{position:absolute;bottom:0;right:0;width:14px;height:14px;background:var(--success);border-radius:50%;border:2px solid var(--card)}
+.profile-info{flex:1}
+.profile-info.name{font-weight:600}
+.profile-info.email{font-size:13px;color:var(--muted)}
+.badge{background:rgba(79,70,229,0.2);color:var(--accent);padding:4px 8px;border-radius:6px;font-size:12px;font-weight:600}
+
+.setting-item{background:var(--card);padding:16px;border-radius:12px;margin-bottom:12px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;border:1px solid rgba(255,255,255,0.1);transition:.2s}
+.setting-item:hover{opacity:0.8}
+.setting-item.title{font-weight:500}
+.setting-item.subtitle{font-size:12px;color:var(--muted)}
+
+.upgrade-group{background:var(--card);padding:16px;border-radius:12px;margin-bottom:12px;border:1px solid rgba(255,255,255,0.1)}
+.upgrade-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;cursor:pointer}
+.plan-item{background:var(--bg);padding:12px 16px;border-radius:8px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;cursor:pointer;border:1px solid rgba(255,255,255,0.1)}
+.plan-item:hover{border-color:var(--accent)}
+
+.modal{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);display:none;align-items:center;justify-content:center;z-index:200}
+.modal.show{display:flex}
+.modal-content{background:var(--card);padding:24px;border-radius:16px;width:90%;max-width:400px}
+.input,select{width:100%;background:var(--bg);border:1px solid rgba(255,255,255,0.1);color:var(--text);padding:12px;border-radius:8px;margin-bottom:12px}
+.btn{background:var(--gradient);color:white;border:none;padding:12px;border-radius:8px;font-weight:600;cursor:pointer;width:100%}
+.btn.secondary{background:var(--card);border:1px solid rgba(255,255,255,0.1)}
+.alert{padding:10px;border-radius:8px;margin-bottom:12px;font-size:14px}
+.alert.success{background:rgba(34,197,94,0.1);color:var(--success)}
+.alert.error{background:rgba(239,68,68,0.1);color:var(--danger)}
+
+.switch{position:relative;display:inline-block;width:46px;height:24px}
+.switch input{opacity:0;width:0;height:0}
+.slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#ccc;transition:.4s;border-radius:24px}
+.slider:before{position:absolute;content:"";height:18px;width:18px;left:3px;bottom:3px;background:white;transition:.4s;border-radius:50%}
+input:checked +.slider{background:var(--accent)}
+input:checked +.slider:before{transform:translateX(22px)}
+.setting-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <button class="back-btn" onclick="window.location='dashboard.html'">←</button>
+  Tempaper Generator Settings
+</div>
+
+<!-- Profile Header -->
+<div class="profile-card">
+  <div class="avatar" id="profileAvatar">U<div class="avatar-badge"></div></div>
+  <div class="profile-info">
+    <div class="name" id="profileName">User name</div>
+    <div class="email" id="profileEmail">gmail</div>
+  </div>
+  <div class="badge" id="userBadge">Free</div>
+</div>
+
+<!-- App Setting -->
+<div class="setting-item" onclick="openModal('appModal')">
+  <div>
+    <div class="title">App Setting</div>
+    <div class="subtitle" id="appSettingSummary">Theme: System, Text: 16px</div>
+  </div>
+  <span>></span>
+</div>
+
+<!-- Upgrade Section -->
+<div class="upgrade-group">
+  <div class="upgrade-header" onclick="toggleUpgrade()">
+    <div class="title">Upgrade</div>
+    <span id="upgradeArrow">v</span>
+  </div>
+  <div id="upgradePlans">
+    <div class="plan-item" onclick="selectPlan('Gold')">Gold <span>></span></div>
+    <div class="plan-item" onclick="selectPlan('Silver')">Silver <span>></span></div>
+    <div class="plan-item" onclick="selectPlan('Diamond')">Diamond <span>></span></div>
+  </div>
+</div>
+
+<!-- Security Password -->
+<div class="setting-item" onclick="openModal('passwordModal')">
+  <div class="title">Security Password</div>
+  <span>></span>
+</div>
+
+<!-- App Setting Modal -->
+<div class="modal" id="appModal">
+  <div class="modal-content">
+    <h3 style="margin-bottom:16px">App Settings</h3>
+
+    <div class="setting-row">
+      <label>Theme</label>
+      <select id="themeSelect" class="input" style="width:140px;margin:0">
+        <option value="system">System</option>
+        <option value="dark">Dark</option>
+        <option value="light">Light</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <label>Text Size</label>
+      <input type="range" id="fontSizeRange" min="12" max="20" value="16" style="width:140px">
+      <span id="fontSizeValue">16px</span>
+    </div>
+
+    <div class="setting-row">
+      <label>Notifications</label>
+      <label class="switch">
+        <input type="checkbox" id="notifToggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <button class="btn" onclick="saveAppSettings()">Save</button>
+    <button class="btn secondary" style="margin-top:10px" onclick="closeModal('appModal')">Cancel</button>
+  </div>
+</div>
+
+<!-- Password Change Modal -->
+<div class="modal" id="passwordModal">
+  <div class="modal-content">
+    <h3 style="margin-bottom:16px">Change Password</h3>
+    <div id="alertBox"></div>
+    <button class="btn secondary" style="margin-bottom:12px" onclick="sendPasswordCode()">Send Code to <span id="emailForCode"></span></button>
+    <div id="passwordForm" style="display:none">
+      <input class="input" id="codeInput" placeholder="Enter 6-digit code"/>
+      <input class="input" id="newPassInput" type="password" placeholder="New Password"/>
+      <button class="btn" onclick="changePassword()">Update Password</button>
+    </div>
+    <button class="btn" style="background:var(--danger);margin-top:10px" onclick="closeModal('passwordModal')">Cancel</button>
+  </div>
+</div>
+
+  
+<script>
+const API_URL = "https://term-paper-n4kl.onrender.com"; // CHANGE THIS
+let currentUser = null;
+let appSettings = {theme: 'system', fontSize: 16, notifications: true};
+
+document.addEventListener("DOMContentLoaded", async () => {
+  loadAppSettings(); // load theme + font first
+  const userId = localStorage.getItem("user_id");
+  if (userId) { await loadProfile(userId); }
+  else { window.location.href = "setup-signin.html"; }
+})
+
+// THEME + SETTINGS LOGIC
+function loadAppSettings(){
+  const saved = localStorage.getItem("app_settings");
+  if(saved) appSettings = JSON.parse(saved);
+
+  document.getElementById("themeSelect").value = appSettings.theme;
+  document.getElementById("fontSizeRange").value = appSettings.fontSize;
+  document.getElementById("fontSizeValue").innerText = appSettings.fontSize + 'px';
+  document.getElementById("notifToggle").checked = appSettings.notifications;
+  applyTheme();
+  document.documentElement.style.setProperty('--font-size', appSettings.fontSize + 'px');
+  updateSummary();
+}
+
+function saveAppSettings(){
+  appSettings.theme = document.getElementById("themeSelect").value;
+  appSettings.fontSize = document.getElementById("fontSizeRange").value;
+  appSettings.notifications = document.getElementById("notifToggle").checked;
+  localStorage.setItem("app_settings", JSON.stringify(appSettings));
+  applyTheme();
+  document.documentElement.style.setProperty('--font-size', appSettings.fontSize + 'px');
+  updateSummary();
+  closeModal('appModal');
+}
+
+function applyTheme(){
+  if(appSettings.theme === 'system'){
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    document.documentElement.setAttribute('data-theme', prefersDark? 'dark' : 'light');
+  } else {
+    document.documentElement.setAttribute('data-theme', appSettings.theme);
+  }
+}
+
+function updateSummary(){
+  document.getElementById("appSettingSummary").innerText =
+    `Theme: ${appSettings.theme}, Text: ${appSettings.fontSize}px`;
+}
+
+document.getElementById("fontSizeRange").oninput = (e)=>{
+  document.getElementById("fontSizeValue").innerText = e.target.value + 'px';
+}
+
+// PROFILE + API
+async function loadProfile(userId) {
+  const res = await fetch(`${API_URL}/me?user_id=${userId}`);
+  const data = await res.json();
+  if(res.ok){
+    currentUser = data.user;
+    document.getElementById("profileAvatar").childNodes[0].nodeValue = currentUser.username[0].toUpperCase();
+    document.getElementById("profileName").innerText = currentUser.username;
+    document.getElementById("profileEmail").innerText = currentUser.email;
+    document.getElementById("emailForCode").innerText = currentUser.email;
+  } else { logout(); }
+}
+
+function toggleUpgrade(){
+  const plans = document.getElementById("upgradePlans");
+  const arrow = document.getElementById("upgradeArrow");
+  plans.style.display = plans.style.display === "none"? "block" : "none";
+  arrow.innerText = plans.style.display === "none"? ">" : "v";
+}
+
+function selectPlan(plan){
+  alert(`${plan} Plan selected. Connect to payment API here.`);
+}
+
+async function sendPasswordCode(){
+  const res=await fetch(`${API_URL}/request-reset`,{
+    method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({email:currentUser.email,purpose:"change_password"})
+  });
+  const data=await res.json();
+  showAlert(data.message||data.error,res.ok?"success":"error");
+  if(res.ok) document.getElementById("passwordForm").style.display="block";
+}
+
+async function changePassword(){
+  const code=document.getElementById("codeInput").value;
+  const new_password=document.getElementById("newPassInput").value;
+  const res=await fetch(`${API_URL}/change-password`,{
+    method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({user_id:currentUser.id,code,new_password})
+  });
+  const data=await res.json();
+  showAlert(data.message||data.error,res.ok?"success":"error");
+  if(res.ok) setTimeout(()=>closeModal('passwordModal'),1500);
+}
+
+function showAlert(msg,type){
+  document.getElementById("alertBox").innerHTML=`<div class="alert ${type}">${msg}</div>`;
+  setTimeout(()=>document.getElementById("alertBox").innerHTML="",3000);
+}
+function openModal(id){ document.getElementById(id).classList.add("show"); }
+function closeModal(id){ document.getElementById(id).classList.remove("show"); }
+function logout(){localStorage.removeItem("user_id");window.location.href="setup-signin.html"}
+
+// Listen for system theme change
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
+</script>
+
+</body>
+</html>
