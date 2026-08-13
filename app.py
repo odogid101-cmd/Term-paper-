@@ -1,4 +1,4 @@
-# app.py (API-only)
+# app.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -14,17 +14,18 @@ logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 CORS(app)
 
+# Environment variables
 DATABASE_URL = os.getenv("DATABASE_URL")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 FROM_EMAIL = os.getenv("FROM_EMAIL")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+CORE_API_KEY = os.getenv("CORE_API_KEY")
 PORT = int(os.getenv("PORT", 5000))
 TEST_EMAIL_KEY = os.getenv("TEST_EMAIL_KEY")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
-
-if not RESEND_API_KEY or not FROM_EMAIL:
-    logging.warning("RESEND_API_KEY and/or FROM_EMAIL not set — send_email will fail until provided")
 
 def get_db():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
@@ -67,7 +68,7 @@ def generate_code(purpose="verify", digits=6):
 
 def send_email(to_email, subject, html_content):
     if not RESEND_API_KEY or not FROM_EMAIL:
-        logging.error("Cannot send email: RESEND_API_KEY or FROM_EMAIL is missing.")
+        logging.error("Missing RESEND_API_KEY or FROM_EMAIL.")
         return False
     try:
         resp = requests.post(
@@ -84,19 +85,115 @@ def send_email(to_email, subject, html_content):
             },
             timeout=10
         )
-        if resp.status_code in (200, 201):
-            logging.info("Email sent successfully to %s", to_email)
-            return True
-        else:
-            logging.error("Resend API error (%s): %s", resp.status_code, resp.text)
-            return False
+        return resp.status_code in (200, 201)
     except Exception as e:
-        logging.exception("Failed to send email to %s: %s", to_email, e)
+        logging.exception("Failed to send email: %s", e)
         return False
+
+# Search Helper Functions
+def search_tavily(query):
+    if not TAVILY_API_KEY:
+        return ""
+    try:
+        res = requests.post(
+            "https://api.tavily.com/search",
+            json={"api_key": TAVILY_API_KEY, "query": query, "max_results": 3},
+            timeout=8
+        )
+        if res.status_code == 200:
+            results = res.json().get("results", [])
+            return "\n".join([f"- {r.get('title')}: {r.get('content')}" for r in results])
+    except Exception as e:
+        logging.error(f"Tavily search failed: {e}")
+    return ""
+
+def search_core(query):
+    if not CORE_API_KEY:
+        return ""
+    try:
+        res = requests.get(
+            f"https://api.core.ac.uk/v3/search/works?q={query}&limit=3",
+            headers={"Authorization": f"Bearer {CORE_API_KEY}"},
+            timeout=8
+        )
+        if res.status_code == 200:
+            results = res.json().get("results", [])
+            papers = []
+            for r in results:
+                title = r.get("title", "Untitled")
+                authors = ", ".join([a.get("name", "") for a in r.get("authors", [])])
+                abstract = r.get("abstract", "")[:200]
+                papers.append(f"- {title} by {authors}: {abstract}")
+            return "\n".join(papers)
+    except Exception as e:
+        logging.error(f"CORE search failed: {e}")
+    return ""
 
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({"status": "API is online"}), 200
+
+@app.route("/generate", methods=["POST"])
+def generate_paper():
+    data = request.get_json(silent=True) or {}
+    prompt = data.get("prompt", "").strip()
+
+    if not prompt:
+        return jsonify({"error": "Prompt is required"}), 400
+
+    if not GROQ_API_KEY:
+        return jsonify({"error": "GROQ_API_KEY is not configured on server"}), 500
+
+    # Fetch context from Tavily & CORE
+    tavily_info = search_tavily(prompt)
+    core_papers = search_core(prompt)
+
+    context = ""
+    if tavily_info:
+        context += f"\nWeb Insights:\n{tavily_info}\n"
+    if core_papers:
+        context += f"\nAcademic Papers:\n{core_papers}\n"
+
+    system_prompt = (
+        "You are an expert academic researcher writing a clear, well-structured paper. "
+        "Guidelines:\n"
+        "1. Write in a natural, direct, human academic tone.\n"
+        "2. Strictly AVOID AI clichés/buzzwords like 'delve', 'tapestry', 'testament', 'pivotal', 'in conclusion', or 'furthermore'.\n"
+        "3. Incorporate provided context smoothly and use APA citations when referencing research.\n"
+        "4. Vary your sentence structures."
+    )
+
+    user_content = f"Topic/Prompt: {prompt}\n\nReference Material:\n{context}" if context else prompt
+
+    try:
+        res = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content}
+                ],
+                "temperature": 0.75,
+                "top_p": 0.9
+            },
+            timeout=30
+        )
+
+        if res.status_code == 200:
+            ai_text = res.json()["choices"][0]["message"]["content"]
+            return jsonify({"result": ai_text}), 200
+        else:
+            logging.error(f"Groq error ({res.status_code}): {res.text}")
+            return jsonify({"error": "Failed to generate paper from AI model"}), 500
+
+    except Exception as e:
+        logging.exception("Generation error: %s", e)
+        return jsonify({"error": "Server timeout or error"}), 500
 
 @app.route("/register", methods=["POST"])
 def register():
