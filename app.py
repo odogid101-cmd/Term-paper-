@@ -1,14 +1,14 @@
 # app.py
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from werkzeug.security import generate_password_hash, check_password_hash
-import psycopg2
-import psycopg2.errors
+import datetime
+import logging
 import os
 import secrets
-import datetime
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+import psycopg2
+import psycopg2.errors
 import requests
-import logging
+from werkzeug.security import check_password_hash, generate_password_hash
 
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
@@ -27,14 +27,17 @@ TEST_EMAIL_KEY = os.getenv("TEST_EMAIL_KEY")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
 
+
 def get_db():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
+
 
 def init_db():
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS users (
                         id SERIAL PRIMARY KEY,
                         username VARCHAR(50) UNIQUE NOT NULL,
@@ -43,8 +46,10 @@ def init_db():
                         is_verified BOOLEAN DEFAULT FALSE,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
-                """)
-                cur.execute("""
+                """
+                )
+                cur.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS email_verifications (
                         id SERIAL PRIMARY KEY,
                         user_id INT REFERENCES users(id) ON DELETE CASCADE,
@@ -53,18 +58,22 @@ def init_db():
                         expires_at TIMESTAMP NOT NULL,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
-                """)
+                """
+                )
                 conn.commit()
         logging.info("Database initialized successfully.")
     except Exception as e:
         logging.exception("Database initialization failed: %s", e)
 
+
 init_db()
+
 
 def generate_code(purpose="verify", digits=6):
     if digits == 6:
         return f"{secrets.randbelow(1000000):06d}"
     return secrets.token_hex(4)
+
 
 def send_email(to_email, subject, html_content):
     if not RESEND_API_KEY or not FROM_EMAIL:
@@ -75,20 +84,21 @@ def send_email(to_email, subject, html_content):
             "https://api.resend.com/emails",
             headers={
                 "Authorization": f"Bearer {RESEND_API_KEY}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
             },
             json={
                 "from": FROM_EMAIL,
                 "to": [to_email],
                 "subject": subject,
-                "html": html_content
+                "html": html_content,
             },
-            timeout=10
+            timeout=10,
         )
         return resp.status_code in (200, 201)
     except Exception as e:
         logging.exception("Failed to send email: %s", e)
         return False
+
 
 # Search Helper Functions
 def search_tavily(query):
@@ -98,14 +108,17 @@ def search_tavily(query):
         res = requests.post(
             "https://api.tavily.com/search",
             json={"api_key": TAVILY_API_KEY, "query": query, "max_results": 3},
-            timeout=8
+            timeout=8,
         )
         if res.status_code == 200:
             results = res.json().get("results", [])
-            return "\n".join([f"- {r.get('title')}: {r.get('content')}" for r in results])
+            return "\n".join(
+                [f"- {r.get('title')}: {r.get('content')}" for r in results]
+            )
     except Exception as e:
         logging.error(f"Tavily search failed: {e}")
     return ""
+
 
 def search_core(query):
     if not CORE_API_KEY:
@@ -114,14 +127,16 @@ def search_core(query):
         res = requests.get(
             f"https://api.core.ac.uk/v3/search/works?q={query}&limit=3",
             headers={"Authorization": f"Bearer {CORE_API_KEY}"},
-            timeout=8
+            timeout=8,
         )
         if res.status_code == 200:
             results = res.json().get("results", [])
             papers = []
             for r in results:
                 title = r.get("title", "Untitled")
-                authors = ", ".join([a.get("name", "") for a in r.get("authors", [])])
+                authors = ", ".join(
+                    [a.get("name", "") for a in r.get("authors", [])]
+                )
                 abstract = r.get("abstract", "")[:200]
                 papers.append(f"- {title} by {authors}: {abstract}")
             return "\n".join(papers)
@@ -129,9 +144,11 @@ def search_core(query):
         logging.error(f"CORE search failed: {e}")
     return ""
 
+
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({"status": "API is online"}), 200
+
 
 @app.route("/generate", methods=["POST"])
 def generate_paper():
@@ -142,7 +159,10 @@ def generate_paper():
         return jsonify({"error": "Prompt is required"}), 400
 
     if not GROQ_API_KEY:
-        return jsonify({"error": "GROQ_API_KEY is not configured on server"}), 500
+        return (
+            jsonify({"error": "GROQ_API_KEY is not configured on server"}),
+            500,
+        )
 
     # Fetch context from Tavily & CORE
     tavily_info = search_tavily(prompt)
@@ -163,37 +183,62 @@ def generate_paper():
         "4. Vary your sentence structures."
     )
 
-    user_content = f"Topic/Prompt: {prompt}\n\nReference Material:\n{context}" if context else prompt
+    user_content = (
+        f"Topic/Prompt: {prompt}\n\nReference Material:\n{context}"
+        if context
+        else prompt
+    )
 
-    try:
-        res = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content}
-                ],
-                "temperature": 0.75,
-                "top_p": 0.9
-            },
-            timeout=30
-        )
+    # Fallback model list to ensure request success if one is deprecated or unavailable
+    candidate_models = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-70b-versatile",
+        "llama-3.1-8b-instant",
+        "mixtral-8x7b-32768",
+    ]
 
-        if res.status_code == 200:
-            ai_text = res.json()["choices"][0]["message"]["content"]
-            return jsonify({"result": ai_text}), 200
-        else:
-            logging.error(f"Groq error ({res.status_code}): {res.text}")
-            return jsonify({"error": "Failed to generate paper from AI model"}), 500
+    ai_text = None
+    last_error_msg = ""
 
-    except Exception as e:
-        logging.exception("Generation error: %s", e)
-        return jsonify({"error": "Server timeout or error"}), 500
+    for model in candidate_models:
+        try:
+            res = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                    "temperature": 0.75,
+                    "top_p": 0.9,
+                },
+                timeout=30,
+            )
+
+            if res.status_code == 200:
+                ai_text = res.json()["choices"][0]["message"]["content"]
+                break
+            else:
+                last_error_msg = res.text
+                logging.warning(
+                    f"Groq attempt with model {model} failed ({res.status_code}): {res.text}"
+                )
+        except Exception as e:
+            logging.exception(
+                f"Generation error with model {model}: %s", e
+            )
+
+    if ai_text:
+        return jsonify({"result": ai_text}), 200
+    else:
+        logging.error(f"All Groq model attempts failed. Last error: {last_error_msg}")
+        return jsonify({"error": "Failed to generate paper from AI model"}), 500
+
 
 @app.route("/register", methods=["POST"])
 def register():
@@ -212,31 +257,39 @@ def register():
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO users (username, email, password_hash, is_verified) VALUES (%s, %s, %s, FALSE) RETURNING id",
-                    (username, email, pwd_hash)
+                    (username, email, pwd_hash),
                 )
                 user_id = cur.fetchone()[0]
 
                 code = generate_code("verify", digits=6)
-                expires_at = datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
+                expires_at = datetime.datetime.utcnow() + datetime.timedelta(
+                    minutes=15
+                )
                 cur.execute(
                     "INSERT INTO email_verifications (user_id, code, purpose, expires_at) VALUES (%s, %s, %s, %s)",
-                    (user_id, code, "verify", expires_at)
+                    (user_id, code, "verify", expires_at),
                 )
                 conn.commit()
 
         email_html = f"<h3>Welcome to Tempaper!</h3><p>Your verification code is: <b>{code}</b></p>"
         send_email(email, "Verify your Tempaper account", email_html)
 
-        return jsonify({
-            "message": "Registration successful. Please check your email for verification code.",
-            "user_id": user_id
-        }), 201
+        return (
+            jsonify(
+                {
+                    "message": "Registration successful. Please check your email for verification code.",
+                    "user_id": user_id,
+                }
+            ),
+            201,
+        )
 
     except psycopg2.errors.UniqueViolation:
         return jsonify({"error": "Username or email already exists"}), 400
     except Exception as e:
         logging.exception("Registration failed: %s", e)
         return jsonify({"error": "Internal server error"}), 500
+
 
 @app.route("/login", methods=["POST"])
 def login():
@@ -252,7 +305,7 @@ def login():
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, username, email, password_hash, is_verified FROM users WHERE email = %s OR username = %s",
-                    (identifier.lower(), identifier)
+                    (identifier.lower(), identifier),
                 )
                 row = cur.fetchone()
 
@@ -262,17 +315,32 @@ def login():
                 user_id, username, email, _, is_verified = row
 
                 if not is_verified:
-                    return jsonify({"error": "Verify email first", "user_id": user_id}), 403
+                    return (
+                        jsonify(
+                            {"error": "Verify email first", "user_id": user_id}
+                        ),
+                        403,
+                    )
 
-                return jsonify({
-                    "message": "Login successful",
-                    "user_id": user_id,
-                    "user": {"id": user_id, "username": username, "email": email}
-                }), 200
+                return (
+                    jsonify(
+                        {
+                            "message": "Login successful",
+                            "user_id": user_id,
+                            "user": {
+                                "id": user_id,
+                                "username": username,
+                                "email": email,
+                            },
+                        }
+                    ),
+                    200,
+                )
 
     except Exception as e:
         logging.exception("Login failed: %s", e)
         return jsonify({"error": "Internal server error"}), 500
+
 
 @app.route("/me", methods=["GET"])
 def get_me():
@@ -283,22 +351,31 @@ def get_me():
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id, username, email, is_verified FROM users WHERE id = %s", (user_id,))
+                cur.execute(
+                    "SELECT id, username, email, is_verified FROM users WHERE id = %s",
+                    (user_id,),
+                )
                 row = cur.fetchone()
                 if not row:
                     return jsonify({"error": "User not found"}), 404
 
-                return jsonify({
-                    "user": {
-                        "id": row[0],
-                        "username": row[1],
-                        "email": row[2],
-                        "is_verified": row[3]
-                    }
-                }), 200
+                return (
+                    jsonify(
+                        {
+                            "user": {
+                                "id": row[0],
+                                "username": row[1],
+                                "email": row[2],
+                                "is_verified": row[3],
+                            }
+                        }
+                    ),
+                    200,
+                )
     except Exception as e:
         logging.exception("Get profile failed: %s", e)
         return jsonify({"error": "Internal server error"}), 500
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
