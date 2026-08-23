@@ -1,170 +1,146 @@
-import datetime
-import logging
 import os
-import secrets
-from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+import logging
+import requests
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import psycopg2
-import psycopg2.errors
-import requests
-from serpapi import GoogleSearch
-from werkzeug.security import check_password_hash, generate_password_hash
+from psycopg2 import pool
 
-load_dotenv()
-logging.basicConfig(level=logging.INFO)
-
+# Initialize Flask App
 app = Flask(__name__)
 CORS(app)
 
-# Environment variables
-DATABASE_URL = os.getenv("DATABASE_URL")
-RESEND_API_KEY = os.getenv("RESEND_API_KEY")
-FROM_EMAIL = os.getenv("FROM_EMAIL")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-PORT = int(os.getenv("PORT", 5000))
+# Setup Logging
+logging.basicConfig(level=logging.INFO)
 
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL environment variable is required")
+# Environment Variables
+DATABASE_URL = os.environ.get("DATABASE_URL")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+SERPAPI_KEY = os.environ.get("SERPAPI_KEY")
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 
+# PostgreSQL Connection Pooling
+db_pool = None
+if DATABASE_URL:
+    try:
+        db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL)
+        logging.info("Database connection pool created successfully.")
+    except Exception as e:
+        logging.error(f"Error creating database connection pool: {e}")
 
 def get_db():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    if not db_pool:
+        raise Exception("Database pool is not initialized.")
+    return db_pool.getconn()
+
+def release_db(conn):
+    if db_pool and conn:
+        db_pool.putconn(conn)
 
 
-def init_db():
+# --- Helper Search Functions ---
+
+def search_serpapi_ai(query):
+    if not SERPAPI_KEY:
+        return None, []
     try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS users (
-                        id SERIAL PRIMARY KEY,
-                        username VARCHAR(50) UNIQUE NOT NULL,
-                        email VARCHAR(255) UNIQUE NOT NULL,
-                        password_hash VARCHAR(255) NOT NULL,
-                        is_verified BOOLEAN DEFAULT FALSE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
-                """
-                )
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS email_verifications (
-                        id SERIAL PRIMARY KEY,
-                        user_id INT REFERENCES users(id) ON DELETE CASCADE,
-                        code VARCHAR(10) NOT NULL,
-                        purpose VARCHAR(50) NOT NULL,
-                        expires_at TIMESTAMP NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
-                """
-                )
-                conn.commit()
-        logging.info("Database initialized successfully.")
-    except Exception as e:
-        logging.exception("Database initialization failed: %s", e)
-
-
-init_db()
-
-
-def generate_code(digits=6):
-    return f"{secrets.randbelow(10**digits):0{digits}d}"
-
-
-def send_email(to_email, subject, html_content):
-    if not RESEND_API_KEY or not FROM_EMAIL:
-        logging.error("Missing RESEND_API_KEY or FROM_EMAIL configuration.")
-        return False
-    try:
-        resp = requests.post(
-            "https://api.resend.com/emails",
-            headers={
-                "Authorization": f"Bearer {RESEND_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "from": FROM_EMAIL,
-                "to": [to_email],
-                "subject": subject,
-                "html": html_content,
-            },
-            timeout=10,
-        )
-        return resp.status_code in (200, 201)
-    except Exception as e:
-        logging.exception("Failed to send email: %s", e)
-        return False
-
-
-def search_serpapi_ai(query: str):
-    """Fetches Google AI Mode summaries and reference links via SerpApi."""
-    if not SERPAPI_API_KEY:
-        return "", []
-
-    try:
+        url = "https://serpapi.com/search"
         params = {
-            "engine": "google_ai_mode",
             "q": query,
-            "api_key": SERPAPI_API_KEY,
+            "api_key": SERPAPI_KEY,
+            "engine": "google"
         }
-        search = GoogleSearch(params)
-        results = search.get_dict()
-
-        extracted_text = []
-        sources = []
-
-        text_blocks = results.get("text_blocks", [])
-        for block in text_blocks:
-            if isinstance(block, dict) and "snippet" in block:
-                extracted_text.append(block["snippet"])
-            elif isinstance(block, str):
-                extracted_text.append(block)
-
-        references = results.get("references", [])
-        for ref in references:
-            sources.append(
-                {"title": ref.get("title", ""), "link": ref.get("link", "")}
-            )
-
-        context = "\n".join(extracted_text)
-        return context, sources
+        res = requests.get(url, params=params, timeout=8)
+        if res.status_code == 200:
+            data = res.json()
+            organic_results = data.get("organic_results", [])
+            snippets = []
+            sources = []
+            for item in organic_results[:3]:
+                snippet = item.get("snippet", "")
+                link = item.get("link", "")
+                if snippet:
+                    snippets.append(snippet)
+                if link:
+                    sources.append(link)
+            return "\n".join(snippets), sources
     except Exception as e:
-        logging.error(f"SerpApi error: {e}")
-        return "", []
+        logging.warning(f"SerpApi lookup failed: {e}")
+    return None, []
 
-
-def search_tavily(query: str):
-    """Fallback search using Tavily API."""
+def search_tavily(query):
     if not TAVILY_API_KEY:
         return ""
-
     try:
-        res = requests.post(
-            "https://api.tavily.com/search",
-            json={
-                "api_key": TAVILY_API_KEY,
-                "query": query,
-                "max_results": 3,
-            },
-            timeout=8,
-        )
+        url = "https://api.tavily.com/search"
+        payload = {
+            "api_key": TAVILY_API_KEY,
+            "query": query,
+            "search_depth": "basic"
+        }
+        res = requests.post(url, json=payload, timeout=8)
         if res.status_code == 200:
-            results = res.json().get("results", [])
-            return "\n".join(
-                [f"- {r.get('title')}: {r.get('content')}" for r in results]
-            )
+            data = res.json()
+            results = data.get("results", [])
+            snippets = [r.get("content", "") for r in results[:3] if r.get("content")]
+            return "\n".join(snippets)
     except Exception as e:
-        logging.error(f"Tavily search failed: {e}")
+        logging.warning(f"Tavily lookup failed: {e}")
     return ""
 
 
+# --- API Endpoints ---
+
 @app.route("/", methods=["GET"])
-def home():
-    return jsonify({"status": "API is online"}), 200
+def health_check():
+    return jsonify({"status": "ok", "message": "Tempaper API is running."}), 200
+
+
+@app.route("/me", methods=["GET"])
+def get_me():
+    user_id = request.args.get("user_id")
+
+    if not user_id:
+        return jsonify({"error": "Missing user_id parameter"}), 400
+
+    # Prevent PostgreSQL integer conversion crash when 'demo_user' is sent
+    if not str(user_id).isdigit():
+        return jsonify({
+            "user": {
+                "id": 0,
+                "username": "Guest User",
+                "email": "guest@tempaper.com",
+                "is_verified": False
+            }
+        }), 200
+
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, username, email, is_verified FROM users WHERE id = %s",
+                (int(user_id),)
+            )
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "User not found"}), 404
+
+            return jsonify({
+                "user": {
+                    "id": row[0],
+                    "username": row[1],
+                    "email": row[2],
+                    "is_verified": row[3]
+                }
+            }), 200
+    except Exception as e:
+        logging.exception("Get profile failed: %s", e)
+        return jsonify({"error": "Internal server error"}), 500
+    finally:
+        if conn:
+            release_db(conn)
+
 
 @app.route("/generate", methods=["POST"])
 def generate_paper():
@@ -175,14 +151,9 @@ def generate_paper():
         return jsonify({"error": "Prompt is required"}), 400
 
     if not OPENROUTER_API_KEY:
-        return (
-            jsonify(
-                {"error": "OPENROUTER_API_KEY is not configured on server"}
-            ),
-            500,
-        )
+        return jsonify({"error": "OPENROUTER_API_KEY is not configured on server"}), 500
 
-    # Step 1: Search context with tighter network timeouts (8s)
+    # Step 1: Search context with network timeouts
     context, sources = search_serpapi_ai(prompt)
     if not context:
         context = search_tavily(prompt)
@@ -201,13 +172,13 @@ def generate_paper():
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost:5000",
-        "X-Title": "Term Paper Assistant",
+        "HTTP-Referer": "https://tempaper.onrender.com",
+        "X-Title": "Tempaper Generator",
     }
 
-    # Updated active free model fallbacks on OpenRouter
+    # Model endpoints prioritized by speed and free access
     candidate_models = [
-        "openrouter/free",  # Dynamic router for available free models
+        "openrouter/free",
         "meta-llama/llama-3.3-70b-instruct:free",
         "google/gemma-2-9b-it:free",
     ]
@@ -228,11 +199,12 @@ def generate_paper():
                     ],
                     "temperature": 0.7,
                 },
-                timeout=12,  # Prevent single request from hanging Gunicorn
+                timeout=12  # Strict 12s timeout per request to avoid Gunicorn worker kill
             )
 
             if res.status_code == 200:
-                ai_text = res.json()["choices"][0]["message"]["content"]
+                response_json = res.json()
+                ai_text = response_json["choices"][0]["message"]["content"]
                 break
             else:
                 last_error = res.text
@@ -240,195 +212,15 @@ def generate_paper():
                     f"OpenRouter attempt with {model_name} failed ({res.status_code}): {res.text}"
                 )
         except Exception as e:
-            logging.exception(
-                f"OpenRouter error with model {model_name}: %s", e
-            )
+            logging.warning(f"OpenRouter timeout/error with model {model_name}: {e}")
 
     if ai_text:
         return jsonify({"result": ai_text, "sources": sources}), 200
     else:
         logging.error(f"All OpenRouter attempts failed: {last_error}")
-        return jsonify({"error": "Failed to generate paper from AI model"}), 500
-
-
-@app.route("/me", methods=["GET"])
-def get_me():
-    user_id = request.args.get("user_id")
-
-    if not user_id:
-        return jsonify({"error": "Missing user_id parameter"}), 400
-
-    # Prevent PostgreSQL integer cast errors
-    if not str(user_id).isdigit():
-        return (
-            jsonify({"error": "Invalid user_id format. Must be an integer."}),
-            400,
-        )
-
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, username, email, is_verified FROM users WHERE id = %s",
-                    (int(user_id),),
-                )
-                row = cur.fetchone()
-                if not row:
-                    return jsonify({"error": "User not found"}), 404
-
-                return (
-                    jsonify(
-                        {
-                            "user": {
-                                "id": row[0],
-                                "username": row[1],
-                                "email": row[2],
-                                "is_verified": row[3],
-                            }
-                        }
-                    ),
-                    200,
-                )
-    except Exception as e:
-        logging.exception("Get profile failed: %s", e)
-        return jsonify({"error": "Internal server error"}), 500
-
-@app.route("/register", methods=["POST"])
-def register():
-    data = request.get_json(silent=True) or {}
-    username = (data.get("username") or "").strip()
-    email = (data.get("email") or "").strip().lower()
-    password = data.get("password") or ""
-
-    if not username or not email or not password:
-        return jsonify({"error": "Missing required fields"}), 400
-
-    pwd_hash = generate_password_hash(password)
-
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO users (username, email, password_hash, is_verified) VALUES (%s, %s, %s, FALSE) RETURNING id",
-                    (username, email, pwd_hash),
-                )
-                user_id = cur.fetchone()[0]
-
-                code = generate_code(digits=6)
-                expires_at = datetime.datetime.utcnow() + datetime.timedelta(
-                    minutes=15
-                )
-                cur.execute(
-                    "INSERT INTO email_verifications (user_id, code, purpose, expires_at) VALUES (%s, %s, %s, %s)",
-                    (user_id, code, "verify", expires_at),
-                )
-                conn.commit()
-
-        email_html = f"<h3>Welcome to Tempaper!</h3><p>Your verification code is: <b>{code}</b></p>"
-        send_email(email, "Verify your Tempaper account", email_html)
-
-        return (
-            jsonify(
-                {
-                    "message": "Registration successful. Please check your email for verification code.",
-                    "user_id": user_id,
-                }
-            ),
-            201,
-        )
-
-    except psycopg2.errors.UniqueViolation:
-        return jsonify({"error": "Username or email already exists"}), 400
-    except Exception as e:
-        logging.exception("Registration failed: %s", e)
-        return jsonify({"error": "Internal server error"}), 500
-
-
-@app.route("/login", methods=["POST"])
-def login():
-    data = request.get_json(silent=True) or {}
-    identifier = (data.get("identifier") or "").strip()
-    password = data.get("password") or ""
-
-    if not identifier or not password:
-        return jsonify({"error": "Missing identifier or password"}), 400
-
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, username, email, password_hash, is_verified FROM users WHERE email = %s OR username = %s",
-                    (identifier.lower(), identifier),
-                )
-                row = cur.fetchone()
-
-                if not row or not check_password_hash(row[3], password):
-                    return jsonify({"error": "Invalid credentials"}), 401
-
-                user_id, username, email, _, is_verified = row
-
-                if not is_verified:
-                    return (
-                        jsonify(
-                            {"error": "Verify email first", "user_id": user_id}
-                        ),
-                        403,
-                    )
-
-                return (
-                    jsonify(
-                        {
-                            "message": "Login successful",
-                            "user_id": user_id,
-                            "user": {
-                                "id": user_id,
-                                "username": username,
-                                "email": email,
-                            },
-                        }
-                    ),
-                    200,
-                )
-
-    except Exception as e:
-        logging.exception("Login failed: %s", e)
-        return jsonify({"error": "Internal server error"}), 500
-
-
-@app.route("/me", methods=["GET"])
-def get_me():
-    user_id = request.args.get("user_id")
-    if not user_id:
-        return jsonify({"error": "Missing user_id parameter"}), 400
-
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, username, email, is_verified FROM users WHERE id = %s",
-                    (user_id,),
-                )
-                row = cur.fetchone()
-                if not row:
-                    return jsonify({"error": "User not found"}), 404
-
-                return (
-                    jsonify(
-                        {
-                            "user": {
-                                "id": row[0],
-                                "username": row[1],
-                                "email": row[2],
-                                "is_verified": row[3],
-                            }
-                        }
-                    ),
-                    200,
-                )
-    except Exception as e:
-        logging.exception("Get profile failed: %s", e)
-        return jsonify({"error": "Internal server error"}), 500
+        return jsonify({"error": "Failed to generate paper from AI model. Please try again."}), 500
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
