@@ -166,7 +166,6 @@ def search_tavily(query: str):
 def home():
     return jsonify({"status": "API is online"}), 200
 
-
 @app.route("/generate", methods=["POST"])
 def generate_paper():
     data = request.get_json(silent=True) or {}
@@ -183,20 +182,14 @@ def generate_paper():
             500,
         )
 
-    # Fetch context from SerpApi (Google AI Mode)
+    # Step 1: Search context with tighter network timeouts (8s)
     context, sources = search_serpapi_ai(prompt)
-
-    # Fallback to Tavily if SerpApi context is empty
     if not context:
         context = search_tavily(prompt)
 
     system_prompt = (
         "You are an expert academic researcher writing a clear, well-structured term paper. "
-        "Guidelines:\n"
-        "1. Write in a natural, direct, human academic tone.\n"
-        "2. Strictly AVOID AI clichés/buzzwords like 'delve', 'tapestry', 'testament', 'pivotal', 'in conclusion', or 'furthermore'.\n"
-        "3. Incorporate provided reference context smoothly into the text.\n"
-        "4. Vary your sentence structures."
+        "Write in a natural, direct academic tone without clichés or filler words."
     )
 
     user_content = (
@@ -212,11 +205,11 @@ def generate_paper():
         "X-Title": "Term Paper Assistant",
     }
 
-    # Free candidate models on OpenRouter
+    # Updated active free model fallbacks on OpenRouter
     candidate_models = [
+        "openrouter/free",  # Dynamic router for available free models
         "meta-llama/llama-3.3-70b-instruct:free",
         "google/gemma-2-9b-it:free",
-        "openrouter/free",
     ]
 
     ai_text = None
@@ -235,7 +228,7 @@ def generate_paper():
                     ],
                     "temperature": 0.7,
                 },
-                timeout=30,
+                timeout=12,  # Prevent single request from hanging Gunicorn
             )
 
             if res.status_code == 200:
@@ -257,6 +250,48 @@ def generate_paper():
         logging.error(f"All OpenRouter attempts failed: {last_error}")
         return jsonify({"error": "Failed to generate paper from AI model"}), 500
 
+
+@app.route("/me", methods=["GET"])
+def get_me():
+    user_id = request.args.get("user_id")
+
+    if not user_id:
+        return jsonify({"error": "Missing user_id parameter"}), 400
+
+    # Prevent PostgreSQL integer cast errors
+    if not str(user_id).isdigit():
+        return (
+            jsonify({"error": "Invalid user_id format. Must be an integer."}),
+            400,
+        )
+
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, username, email, is_verified FROM users WHERE id = %s",
+                    (int(user_id),),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "User not found"}), 404
+
+                return (
+                    jsonify(
+                        {
+                            "user": {
+                                "id": row[0],
+                                "username": row[1],
+                                "email": row[2],
+                                "is_verified": row[3],
+                            }
+                        }
+                    ),
+                    200,
+                )
+    except Exception as e:
+        logging.exception("Get profile failed: %s", e)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/register", methods=["POST"])
 def register():
