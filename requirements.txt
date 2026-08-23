@@ -6,3 +6,4 @@ python-dotenv
 gunicorn
 faster-whisper
 werkzeug
+google-search-results
