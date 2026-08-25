@@ -1,10 +1,17 @@
 import os
+import random
+import string
 import logging
-import requests
+from datetime import datetime, timedelta
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import psycopg2
 from psycopg2 import pool
+import requests
+from werkzeug.security import generate_password_hash, check_password_hash
+from google import genai
+from google.genai import types
 
 # Initialize Flask App
 app = Flask(__name__)
@@ -15,9 +22,13 @@ logging.basicConfig(level=logging.INFO)
 
 # Environment Variables
 DATABASE_URL = os.environ.get("DATABASE_URL")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-SERPAPI_KEY = os.environ.get("SERPAPI_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
+
+# Initialize Gemini Client
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # PostgreSQL Connection Pooling
 db_pool = None
@@ -37,63 +48,364 @@ def release_db(conn):
     if db_pool and conn:
         db_pool.putconn(conn)
 
+# Helper: OTP Generators
+def generate_otp(prefix):
+    digits = "".join(random.choices(string.digits, k=3))
+    return f"{prefix}{digits}"
 
-# --- Helper Search Functions ---
-
-def search_serpapi_ai(query):
-    if not SERPAPI_KEY:
-        return None, []
+# Helper: Send Email via Resend
+def send_email(to_email, subject, html_content):
+    if not RESEND_API_KEY:
+        logging.warning("RESEND_API_KEY is not configured. Email skipped.")
+        return False
+    
+    url = "https://api.resend.com/emails"
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "from": RESEND_FROM_EMAIL,
+        "to": [to_email],
+        "subject": subject,
+        "html": html_content
+    }
     try:
-        url = "https://serpapi.com/search"
-        params = {
-            "q": query,
-            "api_key": SERPAPI_KEY,
-            "engine": "google"
-        }
-        res = requests.get(url, params=params, timeout=8)
-        if res.status_code == 200:
-            data = res.json()
-            organic_results = data.get("organic_results", [])
-            snippets = []
-            sources = []
-            for item in organic_results[:3]:
-                snippet = item.get("snippet", "")
-                link = item.get("link", "")
-                if snippet:
-                    snippets.append(snippet)
-                if link:
-                    sources.append(link)
-            return "\n".join(snippets), sources
+        res = requests.post(url, json=payload, headers=headers, timeout=10)
+        return res.status_code in (200, 201)
     except Exception as e:
-        logging.warning(f"SerpApi lookup failed: {e}")
-    return None, []
+        logging.error(f"Failed to send email via Resend: {e}")
+        return False
 
+# Helper: Tavily Search Function
 def search_tavily(query):
     if not TAVILY_API_KEY:
-        return ""
+        logging.warning("TAVILY_API_KEY is not configured.")
+        return "", []
     try:
         url = "https://api.tavily.com/search"
         payload = {
             "api_key": TAVILY_API_KEY,
             "query": query,
-            "search_depth": "basic"
+            "search_depth": "basic",
+            "max_results": 3
         }
         res = requests.post(url, json=payload, timeout=8)
         if res.status_code == 200:
             data = res.json()
             results = data.get("results", [])
-            snippets = [r.get("content", "") for r in results[:3] if r.get("content")]
-            return "\n".join(snippets)
+            snippets = [r.get("content", "") for r in results if r.get("content")]
+            sources = [r.get("url", "") for r in results if r.get("url")]
+            return "\n\n".join(snippets), sources
     except Exception as e:
         logging.warning(f"Tavily lookup failed: {e}")
-    return ""
+    return "", []
 
 
-# --- API Endpoints ---
+# --- Health Check ---
 
 @app.route("/", methods=["GET"])
 def health_check():
     return jsonify({"status": "ok", "message": "Tempaper API is running."}), 200
+
+
+# --- Auth & User Endpoints ---
+
+@app.route("/register", methods=["POST"])
+def register():
+    data = request.get_json(silent=True) or {}
+    username = data.get("username", "").strip()
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+
+    if not username or not email or not password:
+        return jsonify({"error": "All fields are required"}), 400
+
+    hashed = generate_password_hash(password)
+    otp = generate_otp("ver")
+    expires_at = datetime.utcnow() + timedelta(minutes=15)
+
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users (username, email, password_hash, is_verified, otp_code, otp_expires_at)
+                VALUES (%s, %s, %s, FALSE, %s, %s)
+                RETURNING id;
+                """,
+                (username, email, hashed, otp, expires_at)
+            )
+            user_id = cur.fetchone()[0]
+            conn.commit()
+
+        send_email(
+            email,
+            "Verify Your Tempaper Account",
+            f"<p>Your verification code is: <strong>{otp}</strong></p><p>Expires in 15 minutes.</p>"
+        )
+
+        return jsonify({"message": "Registration successful. Please check your email for verification code.", "user_id": user_id}), 201
+    except psycopg2.IntegrityError:
+        if conn: conn.rollback()
+        return jsonify({"error": "Username or Email already exists"}), 400
+    except Exception as e:
+        if conn: conn.rollback()
+        logging.exception("Registration failed: %s", e)
+        return jsonify({"error": "Internal server error"}), 500
+    finally:
+        if conn: release_db(conn)
+
+
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.get_json(silent=True) or {}
+    identifier = data.get("identifier", "").strip().lower()
+    password = data.get("password", "")
+
+    if not identifier or not password:
+        return jsonify({"error": "Missing email/username or password"}), 400
+
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, username, email, password_hash, is_verified FROM users WHERE LOWER(email) = %s OR LOWER(username) = %s",
+                (identifier, identifier)
+            )
+            row = cur.fetchone()
+            if not row or not check_password_hash(row[3], password):
+                return jsonify({"error": "Invalid username/email or password"}), 401
+
+            if not row[4]:
+                return jsonify({"error": "Verify email first"}), 403
+
+            return jsonify({
+                "message": "Login successful",
+                "user_id": row[0],
+                "user": {"id": row[0], "username": row[1], "email": row[2]}
+            }), 200
+    except Exception as e:
+        logging.exception("Login error: %s", e)
+        return jsonify({"error": "Internal server error"}), 500
+    finally:
+        if conn: release_db(conn)
+
+
+@app.route("/verify-email", methods=["POST"])
+def verify_email():
+    data = request.get_json(silent=True) or {}
+    email = data.get("email", "").strip().lower()
+    code = data.get("code", "").strip()
+
+    if not email or not code:
+        return jsonify({"error": "Email and code are required"}), 400
+
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, otp_code, otp_expires_at FROM users WHERE LOWER(email) = %s",
+                (email,)
+            )
+            row = cur.fetchone()
+
+            if not row:
+                return jsonify({"error": "User not found"}), 404
+
+            user_id, saved_otp, expires_at = row
+
+            if saved_otp != code:
+                return jsonify({"error": "Invalid verification code"}), 400
+
+            if expires_at and datetime.utcnow() > expires_at:
+                return jsonify({"error": "Verification code has expired"}), 400
+
+            cur.execute(
+                "UPDATE users SET is_verified = TRUE, otp_code = NULL, otp_expires_at = NULL WHERE id = %s",
+                (user_id,)
+            )
+            conn.commit()
+
+            return jsonify({"message": "Account verified successfully!"}), 200
+    except Exception as e:
+        if conn: conn.rollback()
+        logging.exception("Verify error: %s", e)
+        return jsonify({"error": "Internal server error"}), 500
+    finally:
+        if conn: release_db(conn)
+
+
+@app.route("/resend-verification", methods=["POST"])
+def resend_verification():
+    data = request.get_json(silent=True) or {}
+    email = data.get("email", "").strip().lower()
+
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+
+    otp = generate_otp("ver")
+    expires_at = datetime.utcnow() + timedelta(minutes=15)
+
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET otp_code = %s, otp_expires_at = %s WHERE LOWER(email) = %s RETURNING is_verified",
+                (otp, expires_at, email)
+            )
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "Email not found"}), 404
+
+            if row[0]:
+                return jsonify({"message": "Account is already verified"}), 200
+
+            conn.commit()
+
+        send_email(
+            email,
+            "Your Verification Code",
+            f"<p>Your new verification code is: <strong>{otp}</strong></p>"
+        )
+
+        return jsonify({"message": "Verification code resent successfully"}), 200
+    except Exception as e:
+        if conn: conn.rollback()
+        logging.exception("Resend verification failed: %s", e)
+        return jsonify({"error": "Internal server error"}), 500
+    finally:
+        if conn: release_db(conn)
+
+
+@app.route("/request-reset", methods=["POST"])
+def request_reset():
+    data = request.get_json(silent=True) or {}
+    email = data.get("email", "").strip().lower()
+
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+
+    otp = generate_otp("pass")
+    expires_at = datetime.utcnow() + timedelta(minutes=15)
+
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET otp_code = %s, otp_expires_at = %s WHERE LOWER(email) = %s RETURNING id",
+                (otp, expires_at, email)
+            )
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"message": "If the email exists, a code was sent."}), 200
+
+            conn.commit()
+
+        send_email(
+            email,
+            "Password Reset Code",
+            f"<p>Your password reset code is: <strong>{otp}</strong></p>"
+        )
+
+        return jsonify({"message": "Reset code sent to your email."}), 200
+    except Exception as e:
+        if conn: conn.rollback()
+        logging.exception("Request reset failed: %s", e)
+        return jsonify({"error": "Internal server error"}), 500
+    finally:
+        if conn: release_db(conn)
+
+
+@app.route("/reset-password", methods=["POST"])
+def reset_password():
+    data = request.get_json(silent=True) or {}
+    email = data.get("email", "").strip().lower()
+    code = data.get("code", "").strip()
+    new_password = data.get("new_password", "")
+
+    if not email or not code or not new_password:
+        return jsonify({"error": "Missing required fields"}), 400
+
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, otp_code, otp_expires_at FROM users WHERE LOWER(email) = %s",
+                (email,)
+            )
+            row = cur.fetchone()
+
+            if not row or row[1] != code:
+                return jsonify({"error": "Invalid code or email"}), 400
+
+            _, _, expires_at = row
+            if expires_at and datetime.utcnow() > expires_at:
+                return jsonify({"error": "Reset code has expired"}), 400
+
+            new_hashed = generate_password_hash(new_password)
+            cur.execute(
+                "UPDATE users SET password_hash = %s, otp_code = NULL, otp_expires_at = NULL WHERE LOWER(email) = %s",
+                (new_hashed, email)
+            )
+            conn.commit()
+
+            return jsonify({"message": "Password updated successfully!"}), 200
+    except Exception as e:
+        if conn: conn.rollback()
+        logging.exception("Reset password failed: %s", e)
+        return jsonify({"error": "Internal server error"}), 500
+    finally:
+        if conn: release_db(conn)
+
+
+@app.route("/change-password", methods=["POST"])
+def change_password():
+    data = request.get_json(silent=True) or {}
+    user_id = data.get("user_id")
+    code = data.get("code", "").strip()
+    new_password = data.get("new_password", "")
+
+    if not user_id or not code or not new_password:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, otp_code, otp_expires_at FROM users WHERE id = %s",
+                (int(user_id),)
+            )
+            row = cur.fetchone()
+
+            if not row or row[1] != code:
+                return jsonify({"error": "Invalid authorization code"}), 400
+
+            _, _, expires_at = row
+            if expires_at and datetime.utcnow() > expires_at:
+                return jsonify({"error": "Code has expired"}), 400
+
+            new_hashed = generate_password_hash(new_password)
+            cur.execute(
+                "UPDATE users SET password_hash = %s, otp_code = NULL, otp_expires_at = NULL WHERE id = %s",
+                (new_hashed, int(user_id))
+            )
+            conn.commit()
+
+            return jsonify({"message": "Password updated successfully"}), 200
+    except Exception as e:
+        if conn: conn.rollback()
+        logging.exception("Change password error: %s", e)
+        return jsonify({"error": "Internal server error"}), 500
+    finally:
+        if conn: release_db(conn)
 
 
 @app.route("/me", methods=["GET"])
@@ -103,7 +415,6 @@ def get_me():
     if not user_id:
         return jsonify({"error": "Missing user_id parameter"}), 400
 
-    # Prevent PostgreSQL integer conversion crash when 'demo_user' is sent
     if not str(user_id).isdigit():
         return jsonify({
             "user": {
@@ -138,9 +449,10 @@ def get_me():
         logging.exception("Get profile failed: %s", e)
         return jsonify({"error": "Internal server error"}), 500
     finally:
-        if conn:
-            release_db(conn)
+        if conn: release_db(conn)
 
+
+# --- Generation Endpoint (Tavily + Google AI Studio) ---
 
 @app.route("/generate", methods=["POST"])
 def generate_paper():
@@ -150,75 +462,40 @@ def generate_paper():
     if not prompt:
         return jsonify({"error": "Prompt is required"}), 400
 
-    if not OPENROUTER_API_KEY:
-        return jsonify({"error": "OPENROUTER_API_KEY is not configured on server"}), 500
+    if not ai_client:
+        return jsonify({"error": "GEMINI_API_KEY is not configured on server"}), 500
 
-    # Step 1: Search context with network timeouts
-    context, sources = search_serpapi_ai(prompt)
-    if not context:
-        context = search_tavily(prompt)
+    # Step 1: Research query using Tavily API
+    tavily_context, sources = search_tavily(prompt)
 
-    system_prompt = (
-        "You are an expert academic researcher writing a clear, well-structured term paper. "
-        "Write in a natural, direct academic tone without clichés or filler words."
-    )
-
-    user_content = (
-        f"Topic/Prompt: {prompt}\n\nReference Material:\n{context}"
-        if context
-        else prompt
-    )
-
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://tempaper.onrender.com",
-        "X-Title": "Tempaper Generator",
-    }
-
-    # Model endpoints prioritized by speed and free access
-    candidate_models = [
-        "openrouter/free",
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "google/gemma-2-9b-it:free",
-    ]
-
-    ai_text = None
-    last_error = ""
-
-    for model_name in candidate_models:
-        try:
-            res = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json={
-                    "model": model_name,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_content},
-                    ],
-                    "temperature": 0.7,
-                },
-                timeout=12  # Strict 12s timeout per request to avoid Gunicorn worker kill
-            )
-
-            if res.status_code == 200:
-                response_json = res.json()
-                ai_text = response_json["choices"][0]["message"]["content"]
-                break
-            else:
-                last_error = res.text
-                logging.warning(
-                    f"OpenRouter attempt with {model_name} failed ({res.status_code}): {res.text}"
-                )
-        except Exception as e:
-            logging.warning(f"OpenRouter timeout/error with model {model_name}: {e}")
-
-    if ai_text:
-        return jsonify({"result": ai_text, "sources": sources}), 200
+    # Step 2: Build research context prompt
+    if tavily_context:
+        full_content = f"Topic/Prompt: {prompt}\n\nReference Material from Research:\n{tavily_context}"
     else:
-        logging.error(f"All OpenRouter attempts failed: {last_error}")
-        return jsonify({"error": "Failed to generate paper from AI model. Please try again."}), 500
+        full_content = prompt
+
+    try:
+        # Step 3: Generate paper with Gemini 2.5 Flash
+        response = ai_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=full_content,
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "You are an expert academic researcher writing a clear, well-structured term paper. "
+                    "Write in a natural academic tone without filler words using the provided reference material."
+                ),
+                temperature=0.7
+            ),
+        )
+
+        return jsonify({
+            "result": response.text,
+            "sources": sources
+        }), 200
+
+    except Exception as e:
+        logging.exception("Gemini generation error: %s", e)
+        return jsonify({"error": f"Failed to generate paper: {str(e)}"}), 500
 
 
 if __name__ == "__main__":
