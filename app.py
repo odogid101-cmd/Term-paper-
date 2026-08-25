@@ -18,8 +18,11 @@ CORS(app)
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
 
-# Environment Variables
+# Environment Variables & URL Fix for PostgreSQL
 DATABASE_URL = os.environ.get("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
@@ -53,6 +56,41 @@ def get_db():
 def release_db(conn):
     if db_pool and conn:
         db_pool.putconn(conn)
+
+def init_db():
+    """Automatically creates the users table on startup if it does not exist."""
+    if not db_pool:
+        logging.error("Cannot initialize DB: db_pool is not ready.")
+        return
+
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    username VARCHAR(100) UNIQUE NOT NULL,
+                    email VARCHAR(255) UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    is_verified BOOLEAN DEFAULT FALSE,
+                    otp_code VARCHAR(20),
+                    otp_expires_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            conn.commit()
+            logging.info("Database schema initialized successfully.")
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logging.error(f"Error initializing database schema: {e}")
+    finally:
+        if conn:
+            release_db(conn)
+
+# Run schema initialization automatically when server starts
+init_db()
 
 # Helper: OTP Generator
 def generate_otp(prefix):
@@ -110,7 +148,7 @@ def search_tavily(query):
 
 # --- Endpoints ---
 
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET", "HEAD"])
 def health_check():
     return jsonify({"status": "ok", "message": "Tempaper API is running."}), 200
 
@@ -369,49 +407,6 @@ def reset_password():
         if conn: release_db(conn)
 
 
-@app.route("/change-password", methods=["POST"])
-def change_password():
-    data = request.get_json(silent=True) or {}
-    user_id = data.get("user_id")
-    code = data.get("code", "").strip()
-    new_password = data.get("new_password", "")
-
-    if not user_id or not code or not new_password:
-        return jsonify({"error": "Missing required parameters"}), 400
-
-    conn = None
-    try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, otp_code, otp_expires_at FROM users WHERE id = %s",
-                (int(user_id),)
-            )
-            row = cur.fetchone()
-
-            if not row or row[1] != code:
-                return jsonify({"error": "Invalid authorization code"}), 400
-
-            _, _, expires_at = row
-            if expires_at and datetime.utcnow() > expires_at:
-                return jsonify({"error": "Code has expired"}), 400
-
-            new_hashed = generate_password_hash(new_password)
-            cur.execute(
-                "UPDATE users SET password_hash = %s, otp_code = NULL, otp_expires_at = NULL WHERE id = %s",
-                (new_hashed, int(user_id))
-            )
-            conn.commit()
-
-            return jsonify({"message": "Password updated successfully"}), 200
-    except Exception as e:
-        if conn: conn.rollback()
-        logging.exception("Change password error: %s", e)
-        return jsonify({"error": "Internal server error"}), 500
-    finally:
-        if conn: release_db(conn)
-
-
 @app.route("/me", methods=["GET"])
 def get_me():
     user_id = request.args.get("user_id")
@@ -467,24 +462,21 @@ def generate_paper():
     if not ai_client:
         return jsonify({"error": "GEMINI_API_KEY is not properly initialized on the server"}), 500
 
-    # Step 1: Query search context from Tavily
     tavily_context, sources = search_tavily(prompt)
 
-    # Step 2: Assemble query payload
     if tavily_context:
         full_content = f"Topic/Prompt: {prompt}\n\nReference Material:\n{tavily_context}"
     else:
         full_content = prompt
 
     try:
-        # Step 3: Call Google Gemini with gemini-1.5-flash
         response = ai_client.models.generate_content(
             model="gemini-1.5-flash",
             contents=full_content,
             config=types.GenerateContentConfig(
                 system_instruction=(
                     "You are an expert academic researcher writing a clear, well-structured term paper. "
-                    "Write in a direct academic tone without clichés using the reference material."
+                    "Write in a direct academic tone using the reference material where applicable."
                 ),
                 temperature=0.7
             )
