@@ -471,8 +471,8 @@ def generate_paper():
 
     try:
         response = ai_client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=full_content,
+    model="gemini-2.5-flash",
+    contents=full_content,
             config=types.GenerateContentConfig(
                 system_instruction=(
                     "You are an expert academic researcher writing a clear, well-structured term paper. "
