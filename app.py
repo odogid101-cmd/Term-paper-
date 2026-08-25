@@ -10,8 +10,6 @@ import psycopg2
 from psycopg2 import pool
 import requests
 from werkzeug.security import generate_password_hash, check_password_hash
-from google import genai
-from google.genai import types
 
 # Initialize Flask App
 app = Flask(__name__)
@@ -27,8 +25,16 @@ TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 
-# Initialize Gemini Client
-ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# Google GenAI Initialization
+ai_client = None
+if GEMINI_API_KEY:
+    try:
+        from google import genai
+        from google.genai import types
+        ai_client = genai.Client(api_key=GEMINI_API_KEY)
+        logging.info("Google GenAI client initialized successfully.")
+    except Exception as e:
+        logging.error(f"Failed to initialize Google GenAI client: {e}")
 
 # PostgreSQL Connection Pooling
 db_pool = None
@@ -48,7 +54,7 @@ def release_db(conn):
     if db_pool and conn:
         db_pool.putconn(conn)
 
-# Helper: OTP Generators
+# Helper: OTP Generator
 def generate_otp(prefix):
     digits = "".join(random.choices(string.digits, k=3))
     return f"{prefix}{digits}"
@@ -102,14 +108,12 @@ def search_tavily(query):
     return "", []
 
 
-# --- Health Check ---
+# --- Endpoints ---
 
 @app.route("/", methods=["GET"])
 def health_check():
     return jsonify({"status": "ok", "message": "Tempaper API is running."}), 200
 
-
-# --- Auth & User Endpoints ---
 
 @app.route("/register", methods=["POST"])
 def register():
@@ -146,7 +150,7 @@ def register():
             f"<p>Your verification code is: <strong>{otp}</strong></p><p>Expires in 15 minutes.</p>"
         )
 
-        return jsonify({"message": "Registration successful. Please check your email for verification code.", "user_id": user_id}), 201
+        return jsonify({"message": "Registration successful. Check your email for code.", "user_id": user_id}), 201
     except psycopg2.IntegrityError:
         if conn: conn.rollback()
         return jsonify({"error": "Username or Email already exists"}), 400
@@ -452,8 +456,6 @@ def get_me():
         if conn: release_db(conn)
 
 
-# --- Generation Endpoint (Tavily + Google AI Studio) ---
-
 @app.route("/generate", methods=["POST"])
 def generate_paper():
     data = request.get_json(silent=True) or {}
@@ -463,29 +465,29 @@ def generate_paper():
         return jsonify({"error": "Prompt is required"}), 400
 
     if not ai_client:
-        return jsonify({"error": "GEMINI_API_KEY is not configured on server"}), 500
+        return jsonify({"error": "GEMINI_API_KEY is not properly initialized on the server"}), 500
 
-    # Step 1: Research query using Tavily API
+    # Step 1: Query search context from Tavily
     tavily_context, sources = search_tavily(prompt)
 
-    # Step 2: Build research context prompt
+    # Step 2: Assemble query payload
     if tavily_context:
-        full_content = f"Topic/Prompt: {prompt}\n\nReference Material from Research:\n{tavily_context}"
+        full_content = f"Topic/Prompt: {prompt}\n\nReference Material:\n{tavily_context}"
     else:
         full_content = prompt
 
     try:
-        # Step 3: Generate paper with Gemini 2.5 Flash
+        # Step 3: Call Google Gemini with gemini-1.5-flash
         response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-1.5-flash",
             contents=full_content,
             config=types.GenerateContentConfig(
                 system_instruction=(
                     "You are an expert academic researcher writing a clear, well-structured term paper. "
-                    "Write in a natural academic tone without filler words using the provided reference material."
+                    "Write in a direct academic tone without clichés using the reference material."
                 ),
                 temperature=0.7
-            ),
+            )
         )
 
         return jsonify({
