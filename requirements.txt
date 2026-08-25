@@ -7,3 +7,4 @@ gunicorn
 faster-whisper
 werkzeug
 google-search-results
+google-genai
