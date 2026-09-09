@@ -142,9 +142,8 @@ def search_tavily(query):
         logging.warning(f"Tavily lookup failed: {e}")
     return "", []
 
-# Helper: Robust Gemini Call with Retry Logic
-def call_gemini_with_retry(contents, system_instruction, max_retries=3):
-    if not ai_client:
+Helper: Robust Gemini Call with Retry Logic and Increased Client Timeout
+def call_gemini_with_retry(contents, system_instruction, max_retries=3):    if not ai_client:
         raise Exception("Gemini client not initialized")
 
     delay = 2
