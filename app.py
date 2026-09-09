@@ -1,4 +1,5 @@
 import os
+import time
 import random
 import string
 import logging
@@ -18,7 +19,7 @@ CORS(app)
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
 
-# Environment Variables & URL Fix for PostgreSQL
+# Environment Variables
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -58,7 +59,6 @@ def release_db(conn):
         db_pool.putconn(conn)
 
 def init_db():
-    """Automatically creates the users table on startup if it does not exist."""
     if not db_pool:
         logging.error("Cannot initialize DB: db_pool is not ready.")
         return
@@ -89,15 +89,13 @@ def init_db():
         if conn:
             release_db(conn)
 
-# Run schema initialization automatically when server starts
 init_db()
 
-# Helper: OTP Generator
+# Helpers
 def generate_otp(prefix):
     digits = "".join(random.choices(string.digits, k=3))
     return f"{prefix}{digits}"
 
-# Helper: Send Email via Resend
 def send_email(to_email, subject, html_content):
     if not RESEND_API_KEY:
         logging.warning("RESEND_API_KEY is not configured. Email skipped.")
@@ -121,7 +119,6 @@ def send_email(to_email, subject, html_content):
         logging.error(f"Failed to send email via Resend: {e}")
         return False
 
-# Helper: Tavily Search Function
 def search_tavily(query):
     if not TAVILY_API_KEY:
         logging.warning("TAVILY_API_KEY is not configured.")
@@ -145,13 +142,36 @@ def search_tavily(query):
         logging.warning(f"Tavily lookup failed: {e}")
     return "", []
 
+# Helper: Robust Gemini Call with Retry Logic
+def call_gemini_with_retry(contents, system_instruction, max_retries=4):
+    delay = 2
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = ai_client.models.generate_content(
+                model="gemini-3.6-flash",
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=0.7
+                )
+            )
+            return response.text
+        except Exception as e:
+            err_msg = str(e)
+            is_503 = "503" in err_msg or "UNAVAILABLE" in err_msg or "high demand" in err_msg
+            
+            if is_503 and attempt < max_retries:
+                logging.warning(f"Gemini 503 hit. Attempt {attempt}/{max_retries}. Retrying in {delay}s...")
+                time.sleep(delay)
+                delay *= 2
+            else:
+                raise e
 
-# --- Endpoints ---
+# --- Routes ---
 
 @app.route("/", methods=["GET", "HEAD"])
 def health_check():
     return jsonify({"status": "ok", "message": "Tempaper API is running."}), 200
-
 
 @app.route("/register", methods=["POST"])
 def register():
@@ -199,7 +219,6 @@ def register():
     finally:
         if conn: release_db(conn)
 
-
 @app.route("/login", methods=["POST"])
 def login():
     data = request.get_json(silent=True) or {}
@@ -234,7 +253,6 @@ def login():
         return jsonify({"error": "Internal server error"}), 500
     finally:
         if conn: release_db(conn)
-
 
 @app.route("/verify-email", methods=["POST"])
 def verify_email():
@@ -280,7 +298,6 @@ def verify_email():
     finally:
         if conn: release_db(conn)
 
-
 @app.route("/resend-verification", methods=["POST"])
 def resend_verification():
     data = request.get_json(silent=True) or {}
@@ -323,7 +340,6 @@ def resend_verification():
     finally:
         if conn: release_db(conn)
 
-
 @app.route("/request-reset", methods=["POST"])
 def request_reset():
     data = request.get_json(silent=True) or {}
@@ -362,7 +378,6 @@ def request_reset():
         return jsonify({"error": "Internal server error"}), 500
     finally:
         if conn: release_db(conn)
-
 
 @app.route("/reset-password", methods=["POST"])
 def reset_password():
@@ -405,7 +420,6 @@ def reset_password():
         return jsonify({"error": "Internal server error"}), 500
     finally:
         if conn: release_db(conn)
-
 
 @app.route("/me", methods=["GET"])
 def get_me():
@@ -450,10 +464,8 @@ def get_me():
     finally:
         if conn: release_db(conn)
 
-
 @app.route("/chat", methods=["POST"])
 def assistant_chat():
-    """Lightweight AI assistant route strictly using Gemini API for research & general help."""
     data = request.get_json(silent=True) or {}
     prompt = data.get("prompt", "").strip()
 
@@ -464,22 +476,15 @@ def assistant_chat():
         return jsonify({"error": "GEMINI_API_KEY is not configured"}), 500
 
     try:
-        response = ai_client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=(
-                    "You are an AI Copilot research assistant. "
-                    "Provide clear, concise, and helpful answers to guide academic research, outlines, and general student questions."
-                ),
-                temperature=0.7
-            )
+        sys_instruction = (
+            "You are an AI Copilot research assistant. "
+            "Provide clear, concise, and helpful answers to guide academic research, outlines, and general student questions."
         )
-        return jsonify({"result": response.text}), 200
+        result_text = call_gemini_with_retry(prompt, sys_instruction)
+        return jsonify({"result": result_text}), 200
     except Exception as e:
         logging.exception("Gemini assistant error: %s", e)
         return jsonify({"error": f"Assistant error: {str(e)}"}), 500
-
 
 @app.route("/generate", methods=["POST"])
 def generate_paper():
@@ -500,29 +505,22 @@ def generate_paper():
         full_content = prompt
 
     try:
-        response = ai_client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=full_content,
-            config=types.GenerateContentConfig(
-                system_instruction=(
-                    "You are an expert academic researcher writing a complete, professional term paper. "
-                    "Structure the paper clearly as if it were formatted in Microsoft Word: "
-                    "Use a main Title (# Title), Executive Summary/Abstract, Main Sections (## Section), "
-                    "Subsections (### Subsection), well-developed paragraphs, and formal References/Citations."
-                ),
-                temperature=0.7
-            )
+        sys_instruction = (
+            "You are an expert academic researcher writing a complete, professional term paper. "
+            "Structure the paper clearly as if it were formatted in Microsoft Word: "
+            "Use a main Title (# Title), Executive Summary/Abstract, Main Sections (## Section), "
+            "Subsections (### Subsection), well-developed paragraphs, and formal References/Citations."
         )
+        result_text = call_gemini_with_retry(full_content, sys_instruction)
 
         return jsonify({
-            "result": response.text,
+            "result": result_text,
             "sources": sources
         }), 200
 
     except Exception as e:
         logging.exception("Gemini generation error: %s", e)
         return jsonify({"error": f"Failed to generate paper: {str(e)}"}), 500
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
