@@ -1,5 +1,4 @@
 import os
-import time
 import random
 import string
 import logging
@@ -17,9 +16,9 @@ app = Flask(__name__)
 CORS(app)
 
 # Setup Logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Environment Variables
+# Environment Variables & URL Fix for PostgreSQL
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -39,15 +38,19 @@ if GEMINI_API_KEY:
         logging.info("Google GenAI client initialized successfully.")
     except Exception as e:
         logging.error(f"Failed to initialize Google GenAI client: {e}")
+else:
+    logging.warning("GEMINI_API_KEY not found in environment.")
 
 # PostgreSQL Connection Pooling
 db_pool = None
 if DATABASE_URL:
     try:
-        db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL, connect_timeout=10)
+        db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL)
         logging.info("Database connection pool created successfully.")
     except Exception as e:
         logging.error(f"Error creating database connection pool: {e}")
+else:
+    logging.warning("DATABASE_URL not found in environment.")
 
 def get_db():
     if not db_pool:
@@ -59,6 +62,7 @@ def release_db(conn):
         db_pool.putconn(conn)
 
 def init_db():
+    """Automatically creates the users table on startup if it does not exist."""
     if not db_pool:
         logging.error("Cannot initialize DB: db_pool is not ready.")
         return
@@ -89,13 +93,15 @@ def init_db():
         if conn:
             release_db(conn)
 
+# Run schema initialization automatically when server starts
 init_db()
 
-# Helpers
+# Helper: OTP Generator
 def generate_otp(prefix):
     digits = "".join(random.choices(string.digits, k=3))
     return f"{prefix}{digits}"
 
+# Helper: Send Email via Resend
 def send_email(to_email, subject, html_content):
     if not RESEND_API_KEY:
         logging.warning("RESEND_API_KEY is not configured. Email skipped.")
@@ -114,11 +120,13 @@ def send_email(to_email, subject, html_content):
     }
     try:
         res = requests.post(url, json=payload, headers=headers, timeout=10)
-        return res.status_code in (200, 201)
+        res.raise_for_status()
+        return True
     except Exception as e:
         logging.error(f"Failed to send email via Resend: {e}")
         return False
 
+# Helper: Tavily Search Function
 def search_tavily(query):
     if not TAVILY_API_KEY:
         logging.warning("TAVILY_API_KEY is not configured.")
@@ -129,9 +137,10 @@ def search_tavily(query):
             "api_key": TAVILY_API_KEY,
             "query": query,
             "search_depth": "basic",
-            "max_results": 3
+            "max_results": 3,
+            "include_answer": False
         }
-        res = requests.post(url, json=payload, timeout=8)
+        res = requests.post(url, json=payload, timeout=10)
         if res.status_code == 200:
             data = res.json()
             results = data.get("results", [])
@@ -142,35 +151,22 @@ def search_tavily(query):
         logging.warning(f"Tavily lookup failed: {e}")
     return "", []
 
-Helper: Robust Gemini Call with Retry Logic and Increased Client Timeout
-def call_gemini_with_retry(contents, system_instruction, max_retries=3):    if not ai_client:
+# Helper: Fast Gemini Call - Humanized + Word Format
+def call_gemini_fast(contents, system_instruction):
+    if not ai_client:
         raise Exception("Gemini client not initialized")
+    response = ai_client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=0.85,
+            max_output_tokens=3000
+        )
+    )
+    return response.text
 
-    delay = 2
-    for attempt in range(1, max_retries + 1):
-        try:
-            # FIX: Removed http_options, use config only
-            response = ai_client.models.generate_content(
-                model="gemini-3.6-flash", # Changed from 2.5-flash to 2.0-flash
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    temperature=0.7
-                )
-            )
-            return response.text
-        except Exception as e:
-            err_msg = str(e).lower()
-            is_503 = "503" in err_msg or "unavailable" in err_msg or "high demand" in err_msg
-
-            if is_503 and attempt < max_retries:
-                logging.warning(f"Gemini 503 hit. Attempt {attempt}/{max_retries}. Retrying in {delay}s...")
-                time.sleep(delay)
-                delay *= 2
-            else:
-                raise e
-
-# --- Routes ---
+# --- Endpoints ---
 
 @app.route("/", methods=["GET", "HEAD"])
 def health_check():
@@ -185,6 +181,8 @@ def register():
 
     if not username or not email or not password:
         return jsonify({"error": "All fields are required"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
 
     hashed = generate_password_hash(password)
     otp = generate_otp("ver")
@@ -208,7 +206,7 @@ def register():
         send_email(
             email,
             "Verify Your Tempaper Account",
-            f"<p>Your verification code is: <strong>{otp}</strong></p><p>Expires in 15 minutes.</p>"
+            f"<h2>Welcome to Tempaper!</h2><p>Your verification code is: <strong>{otp}</strong></p><p>This code expires in 15 minutes.</p>"
         )
 
         return jsonify({"message": "Registration successful. Check your email for code.", "user_id": user_id}), 201
@@ -244,7 +242,7 @@ def login():
                 return jsonify({"error": "Invalid username/email or password"}), 401
 
             if not row[4]:
-                return jsonify({"error": "Verify email first"}), 403
+                return jsonify({"error": "Please verify your email first"}), 403
 
             return jsonify({
                 "message": "Login successful",
@@ -331,8 +329,8 @@ def resend_verification():
 
         send_email(
             email,
-            "Your Verification Code",
-            f"<p>Your new verification code is: <strong>{otp}</strong></p>"
+            "Your Tempaper Verification Code",
+            f"<p>Your new verification code is: <strong>{otp}</strong></p><p>Expires in 15 minutes.</p>"
         )
 
         return jsonify({"message": "Verification code resent successfully"}), 200
@@ -364,14 +362,15 @@ def request_reset():
             )
             row = cur.fetchone()
             if not row:
+                # Don't reveal if email exists
                 return jsonify({"message": "If the email exists, a code was sent."}), 200
 
             conn.commit()
 
         send_email(
             email,
-            "Password Reset Code",
-            f"<p>Your password reset code is: <strong>{otp}</strong></p>"
+            "Tempaper Password Reset Code",
+            f"<p>Your password reset code is: <strong>{otp}</strong></p><p>Expires in 15 minutes.</p>"
         )
 
         return jsonify({"message": "Reset code sent to your email."}), 200
@@ -391,6 +390,8 @@ def reset_password():
 
     if not email or not code or not new_password:
         return jsonify({"error": "Missing required fields"}), 400
+    if len(new_password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
 
     conn = None
     try:
@@ -480,10 +481,10 @@ def assistant_chat():
 
     try:
         sys_instruction = (
-            "You are an AI Copilot research assistant. "
-            "Provide clear, concise, and helpful answers to guide academic research, outlines, and general student questions."
+            "You are an AI Copilot research assistant for students. "
+            "Provide clear, concise, and helpful answers. Use bullet points and examples."
         )
-        result_text = call_gemini_with_retry(prompt, sys_instruction)
+        result_text = call_gemini_fast(prompt, sys_instruction)
         return jsonify({"result": result_text}), 200
     except Exception as e:
         logging.exception("Gemini assistant error: %s", e)
@@ -508,13 +509,24 @@ def generate_paper():
         full_content = prompt
 
     try:
-        sys_instruction = (
-            "You are an expert academic researcher writing a complete, professional term paper. "
-            "Structure the paper clearly as if it were formatted in Microsoft Word: "
-            "Use a main Title (# Title), Executive Summary/Abstract, Main Sections (## Section), "
-            "Subsections (### Subsection), well-developed paragraphs, and formal References/Citations."
-        )
-        result_text = call_gemini_with_retry(full_content, sys_instruction)
+        sys_instruction = """
+You are a professional university lecturer and academic writer.
+Write a complete term paper in the exact format of a Microsoft Word document.
+
+RULES:
+1. Use clear Word-style headings: # for Title, ## for Main Sections, ### for Subsections.
+2. Start with: Title Page, Abstract/Executive Summary, Table of Contents, Introduction.
+3. Body should have 3-5 well developed sections with paragraphs, examples, and analysis.
+4. End with: Conclusion, Recommendations, and References section.
+5. Write in a HUMAN, natural tone. Avoid robotic AI phrases like "In conclusion" or "It is important to note".
+    Use varied sentence length, and student-friendly language.
+6. Cite sources from the Reference Material using [1], [2] etc and list them at the end.
+7. The paper should be 1200-2000 words, well researched and ready to submit.
+
+Format everything in Markdown so it can be copied directly into Microsoft Word.
+"""
+
+        result_text = call_gemini_fast(full_content, sys_instruction)
 
         return jsonify({
             "result": result_text,
@@ -523,10 +535,7 @@ def generate_paper():
 
     except Exception as e:
         logging.exception("Gemini generation error: %s", e)
-        err_msg = str(e)
-        if "timeout" in err_msg.lower() or "deadline" in err_msg.lower():
-            return jsonify({"error": "The generation request timed out. Please try again with a shorter prompt."}), 504
-        return jsonify({"error": f"Failed to generate paper: {err_msg}"}), 500
+        return jsonify({"error": f"Failed to generate paper: {str(e)}"}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
