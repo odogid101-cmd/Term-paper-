@@ -142,17 +142,20 @@ def search_tavily(query):
         logging.warning(f"Tavily lookup failed: {e}")
     return "", []
 
-# Helper: Robust Gemini Call with Retry Logic
-def call_gemini_with_retry(contents, system_instruction, max_retries=4):
+# Helper: Robust Gemini Call with Retry Logic and Increased Client Timeout
+def call_gemini_with_retry(contents, system_instruction, max_retries=3):
     delay = 2
     for attempt in range(1, max_retries + 1):
         try:
             response = ai_client.models.generate_content(
-                model="gemini-3.6-flash",
+                model="gemini-2.5-flash",
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     temperature=0.7
+                ),
+                http_options=types.HttpOptions(
+                    timeout=120.0  # Increased request timeout to 120 seconds
                 )
             )
             return response.text
@@ -520,7 +523,10 @@ def generate_paper():
 
     except Exception as e:
         logging.exception("Gemini generation error: %s", e)
-        return jsonify({"error": f"Failed to generate paper: {str(e)}"}), 500
+        err_msg = str(e)
+        if "timeout" in err_msg.lower() or "timed out" in err_msg.lower():
+            return jsonify({"error": "The generation request timed out. Please try again with a shorter prompt."}), 504
+        return jsonify({"error": f"Failed to generate paper: {err_msg}"}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
