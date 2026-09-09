@@ -44,7 +44,7 @@ if GEMINI_API_KEY:
 db_pool = None
 if DATABASE_URL:
     try:
-        db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL)
+        db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL, connect_timeout=10)
         logging.info("Database connection pool created successfully.")
     except Exception as e:
         logging.error(f"Error creating database connection pool: {e}")
@@ -100,7 +100,7 @@ def send_email(to_email, subject, html_content):
     if not RESEND_API_KEY:
         logging.warning("RESEND_API_KEY is not configured. Email skipped.")
         return False
-    
+
     url = "https://api.resend.com/emails"
     headers = {
         "Authorization": f"Bearer {RESEND_API_KEY}",
@@ -142,27 +142,28 @@ def search_tavily(query):
         logging.warning(f"Tavily lookup failed: {e}")
     return "", []
 
-# Helper: Robust Gemini Call with Retry Logic and Increased Client Timeout
+# Helper: Robust Gemini Call with Retry Logic
 def call_gemini_with_retry(contents, system_instruction, max_retries=3):
+    if not ai_client:
+        raise Exception("Gemini client not initialized")
+
     delay = 2
     for attempt in range(1, max_retries + 1):
         try:
+            # FIX: Removed http_options, use config only
             response = ai_client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-2.0-flash", # Changed from 2.5-flash to 2.0-flash
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     temperature=0.7
-                ),
-                http_options=types.HttpOptions(
-                    timeout=120.0  # Increased request timeout to 120 seconds
                 )
             )
             return response.text
         except Exception as e:
-            err_msg = str(e)
-            is_503 = "503" in err_msg or "UNAVAILABLE" in err_msg or "high demand" in err_msg
-            
+            err_msg = str(e).lower()
+            is_503 = "503" in err_msg or "unavailable" in err_msg or "high demand" in err_msg
+
             if is_503 and attempt < max_retries:
                 logging.warning(f"Gemini 503 hit. Attempt {attempt}/{max_retries}. Retrying in {delay}s...")
                 time.sleep(delay)
@@ -281,7 +282,7 @@ def verify_email():
 
             user_id, saved_otp, expires_at = row
 
-            if saved_otp != code:
+            if saved_otp!= code:
                 return jsonify({"error": "Invalid verification code"}), 400
 
             if expires_at and datetime.utcnow() > expires_at:
@@ -402,10 +403,10 @@ def reset_password():
             )
             row = cur.fetchone()
 
-            if not row or row[1] != code:
+            if not row or row[1]!= code:
                 return jsonify({"error": "Invalid code or email"}), 400
 
-            _, _, expires_at = row
+            _, expires_at = row
             if expires_at and datetime.utcnow() > expires_at:
                 return jsonify({"error": "Reset code has expired"}), 400
 
@@ -524,7 +525,7 @@ def generate_paper():
     except Exception as e:
         logging.exception("Gemini generation error: %s", e)
         err_msg = str(e)
-        if "timeout" in err_msg.lower() or "timed out" in err_msg.lower():
+        if "timeout" in err_msg.lower() or "deadline" in err_msg.lower():
             return jsonify({"error": "The generation request timed out. Please try again with a shorter prompt."}), 504
         return jsonify({"error": f"Failed to generate paper: {err_msg}"}), 500
 
