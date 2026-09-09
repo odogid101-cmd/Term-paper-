@@ -152,7 +152,7 @@ def call_gemini_with_retry(contents, system_instruction, max_retries=3):
         try:
             # FIX: Removed http_options, use config only
             response = ai_client.models.generate_content(
-                model="gemini-2.0-flash", # Changed from 2.5-flash to 2.0-flash
+                model="gemini-3.6-flash", # Changed from 2.5-flash to 2.0-flash
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
