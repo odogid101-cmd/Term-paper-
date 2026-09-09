@@ -451,6 +451,36 @@ def get_me():
         if conn: release_db(conn)
 
 
+@app.route("/chat", methods=["POST"])
+def assistant_chat():
+    """Lightweight AI assistant route strictly using Gemini API for research & general help."""
+    data = request.get_json(silent=True) or {}
+    prompt = data.get("prompt", "").strip()
+
+    if not prompt:
+        return jsonify({"error": "Prompt is required"}), 400
+
+    if not ai_client:
+        return jsonify({"error": "GEMINI_API_KEY is not configured"}), 500
+
+    try:
+        response = ai_client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "You are an AI Copilot research assistant. "
+                    "Provide clear, concise, and helpful answers to guide academic research, outlines, and general student questions."
+                ),
+                temperature=0.7
+            )
+        )
+        return jsonify({"result": response.text}), 200
+    except Exception as e:
+        logging.exception("Gemini assistant error: %s", e)
+        return jsonify({"error": f"Assistant error: {str(e)}"}), 500
+
+
 @app.route("/generate", methods=["POST"])
 def generate_paper():
     data = request.get_json(silent=True) or {}
@@ -471,12 +501,14 @@ def generate_paper():
 
     try:
         response = ai_client.models.generate_content(
-    model="gemini-3.6-flash",
-    contents=full_content,
+            model="gemini-3.6-flash",
+            contents=full_content,
             config=types.GenerateContentConfig(
                 system_instruction=(
-                    "You are an expert academic researcher writing a clear, well-structured term paper. "
-                    "Write in a direct academic tone using the reference material where applicable."
+                    "You are an expert academic researcher writing a complete, professional term paper. "
+                    "Structure the paper clearly as if it were formatted in Microsoft Word: "
+                    "Use a main Title (# Title), Executive Summary/Abstract, Main Sections (## Section), "
+                    "Subsections (### Subsection), well-developed paragraphs, and formal References/Citations."
                 ),
                 temperature=0.7
             )
