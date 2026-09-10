@@ -156,7 +156,7 @@ def call_gemini_fast(contents, system_instruction):
     if not ai_client:
         raise Exception("Gemini client not initialized")
     response = ai_client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-3.6-flash",
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
