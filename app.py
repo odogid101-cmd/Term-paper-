@@ -145,7 +145,7 @@ def generate_with_gemini(prompt, context_text):
     if ai_client and google_types:
         try:
             response = ai_client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-3.6-flash",
                 contents=final_prompt,
                 config=google_types.GenerateContentConfig(
                     system_instruction=(
