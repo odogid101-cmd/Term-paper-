@@ -28,7 +28,6 @@ RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 # Google Gemini initialization
 ai_client = None
 gemini_types = None
-
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 
 if not GEMINI_API_KEY:
@@ -36,19 +35,19 @@ if not GEMINI_API_KEY:
 else:
     try:
         from google import genai
-        from google.genai import types as genai_types
+        from google.genai import types
 
-        gemini_types = genai_types
+        gemini_types = types
         ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
         logging.info(
             "Gemini client initialized successfully. Model: %s",
             GEMINI_MODEL
         )
-
     except Exception as error:
         logging.exception("Gemini client initialization failed: %s", error)
         ai_client = None
+        gemini_types = None
 
 db_pool = None
 if DATABASE_URL:
@@ -121,10 +120,11 @@ def send_email(to_email, subject, html_content):
         "html": html_content
     }
     try:
-        res = requests.post(url, json=payload, headers=headers, timeout=10)
+        res = requests.post(url, json=payload, headers=headers, timeout=15)
+        logging.info("Resend response: status=%s body=%s", res.status_code, res.text)
         return res.status_code in (200, 201)
     except Exception as e:
-        logging.error(f"Failed to send email via Resend: {e}")
+        logging.exception("Failed to send email via Resend: %s", e)
         return False
 
 def search_tavily(query):
@@ -150,66 +150,54 @@ def search_tavily(query):
         logging.warning(f"Tavily lookup failed: {e}")
     return "", []
 
-def generate_with_gemini(prompt, context_text):
+def generate_with_gemini(prompt, context_text=""):
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is missing from the server environment.")
+
+    if not ai_client or not gemini_types:
+        raise RuntimeError(
+            "Gemini client is not initialized. Check google-genai installation and GEMINI_API_KEY."
+        )
+
     final_prompt = context_text if context_text else prompt
 
-    if ai_client and google_types:
-        try:
-            response = ai_client.models.generate_content(
-                model="gemini-3.6-flash",
-                contents=final_prompt,
-                config=google_types.GenerateContentConfig(
-                    system_instruction=(
-                        "You are an expert academic researcher writing a clear, well-structured term paper. "
-                        "Write in a direct academic tone using reference material when available."
-                    ),
-                    temperature=0.7
-                )
-            )
-            return response.text
-        except Exception as e:
-            logging.warning(f"Gemini SDK failed: {e}")
+    system_instruction = """
+You are Tempaper, an expert academic writing assistant.
 
-    if GEMINI_API_KEY:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-            payload = {
-                "contents": [
-                    {"parts": [{"text": final_prompt}]}
-                ],
-                "systemInstruction": {
-                    "parts": [{
-                        "text": (
-                            "You are an expert academic researcher writing a clear, well-structured term paper. "
-                            "Write in a direct academic tone using reference material when available."
-                        )
-                    }]
-                },
-                "generationConfig": {
-                    "temperature": 0.7
-                }
-            }
-            res = requests.post(url, json=payload, timeout=20)
-            if res.status_code == 200:
-                data = res.json()
-                candidates = data.get("candidates", [])
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    text_parts = [p.get("text", "") for p in parts if p.get("text")]
-                    return "\n".join(text_parts)
-        except Exception as e:
-            logging.warning(f"Gemini REST fallback failed: {e}")
+Write a clear, well-structured academic paper based on the user's request.
 
-    return (
-        "# Research Paper\n\n"
-        "This paper was generated from the prompt provided by the user. "
-        "The server did not return a generated result from Gemini, but the application is ready to display academic content once the API key is valid.\n\n"
-        f"Prompt:\n{prompt}"
+Requirements:
+- Use a professional academic tone.
+- Include a suitable title.
+- Use Markdown headings with #, ##, and ###.
+- Include an introduction, body sections, and conclusion when appropriate.
+- Use clear paragraphs.
+- Do not return placeholder text.
+- Do not claim to have searched academic databases unless reference material is provided.
+- Do not invent citations, statistics, quotations, or sources.
+"""
+
+    response = ai_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=final_prompt,
+        config=gemini_types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=0.7,
+            max_output_tokens=8192
+        )
     )
+
+    generated_text = getattr(response, "text", None)
+    if not generated_text or not generated_text.strip():
+        raise RuntimeError("Gemini returned an empty response.")
+
+    return generated_text.strip()
+
 
 @app.route("/", methods=["GET", "HEAD"])
 def health_check():
     return jsonify({"status": "ok", "message": "Tempaper API is running."}), 200
+
 
 @app.route("/register", methods=["POST"])
 def register():
@@ -240,11 +228,15 @@ def register():
             user_id = cur.fetchone()[0]
             conn.commit()
 
-        send_email(
+        email_sent = send_email(
             email,
             "Verify Your Tempaper Account",
             f"<p>Your verification code is: <strong>{otp}</strong></p><p>Expires in 15 minutes.</p>"
         )
+
+        if not email_sent:
+            logging.error("Registration email failed for %s", email)
+            return jsonify({"error": "Could not send verification email. Please try again later."}), 502
 
         return jsonify({"message": "Registration successful. Check your email for code.", "user_id": user_id}), 201
     except psycopg2.IntegrityError:
@@ -259,6 +251,7 @@ def register():
     finally:
         if conn:
             release_db(conn)
+
 
 @app.route("/login", methods=["POST"])
 def login():
@@ -295,6 +288,7 @@ def login():
     finally:
         if conn:
             release_db(conn)
+
 
 @app.route("/verify-email", methods=["POST"])
 def verify_email():
@@ -342,6 +336,7 @@ def verify_email():
         if conn:
             release_db(conn)
 
+
 @app.route("/resend-verification", methods=["POST"])
 def resend_verification():
     data = request.get_json(silent=True) or {}
@@ -370,11 +365,14 @@ def resend_verification():
 
             conn.commit()
 
-        send_email(
+        email_sent = send_email(
             email,
             "Your Verification Code",
             f"<p>Your new verification code is: <strong>{otp}</strong></p>"
         )
+
+        if not email_sent:
+            return jsonify({"error": "Verification email could not be sent."}), 502
 
         return jsonify({"message": "Verification code resent successfully"}), 200
     except Exception as e:
@@ -385,6 +383,7 @@ def resend_verification():
     finally:
         if conn:
             release_db(conn)
+
 
 @app.route("/request-reset", methods=["POST"])
 def request_reset():
@@ -411,11 +410,15 @@ def request_reset():
 
             conn.commit()
 
-        send_email(
+        email_sent = send_email(
             email,
             "Password Reset Code",
-            f"<p>Your password reset code is: <strong>{otp}</strong></p>"
+            f"<div><h2>Tempaper Password Reset</h2><p>Your password reset code is:</p><h1>{otp}</h1><p>This code expires in 15 minutes.</p></div>"
         )
+
+        if not email_sent:
+            logging.error("Password reset email failed for %s", email)
+            return jsonify({"error": "The reset code could not be sent. Please try again later."}), 502
 
         return jsonify({"message": "Reset code sent to your email."}), 200
     except Exception as e:
@@ -523,13 +526,14 @@ def generate_paper():
     if not prompt:
         return jsonify({"error": "Prompt is required"}), 400
 
-    tavily_context, sources = search_tavily(prompt)
-    if tavily_context:
-        final_content = f"Topic/Prompt: {prompt}\n\nReference Material:\n{tavily_context}"
-    else:
-        final_content = prompt
-
     try:
+        tavily_context, sources = search_tavily(prompt)
+
+        if tavily_context:
+            final_content = f"Topic/Prompt: {prompt}\n\nReference Material:\n{tavily_context}"
+        else:
+            final_content = prompt
+
         result = generate_with_gemini(prompt, final_content)
         return jsonify({
             "result": result,
@@ -537,7 +541,9 @@ def generate_paper():
         }), 200
     except Exception as e:
         logging.exception("Generation error: %s", e)
-        return jsonify({"error": f"Failed to generate paper: {str(e)}"}), 500
+        return jsonify({
+            "error": "Gemini failed to generate the paper. Check the server logs for the exact error."
+        }), 502
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
