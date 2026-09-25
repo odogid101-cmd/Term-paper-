@@ -25,18 +25,29 @@ TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 
+# Google Gemini initialization
 ai_client = None
-google_types = None
+gemini_types = None
 
-if GEMINI_API_KEY:
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+
+if not GEMINI_API_KEY:
+    logging.error("GEMINI_API_KEY is missing.")
+else:
     try:
         from google import genai
-        from google.genai import types as google_types_module
-        google_types = google_types_module
+        from google.genai import types as genai_types
+
+        gemini_types = genai_types
         ai_client = genai.Client(api_key=GEMINI_API_KEY)
-        logging.info("Google GenAI client initialized successfully.")
-    except Exception as e:
-        logging.warning(f"Falling back to REST Gemini mode. GenAI init failed: {e}")
+
+        logging.info(
+            "Gemini client initialized successfully. Model: %s",
+            GEMINI_MODEL
+        )
+
+    except Exception as error:
+        logging.exception("Gemini client initialization failed: %s", error)
         ai_client = None
 
 db_pool = None
