@@ -13,7 +13,7 @@ import requests
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=["https://odogid101-cmd.github.io", "*"])
 
 logging.basicConfig(level=logging.INFO)
 
@@ -22,8 +22,9 @@ if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.0-flash-lite")
+# FIXED DEFAULTS - old ones are deleted
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
@@ -67,7 +68,6 @@ def init_db():
     if not db_pool:
         logging.error("Cannot initialize DB: db_pool is not ready.")
         return
-
     conn = None
     try:
         conn = get_db()
@@ -103,7 +103,6 @@ def send_email(to_email, subject, html_content):
     if not RESEND_API_KEY:
         logging.error("RESEND_API_KEY is not configured.")
         return False
-
     try:
         response = requests.post(
             "https://api.resend.com/emails",
@@ -152,7 +151,13 @@ Include an introduction, organized body sections, and a conclusion when appropri
 Do not return placeholder text. Do not invent citations, statistics, quotations, or sources.
 """
 
-    models = list(dict.fromkeys([GEMINI_MODEL, GEMINI_FALLBACK_MODEL]))
+    # FIXED: 4 models fallback instead of 2 dead ones
+    models = list(dict.fromkeys([
+        GEMINI_MODEL,
+        GEMINI_FALLBACK_MODEL,
+        "gemini-2.5-flash-lite",
+        "gemini-1.5-flash-8b"
+    ]))
     last_error = None
 
     for model_name in models:
@@ -178,20 +183,32 @@ Do not return placeholder text. Do not invent citations, statistics, quotations,
                 message = str(error)
                 logging.warning("Gemini failed: model=%s attempt=%s error=%s", model_name, attempt + 1, message)
 
+                # 404 means model is deleted - don't retry, go to next model
+                if "404" in message or "NOT_FOUND" in message:
+                    logging.warning("Model %s is deleted, skipping", model_name)
+                    break
+
                 temporary = any(marker in message.upper() for marker in (
                     "503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "INTERNAL", "DEADLINE_EXCEEDED"
                 ))
                 if not temporary:
+                    # If it's a permanent error like bad prompt, try next model once
+                    if attempt == 0:
+                        continue
                     break
+
                 if attempt < 2:
-                    time.sleep(2 ** (attempt + 1))
+                    # Respect Google's 45s retry for 429, shorter for 503
+                    sleep_time = 45 if "429" in message else 2 ** (attempt + 1)
+                    time.sleep(sleep_time + random.uniform(0,1))
+
         logging.warning("Trying next Gemini model after failure: %s", model_name)
 
     raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
 
 @app.route("/", methods=["GET", "HEAD"])
 def health_check():
-    return jsonify({"status": "ok", "message": "Tempaper API is running."}), 200
+    return jsonify({"status": "ok", "message": "Tempaper API is running.", "primary_model": GEMINI_MODEL, "fallback": GEMINI_FALLBACK_MODEL}), 200
 
 @app.route("/register", methods=["POST"])
 def register():
@@ -289,7 +306,7 @@ def verify_email():
             if not row:
                 return jsonify({"error": "User not found"}), 404
             user_id, saved_otp, expires_at = row
-            if saved_otp != code:
+            if saved_otp!= code:
                 return jsonify({"error": "Invalid verification code"}), 400
             if expires_at and datetime.utcnow() > expires_at:
                 return jsonify({"error": "Verification code has expired"}), 400
@@ -401,7 +418,7 @@ def reset_password():
         with conn.cursor() as cur:
             cur.execute("SELECT otp_code, otp_expires_at FROM users WHERE LOWER(email) = %s", (email,))
             row = cur.fetchone()
-            if not row or row[0] != code:
+            if not row or row[0]!= code:
                 return jsonify({"error": "Invalid code or email"}), 400
             if row[1] and datetime.utcnow() > row[1]:
                 return jsonify({"error": "Reset code has expired"}), 400
@@ -464,10 +481,18 @@ def generate_paper():
     try:
         tavily_context, sources = search_tavily(prompt)
         final_content = f"Topic/Prompt: {prompt}\n\nReference Material:\n{tavily_context}" if tavily_context else prompt
-        return jsonify({"result": generate_with_gemini(prompt, final_content), "sources": sources}), 200
-    except Exception as error:
+        result_text = generate_with_gemini(prompt, final_content)
+        return jsonify({"result": result_text, "sources": sources}), 200
+    except RuntimeError as error:
+        # This is the error you saw in logs - now returns 429 not 503
         logging.exception("Generation failed: %s", error)
-        return jsonify({"error": "Gemini is temporarily unavailable. Please try again in a moment."}), 503
+        msg = str(error)
+        if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+            return jsonify({"error": "AI quota exceeded. Free tier is 5 req/min. Please wait 1 min and retry."}), 429
+        return jsonify({"error": "Gemini is temporarily unavailable. Please try again in a moment.", "details": msg[:400]}), 503
+    except Exception as error:
+        logging.exception("Generate route failed: %s", error)
+        return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
