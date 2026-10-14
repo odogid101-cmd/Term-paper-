@@ -252,21 +252,27 @@ def search_tavily(query):
         logger.warning("Tavily lookup failed: %s", e)
     return "", []
 
+
 def generate_with_gemini(prompt, context_text=""):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY missing")
     if genai is None:
         raise RuntimeError("Gemini Python SDK is not available")
 
+    # Build final prompt content; include any retrieved context first
     final_prompt = context_text if context_text else prompt
 
-    system_instruction = """
-You are Tempaper, an expert academic writing assistant.
-Write a clear, well-structured academic paper based on the user's request.
-Use a professional academic tone, include a suitable title, and use Markdown headings with #, ##, and ###.
-Include an introduction, organized body sections, and a conclusion when appropriate.
-Do not invent citations, statistics, quotations, or sources.
-"""
+    # Place system instruction at the top of the text prompt instead of passing it as a keyword.
+    system_instruction = (
+        "You are Tempaper, an expert academic writing assistant.\n"
+        "Write a clear, well-structured academic paper based on the user's request.\n"
+        "Use a professional academic tone, include a suitable title, and use Markdown headings with #, ##, and ###.\n"
+        "Include an introduction, organized body sections, and a conclusion when appropriate.\n"
+        "Do not invent citations, statistics, quotations, or sources.\n\n"
+    )
+
+    # Put the system instruction before the actual prompt so the model sees it first.
+    combined_prompt = system_instruction + final_prompt
 
     models = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL, "gemini-1.5-flash-latest", "gemini-1.5-flash"]
     last_error = None
@@ -275,16 +281,18 @@ Do not invent citations, statistics, quotations, or sources.
         for attempt in range(3):
             try:
                 logger.info("Calling Gemini model=%s attempt=%s", model_name, attempt + 1)
+                # Use the SDK's GenerativeModel.generate_content with only supported args.
                 model = genai.GenerativeModel(model_name)
+                # NOTE: some SDK versions accept 'generation_config' dict; others accept keyword args.
+                # Here we pass generation_config only; remove unsupported kwargs (system_instruction, safety_settings).
                 response = model.generate_content(
-                    final_prompt,
+                    combined_prompt,
                     generation_config={
                         "temperature": 0.7,
                         "max_output_tokens": 8192,
-                    },
-                    safety_settings=None,
-                    system_instruction=system_instruction
+                    }
                 )
+                # older SDKs attach text on response.text; keep existing extraction.
                 text = getattr(response, "text", None)
                 if not text or not text.strip():
                     raise RuntimeError("Empty Gemini response")
@@ -295,6 +303,7 @@ Do not invent citations, statistics, quotations, or sources.
                 msg = str(e).upper()
                 logger.warning("Gemini failed: model=%s error=%s", model_name, msg)
 
+                # Keep the same error handling / backoff strategy you already had
                 if "404" in msg or "NOT_FOUND" in msg:
                     break
 
@@ -309,7 +318,6 @@ Do not invent citations, statistics, quotations, or sources.
                     time.sleep(sleep_time + random.uniform(0, 1))
 
     raise RuntimeError("All Gemini models failed. Last error: %s" % last_error)
-
 @app.route("/", methods=["GET", "HEAD"])
 def health_check():
     return jsonify({"status": "ok", "message": "Tempaper API is running."}), 200
