@@ -1,12 +1,10 @@
 Flask
 Flask-Cors
 Flask-Caching
-google-generativeai
+cachelib
 psycopg2-binary
 requests
-python-dotenv
+Werkzeug
+groq
 gunicorn
-faster-whisper
-werkzeug
-google-search-results
-google-genai
+python-dotenv
