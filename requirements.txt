@@ -1,6 +1,7 @@
 Flask
 Flask-Cors
 Flask-Caching
+google-generativeai
 psycopg2-binary
 requests
 python-dotenv
