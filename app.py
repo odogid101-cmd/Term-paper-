@@ -252,17 +252,14 @@ def search_tavily(query):
         logger.warning("Tavily lookup failed: %s", e)
     return "", []
 
-
 def generate_with_gemini(prompt, context_text=""):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY missing")
     if genai is None:
         raise RuntimeError("Gemini Python SDK is not available")
 
-    # Build final prompt content; include any retrieved context first
     final_prompt = context_text if context_text else prompt
 
-    # Place system instruction at the top of the text prompt instead of passing it as a keyword.
     system_instruction = (
         "You are Tempaper, an expert academic writing assistant.\n"
         "Write a clear, well-structured academic paper based on the user's request.\n"
@@ -270,54 +267,32 @@ def generate_with_gemini(prompt, context_text=""):
         "Include an introduction, organized body sections, and a conclusion when appropriate.\n"
         "Do not invent citations, statistics, quotations, or sources.\n\n"
     )
-
-    # Put the system instruction before the actual prompt so the model sees it first.
     combined_prompt = system_instruction + final_prompt
 
-    models = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL, "gemini-1.5-flash-latest", "gemini-1.5-flash"]
-    last_error = None
+    model_name = "gemini-3.6-flash"  # ONLY this model
 
-    for model_name in models:
-        for attempt in range(3):
-            try:
-                logger.info("Calling Gemini model=%s attempt=%s", model_name, attempt + 1)
-                # Use the SDK's GenerativeModel.generate_content with only supported args.
-                model = genai.GenerativeModel(model_name)
-                # NOTE: some SDK versions accept 'generation_config' dict; others accept keyword args.
-                # Here we pass generation_config only; remove unsupported kwargs (system_instruction, safety_settings).
-                response = model.generate_content(
-                    combined_prompt,
-                    generation_config={
-                        "temperature": 0.7,
-                        "max_output_tokens": 8192,
-                    }
-                )
-                # older SDKs attach text on response.text; keep existing extraction.
-                text = getattr(response, "text", None)
-                if not text or not text.strip():
-                    raise RuntimeError("Empty Gemini response")
-                logger.info("Gemini success with model=%s", model_name)
-                return text.strip()
-            except Exception as e:
-                last_error = e
-                msg = str(e).upper()
-                logger.warning("Gemini failed: model=%s error=%s", model_name, msg)
+    try:
+        logger.info(f"Calling Gemini model={model_name}")
+        model = genai.GenerativeModel(model_name)
+        response = model.generate_content(
+            combined_prompt,
+            generation_config={
+                "temperature": 0.7,
+                "max_output_tokens": 8192,
+            },
+            request_options={"timeout": 25}
+        )
+        text = getattr(response, "text", None)
+        if not text or not text.strip():
+            raise RuntimeError("Empty Gemini response")
+        return text.strip()
+    except Exception as e:
+        msg = str(e)
+        # If quota error, don't sleep here, just raise it to be handled in /generate route as 429
+        if "429" in msg.upper() or "RESOURCE_EXHAUSTED" in msg.upper() or "quota" in msg.lower():
+            logger.warning(f"{model_name} quota hit (5/min free tier). Returning 429 to client.")
+raise RuntimeError(f"429 Quota exceeded for {model_name}: {msg}")
 
-                # Keep the same error handling / backoff strategy you already had
-                if "404" in msg or "NOT_FOUND" in msg:
-                    break
-
-                temp_error = any(marker in msg for marker in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "INTERNAL", "DEADLINE_EXCEEDED"))
-                if not temp_error and attempt == 0:
-                    continue
-                if not temp_error:
-                    break
-
-                if attempt < 2:
-                    sleep_time = 45 if "429" in msg else 2 ** (attempt + 1)
-                    time.sleep(sleep_time + random.uniform(0, 1))
-
-    raise RuntimeError("All Gemini models failed. Last error: %s" % last_error)
 @app.route("/", methods=["GET", "HEAD"])
 def health_check():
     return jsonify({"status": "ok", "message": "Tempaper API is running."}), 200
