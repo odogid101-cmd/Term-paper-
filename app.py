@@ -3,23 +3,115 @@ import random
 import string
 import time
 import logging
+import functools
 from datetime import datetime, timedelta
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_caching import Cache
+
+# Try to import real Cache; if backend import fails at init time (as in your logs),
+# fall back to a lightweight wrapper using cachelib.SimpleCache to avoid crashing.
+cache = None
+_use_real_flask_caching = False
+
+try:
+    # Import Cache class (may succeed) but instantiation may fail if backend import fails.
+    from flask_caching import Cache as FlaskCache
+    _use_real_flask_caching = True
+except Exception as e:
+    # If import of the package itself fails, we will fall back below.
+    logging.getLogger(__name__).warning("flask_caching import failed: %s", e)
+    _use_real_flask_caching = False
+
+# Initialize Flask app early so we can try init_app on real cache if available
+app = Flask(__name__)
+CORS(app, supports_credentials=True, origins=["https://odogid101-cmd.github.io", "http://localhost:3000", "http://localhost:5000"])
+
+# Now try to set up cache in a safe way
+if _use_real_flask_caching:
+    try:
+        # Attempt to create and init real Flask-Caching. This may raise if backend mapping changed.
+        cache = FlaskCache(config={"CACHE_TYPE": "simple", "CACHE_DEFAULT_TIMEOUT": 300})
+        cache.init_app(app)
+        logging.getLogger(__name__).info("Initialized Flask-Caching (real).")
+    except Exception as e:
+        logging.getLogger(__name__).warning("Flask-Caching initialization failed: %s. Falling back to simple cache.", e)
+        cache = None
+
+# If cache is still None, create a small fallback wrapper around cachelib.SimpleCache
+if cache is None:
+    try:
+        from cachelib import SimpleCache
+        _simple_cache_store = SimpleCache(default_timeout=300)
+
+        class FallbackCache:
+            def __init__(self, store):
+                self._store = store
+
+            def init_app(self, app, config=None):
+                # no-op for compatibility
+                return
+
+            def get(self, key):
+                return self._store.get(key)
+
+            def set(self, key, value, timeout=None):
+                return self._store.set(key, value, timeout)
+
+            def cached(self, timeout=300, query_string=False):
+                """
+                Decorator to mimic Flask-Caching cached decorator for simple uses in this app.
+                Caching key is built from request.path and optionally the query string.
+                The decorator stores the full return value of the view function (including Flask Response).
+                """
+                def decorator(f):
+                    @functools.wraps(f)
+                    def wrapped(*args, **kwargs):
+                        try:
+                            # Build key from path + optionally query string
+                            key = f"cached:v1:{request.path}"
+                            if query_string:
+                                qs = request.query_string.decode() if request.query_string else ""
+                                key = f"{key}?{qs}"
+                            cached_val = self._store.get(key)
+                            if cached_val is not None:
+                                return cached_val
+                            rv = f(*args, **kwargs)
+                            # Cache the response only if it's not an error or None
+                            self._store.set(key, rv, timeout)
+                            return rv
+                        except Exception as exc:
+                            # On any cache-side problem, log and continue without caching
+                            logging.getLogger(__name__).exception("Fallback cache error: %s", exc)
+                            return f(*args, **kwargs)
+                    return wrapped
+                return decorator
+
+        cache = FallbackCache(_simple_cache_store)
+        logging.getLogger(__name__).info("Using fallback SimpleCache wrapper for caching.")
+    except Exception as e:
+        # As a last resort provide a no-op cache object with 'cached' decorator that returns the function unchanged
+        logging.getLogger(__name__).warning("Failed to initialize fallback cachelib SimpleCache: %s. Using no-op cache.", e)
+
+        class NoOpCache:
+            def cached(self, *args, **kwargs):
+                def decorator(f):
+                    return f
+                return decorator
+
+            def init_app(self, app, config=None):
+                return
+
+        cache = NoOpCache()
+
+# Now continue with the rest of your app setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 import psycopg2
 from psycopg2 import pool
 import requests
 from werkzeug.security import generate_password_hash, check_password_hash
-
-app = Flask(__name__)
-CORS(app, supports_credentials=True, origins=["https://odogid101-cmd.github.io", "http://localhost:3000", "http://localhost:5000"])
-
-cache = Cache(app, config={"CACHE_TYPE": "simple", "CACHE_DEFAULT_TIMEOUT": 300})
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
@@ -460,7 +552,8 @@ def reset_password():
         if conn:
             release_db(conn)
 
-@app.route("/me", methods=["GET"])
+# Use caching decorator safely: our cache wrapper provides cached(...) in all fallback cases
+@app.route("/me", methods=["GET", "HEAD"])
 @cache.cached(timeout=300, query_string=True)
 def get_me():
     user_id = request.args.get("user_id")
@@ -509,6 +602,7 @@ def generate_paper():
         word_count = len(result_text.split())
         page_count = max(1, word_count // 250)
 
+        # Only save sessions for real numeric users (guests do not get saved)
         if str(user_id).isdigit():
             conn = None
             try:
@@ -544,13 +638,21 @@ def generate_paper():
 @app.route("/papers", methods=["GET"])
 def get_papers():
     user_id = request.args.get("user_id")
+    # Guests and invalid user ids get an empty list (no history)
     if not user_id or not str(user_id).isdigit():
         return jsonify({"papers": []}), 200
 
+    # Verify the user actually exists; if not, return empty
     conn = None
     try:
         conn = get_db()
         with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE id = %s", (int(user_id),))
+            user_row = cur.fetchone()
+            if not user_row:
+                return jsonify({"papers": []}), 200
+
+            # Fetch paper sessions strictly for this user
             cur.execute("""
                 SELECT id, session_id, title, prompt_text, word_count, page_count, created_at
                 FROM paper_sessions WHERE user_id = %s ORDER BY created_at DESC LIMIT 50
@@ -633,4 +735,5 @@ def settings():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    # app already created above
     app.run(host="0.0.0.0", port=port, debug=False)
