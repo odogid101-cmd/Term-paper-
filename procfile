@@ -1,0 +1,1 @@
+web: gunicorn -k gthread --threads 25 -w 2 app:app
