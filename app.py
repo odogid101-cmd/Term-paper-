@@ -251,15 +251,11 @@ def search_tavily(query):
     except Exception as e:
         logger.warning("Tavily lookup failed: %s", e)
     return "", []
-
 def generate_with_gemini(prompt, context_text=""):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY missing")
-    if genai is None:
-        raise RuntimeError("Gemini Python SDK is not available")
 
     final_prompt = context_text if context_text else prompt
-
     system_instruction = (
         "You are Tempaper, an expert academic writing assistant.\n"
         "Write a clear, well-structured academic paper based on the user's request.\n"
@@ -269,10 +265,26 @@ def generate_with_gemini(prompt, context_text=""):
     )
     combined_prompt = system_instruction + final_prompt
 
-    model_name = "gemini-3.6-flash"  # ONLY this model
+    model_name = GEMINI_MODEL
 
     try:
-        logger.info(f"Calling Gemini model={model_name}")
+        logger.info("Calling Gemini model=%s", model_name)
+
+        if hasattr(genai, "Client"):
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            response = client.models.generate_content(
+                model=model_name,
+                contents=combined_prompt,
+                config={
+                    "temperature": 0.7,
+                    "max_output_tokens": 8192,
+                },
+            )
+            text = getattr(response, "text", None)
+            if not text or not str(text).strip():
+                raise RuntimeError("Empty Gemini response")
+            return str(text).strip()
+
         model = genai.GenerativeModel(model_name)
         response = model.generate_content(
             combined_prompt,
@@ -280,18 +292,18 @@ def generate_with_gemini(prompt, context_text=""):
                 "temperature": 0.7,
                 "max_output_tokens": 8192,
             },
-            request_options={"timeout": 25}
+            request_options={"timeout": 25},
         )
         text = getattr(response, "text", None)
-        if not text or not text.strip():
+        if not text or not str(text).strip():
             raise RuntimeError("Empty Gemini response")
-        return text.strip()
+        return str(text).strip()
+
     except Exception as e:
         msg = str(e)
-        # If quota error, don't sleep here, just raise it to be handled in /generate route as 429
         if "429" in msg.upper() or "RESOURCE_EXHAUSTED" in msg.upper() or "quota" in msg.lower():
-            logger.warning(f"{model_name} quota hit (5/min free tier). Returning 429 to client.")
-raise RuntimeError(f"429 Quota exceeded for {model_name}: {msg}")
+            raise RuntimeError(f"429 Quota exceeded for {model_name}: {msg}") from e
+        raise RuntimeError(f"Gemini generation failed for {model_name}: {msg}") from e
 
 @app.route("/", methods=["GET", "HEAD"])
 def health_check():
