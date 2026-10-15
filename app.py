@@ -1,4 +1,5 @@
 import os
+import re
 import random
 import string
 import logging
@@ -87,6 +88,8 @@ def init_db():
             cur.execute("""CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(100) UNIQUE NOT NULL, email VARCHAR(255) UNIQUE NOT NULL, password_hash TEXT NOT NULL, is_verified BOOLEAN DEFAULT FALSE, otp_code VARCHAR(20), otp_expires_at TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_login TIMESTAMP);""")
             cur.execute("""CREATE TABLE IF NOT EXISTS paper_sessions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, session_id VARCHAR(64) UNIQUE NOT NULL, title VARCHAR(200), prompt_text TEXT, result_text TEXT, word_count INTEGER DEFAULT 0, page_count INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);""")
             cur.execute("""CREATE TABLE IF NOT EXISTS user_settings (id SERIAL PRIMARY KEY, user_id INTEGER UNIQUE REFERENCES users(id) ON DELETE CASCADE, theme VARCHAR(20) DEFAULT 'system', font_size INTEGER DEFAULT 16, notifications BOOLEAN DEFAULT TRUE, auto_save BOOLEAN DEFAULT TRUE, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);""")
+            # Keep a table for chat sessions if you want to save assistant chats
+            cur.execute("""CREATE TABLE IF NOT EXISTS chat_sessions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, session_id VARCHAR(64) UNIQUE NOT NULL, title VARCHAR(200), prompt_text TEXT, result_text TEXT, word_count INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);""")
             conn.commit()
     except Exception as e:
         if conn: conn.rollback()
@@ -135,7 +138,7 @@ def generate_with_groq(prompt, context_text=""):
     if not text or not text.strip(): raise RuntimeError("Empty Groq response")
     return text.strip()
 
-# --- ROUTES ---
+# --- ROUTES (original term-paper logic preserved) ---
 @app.route("/", methods=["GET","HEAD"])
 def health_check(): return jsonify({"status":"ok","message":f"Tempaper API running - Groq {GROQ_MODEL}"}),200
 
@@ -277,6 +280,7 @@ def get_me():
     finally:
         if conn: release_db(conn)
 
+# --- ORIGINAL generate route (TERM PAPER generation) - UNTOUCHED LOGIC --- 
 @app.route("/generate", methods=["POST"])
 def generate_paper():
     data=request.get_json(silent=True) or {}
@@ -310,6 +314,7 @@ def generate_paper():
         if "429" in msg: return jsonify({"error":"Groq rate limit, wait 10s"}),429
         return jsonify({"error":"Generation failed","details":msg[:300]}),500
 
+# --- Keep papers listing as before ---
 @app.route("/papers", methods=["GET"])
 def get_papers():
     uid=request.args.get("user_id")
@@ -327,7 +332,8 @@ def get_papers():
 
 @app.route("/settings", methods=["GET","POST"])
 def settings():
-    uid=request.args.get("user_id") or request.get_json(silent=True).get("user_id")
+    # this route retained as-is (same behavior)
+    uid=request.args.get("user_id") or (request.get_json(silent=True) or {}).get("user_id")
     if not uid or not str(uid).isdigit(): return jsonify({"error":"Valid user_id required"}),400
     if request.method=="GET":
         conn=None
@@ -350,6 +356,96 @@ def settings():
         return jsonify({"message":"Updated"}),200
     finally:
         if conn: release_db(conn)
+
+# --- NEW: general AI assistant endpoint (does NOT replace /generate) ---
+def normalize_server_text(text: str) -> str:
+    """Light normalization for model output to help frontend rendering/pagination."""
+    if not text:
+        return text
+    # remove zero-width / BOM characters that can break rendering
+    text = text.replace('\u200b', '').replace('\ufeff', '')
+    # join hyphenated words broken across line boundaries (e.g., 'hy-\nphen' -> 'hyphen')
+    text = re.sub(r'(\w+)-\s*\n\s*(\w+)', r'\1\2', text)
+    # convert bolded single-line headings like "**6.2 Age and Identity**" -> "### 6.2 Age and Identity"
+    text = re.sub(r'^\s*\*\*\s*(\d+(?:\.\d+)*\s*[^\*]+?)\s*\*\*\s*$', r'### \1', text, flags=re.MULTILINE)
+    # catch other bold-wrapped heading-like lines and convert to h3
+    text = re.sub(r'^\s*\*\*\s*(.+?)\s*\*\*\s*$', r'### \1', text, flags=re.MULTILINE)
+    # collapse many blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    """
+    General assistant endpoint. Uses Groq + optional Tavily context.
+    Request JSON:
+      { "prompt": "...", "user_id": "guest" or numeric, "save": true|false, "system_prompt": "...", "temperature": 0.7, "max_tokens": 1024 }
+    Response:
+      { "result": "...", "sources": [...], "word_count": N }
+    """
+    data=request.get_json(silent=True) or {}
+    prompt=str(data.get("prompt","")).strip()
+    user_id=data.get("user_id","guest")
+    save=bool(data.get("save", False))
+    system_prompt=data.get("system_prompt", None)
+    temperature=float(data.get("temperature", 0.7))
+    max_tokens=int(data.get("max_tokens", 1024))
+
+    if not prompt: return jsonify({"error":"Prompt required"}),400
+    if not GROQ_API_KEY: return jsonify({"error":"GROQ_API_KEY missing"}),503
+    try:
+        tavily_context, sources = search_tavily(prompt)
+        final_content = f"{tavily_context}\n\n{prompt}" if tavily_context else prompt
+
+        # Use a neutral assistant system prompt by default (not forcing academic paper)
+        system_msg = system_prompt if system_prompt else "You are a helpful, concise assistant. Answer user questions clearly and honestly. If you don't know, say you don't know."
+
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role":"system","content":system_msg},
+                {"role":"user","content":final_content}
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=0.9
+        )
+        # extract text robustly
+        text = None
+        try:
+            text = response.choices[0].message.content
+        except Exception:
+            try:
+                text = response.choices[0].text
+            except Exception:
+                text = str(response)
+        if not text or not str(text).strip(): raise RuntimeError("Empty Groq response")
+        raw_result = str(text).strip()
+
+        cleaned_result = normalize_server_text(raw_result)
+        word_count = len(cleaned_result.split())
+
+        # optional save to chat_sessions table
+        if save and str(user_id).isdigit():
+            conn=None
+            try:
+                conn=get_db()
+                sid=''.join(random.choices(string.ascii_letters+string.digits,k=32))
+                with conn.cursor() as cur:
+                    cur.execute("INSERT INTO chat_sessions (user_id,session_id,title,prompt_text,result_text,word_count) VALUES (%s,%s,%s,%s,%s,%s)",
+                                (int(user_id), sid, prompt[:200], prompt, cleaned_result, word_count))
+                    conn.commit()
+            except Exception as e:
+                logger.warning(f"Chat save fail: {e}")
+            finally:
+                if conn: release_db(conn)
+
+        return jsonify({"result": cleaned_result, "sources": sources, "word_count": word_count}), 200
+    except Exception as e:
+        logger.exception(f"Chat fail: {e}")
+        msg=str(e)
+        if "429" in msg: return jsonify({"error":"Groq rate limit, wait"}),429
+        return jsonify({"error":"Chat generation failed","details":msg[:300]}),500
 
 if __name__=="__main__":
     port=int(os.environ.get("PORT",5000))
