@@ -4,6 +4,7 @@ import random
 import string
 import logging
 import functools
+import difflib
 from datetime import datetime, timedelta
 
 from flask import Flask, request, jsonify
@@ -46,8 +47,8 @@ CORS(
     origins=[
         "https://odogid101-cmd.github.io",
         "http://localhost:3000",
-        "http://localhost:5000"
-    ]
+        "http://localhost:5000",
+    ],
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -103,7 +104,8 @@ def init_db():
     try:
         conn = get_db()
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
                     username VARCHAR(100) UNIQUE NOT NULL,
@@ -115,9 +117,11 @@ def init_db():
                     last_login TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
-            """)
+                """
+            )
 
-            cur.execute("""
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS paper_sessions (
                     id SERIAL PRIMARY KEY,
                     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -129,9 +133,11 @@ def init_db():
                     page_count INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
-            """)
+                """
+            )
 
-            cur.execute("""
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS user_settings (
                     id SERIAL PRIMARY KEY,
                     user_id INTEGER UNIQUE REFERENCES users(id) ON DELETE CASCADE,
@@ -140,9 +146,11 @@ def init_db():
                     notifications BOOLEAN DEFAULT TRUE,
                     auto_save BOOLEAN DEFAULT TRUE
                 )
-            """)
+                """
+            )
 
-            cur.execute("""
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS chat_sessions (
                     id SERIAL PRIMARY KEY,
                     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -153,14 +161,17 @@ def init_db():
                     word_count INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
-            """)
+                """
+            )
 
-            # migration-safe guard for existing DBs:
-            cur.execute("""
+            # migration-safe: add last_login if it doesn't already exist
+            cur.execute(
+                """
                 SELECT 1
                 FROM information_schema.columns
                 WHERE table_name = 'users' AND column_name = 'last_login'
-            """)
+                """
+            )
             if not cur.fetchone():
                 cur.execute("ALTER TABLE users ADD COLUMN last_login TIMESTAMP")
 
@@ -238,8 +249,9 @@ def generate_with_groq(prompt, context_text=""):
                 "content": (
                     "You are Tempaper, an expert academic writing assistant. "
                     "Write a clear, well-structured academic paper based on the user's request. "
-                    "Use a professional academic tone, strong thesis development, "
-                    "coherent structure, and grounded reasoning."
+                    "Use a professional academic tone, strong thesis development, coherent structure, "
+                    "and grounded reasoning. Avoid repeating headings, paragraphs, sections, or references. "
+                    "Keep each section unique and concise, with smooth transitions."
                 ),
             },
             {"role": "user", "content": final_prompt},
@@ -255,46 +267,57 @@ def generate_with_groq(prompt, context_text=""):
 
 
 def normalize_server_text(text: str) -> str:
-    """Light normalization for model output to help frontend rendering/pagination."""
     if not text:
         return text
     text = text.replace("\u200b", "").replace("\ufeff", "")
     text = re.sub(r"(\w+)-\s*\n\s*(\w+)", r"\1\2", text)
-    text = re.sub(r"^\s*\*\*\s*(\d+(?:\.\d+)*\s*[^\*]+?)\s*\*\*\s*$", r"### \1", text, flags=re.MULTILINE)
+    text = re.sub(
+        r"^\s*\*\*\s*(\d+(?:\.\d+)*\s*[^\*]+?)\s*\*\*\s*$",
+        r"### \1",
+        text,
+        flags=re.MULTILINE,
+    )
     text = re.sub(r"^\s*\*\*\s*(.+?)\s*\*\*\s*$", r"### \1", text, flags=re.MULTILINE)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
-def remove_duplicate_sections(text: str) -> str:
+def remove_duplicate_sections(text: str, similarity_threshold: float = 0.92) -> str:
     """
-    Remove exact repeated paragraphs/blocks from model output.
-    This specifically fixes duplicated sections like:
-    'Money of account...' repeated twice in a row.
+    Remove exact repeated blocks and near-duplicate consecutive blocks.
+    Helps prevent repetitive conclusions, summaries, and references.
     """
     if not text:
         return text
 
-    text = normalize_server_text(text)
+    normalized = normalize_server_text(text)
+    raw_blocks = re.split(r"\n\s*\n+", normalized.strip())
+    cleaned_blocks = []
+    seen_exact = set()
+    prev = None
 
-    blocks = re.split(r"\n\s*\n+", text.strip())
-    kept = []
-    seen = set()
-
-    for block in blocks:
-        cleaned = re.sub(r"\s+", " ", block).strip()
-        if not cleaned:
+    for block in raw_blocks:
+        b = block.strip()
+        if not b:
             continue
 
-        norm = cleaned.lower()
-        # dedupe exact repeated paragraph blocks
-        if norm in seen:
+        exact_key = re.sub(r"\s+", " ", b).strip().lower()
+        if exact_key in seen_exact:
             continue
-        seen.add(norm)
-        kept.append(block.strip())
+        seen_exact.add(exact_key)
 
-    result = "\n\n".join(kept).strip()
-    return result or text.strip()
+        if prev is not None:
+            prev_norm = re.sub(r"\s+", " ", prev).strip()
+            b_norm = re.sub(r"\s+", " ", b).strip()
+            ratio = difflib.SequenceMatcher(None, prev_norm, b_norm).ratio()
+            if ratio >= similarity_threshold:
+                continue
+
+        cleaned_blocks.append(b)
+        prev = b
+
+    out = "\n\n".join(cleaned_blocks).strip()
+    return out if out else normalized
 
 
 # --- ROUTES (original term-paper logic preserved) ---
@@ -625,16 +648,9 @@ def settings():
             release_db(conn)
 
 
-# --- NEW: general AI assistant endpoint (does NOT replace /generate) ---
+# --- General AI assistant endpoint (does NOT replace /generate) ---
 @app.route("/chat", methods=["POST"])
 def chat():
-    """
-    General assistant endpoint. Uses Groq + optional Tavily context.
-    Request JSON:
-      { "prompt": "...", "user_id": "guest" or numeric, "save": true|false, "system_prompt": "...", "temperature": 0.7, "max_tokens": 1024 }
-    Response:
-      { "result": "...", "sources": [...], "word_count": N }
-    """
     data = request.get_json(silent=True) or {}
     prompt = str(data.get("prompt", "")).strip()
     user_id = data.get("user_id", "guest")
