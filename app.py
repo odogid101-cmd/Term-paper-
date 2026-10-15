@@ -20,6 +20,7 @@ except Exception:
     app = Flask(__name__)
     from cachelib import SimpleCache
     _store = SimpleCache(default_timeout=300)
+
     class FallbackCache:
         def cached(self, timeout=300, query_string=False):
             def decorator(f):
@@ -29,15 +30,25 @@ except Exception:
                     if query_string:
                         key += f"?{request.query_string.decode()}"
                     val = _store.get(key)
-                    if val: return val
+                    if val:
+                        return val
                     rv = f(*args, **kwargs)
                     _store.set(key, rv, timeout)
                     return rv
                 return wrapped
             return decorator
+
     cache = FallbackCache()
 
-CORS(app, supports_credentials=True, origins=["https://odogid101-cmd.github.io", "http://localhost:3000", "http://localhost:5000"])
+CORS(
+    app,
+    supports_credentials=True,
+    origins=[
+        "https://odogid101-cmd.github.io",
+        "http://localhost:3000",
+        "http://localhost:5000"
+    ]
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -73,307 +84,548 @@ if DATABASE_URL:
     except Exception as e:
         logger.exception(f"DB pool error: {e}")
 
+
 def get_db():
-    if not db_pool: raise RuntimeError("DB not initialized")
+    if not db_pool:
+        raise RuntimeError("DB not initialized")
     return db_pool.getconn()
+
+
 def release_db(conn):
-    if db_pool and conn: db_pool.putconn(conn)
+    if db_pool and conn:
+        db_pool.putconn(conn)
+
 
 def init_db():
-    if not db_pool: return
-    conn=None
+    if not db_pool:
+        return
+    conn = None
     try:
-        conn=get_db()
+        conn = get_db()
         with conn.cursor() as cur:
-            cur.execute("""CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(100) UNIQUE NOT NULL, email VARCHAR(255) UNIQUE NOT NULL, password_hash TEXT NOT NULL, is_verified BOOLEAN DEFAULT FALSE, otp_code VARCHAR(20), otp_expires_at TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_login TIMESTAMP);""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS paper_sessions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, session_id VARCHAR(64) UNIQUE NOT NULL, title VARCHAR(200), prompt_text TEXT, result_text TEXT, word_count INTEGER DEFAULT 0, page_count INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS user_settings (id SERIAL PRIMARY KEY, user_id INTEGER UNIQUE REFERENCES users(id) ON DELETE CASCADE, theme VARCHAR(20) DEFAULT 'system', font_size INTEGER DEFAULT 16, notifications BOOLEAN DEFAULT TRUE, auto_save BOOLEAN DEFAULT TRUE, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);""")
-            # Keep a table for chat sessions if you want to save assistant chats
-            cur.execute("""CREATE TABLE IF NOT EXISTS chat_sessions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, session_id VARCHAR(64) UNIQUE NOT NULL, title VARCHAR(200), prompt_text TEXT, result_text TEXT, word_count INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);""")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    username VARCHAR(100) UNIQUE NOT NULL,
+                    email VARCHAR(255) UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    is_verified BOOLEAN DEFAULT FALSE,
+                    otp_code VARCHAR(20),
+                    otp_expires_at TIMESTAMP,
+                    last_login TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS paper_sessions (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    session_id VARCHAR(64) UNIQUE NOT NULL,
+                    title VARCHAR(200),
+                    prompt_text TEXT,
+                    result_text TEXT,
+                    word_count INTEGER,
+                    page_count INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+                    theme VARCHAR(20) DEFAULT 'system',
+                    font_size INTEGER DEFAULT 16,
+                    notifications BOOLEAN DEFAULT TRUE,
+                    auto_save BOOLEAN DEFAULT TRUE
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    session_id VARCHAR(64) UNIQUE NOT NULL,
+                    title VARCHAR(200),
+                    prompt_text TEXT,
+                    result_text TEXT,
+                    word_count INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # migration-safe guard for existing DBs:
+            cur.execute("""
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'users' AND column_name = 'last_login'
+            """)
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE users ADD COLUMN last_login TIMESTAMP")
+
             conn.commit()
     except Exception as e:
-        if conn: conn.rollback()
+        if conn:
+            conn.rollback()
         logger.exception(f"DB init fail: {e}")
     finally:
-        if conn: release_db(conn)
+        if conn:
+            release_db(conn)
+
+
 init_db()
 
-def generate_otp(prefix): return f"{prefix}{''.join(random.choices(string.digits, k=3))}"
+
+def generate_otp(prefix):
+    return f"{prefix}{''.join(random.choices(string.digits, k=3))}"
+
 
 def send_email(to_email, subject, html_content):
-    if not RESEND_API_KEY: return False
+    if not RESEND_API_KEY:
+        return False
     try:
-        r=requests.post("https://api.resend.com/emails", json={"from":RESEND_FROM_EMAIL,"to":[to_email],"subject":subject,"html":html_content}, headers={"Authorization":f"Bearer {RESEND_API_KEY}"}, timeout=15)
-        return r.status_code in (200,201)
-    except: return False
+        r = requests.post(
+            "https://api.resend.com/emails",
+            json={
+                "from": RESEND_FROM_EMAIL,
+                "to": [to_email],
+                "subject": subject,
+                "html": html_content,
+            },
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+            timeout=15,
+        )
+        return r.status_code in (200, 201)
+    except Exception:
+        return False
+
 
 def search_tavily(query):
-    if not TAVILY_API_KEY: return "", []
+    if not TAVILY_API_KEY:
+        return "", []
     try:
-        r=requests.post("https://api.tavily.com/search", json={"api_key":TAVILY_API_KEY,"query":query,"search_depth":"advanced","max_results":5}, timeout=10)
-        if r.status_code==200:
-            res=r.json().get("results",[])
-            snippets=[i.get("content","") for i in res if i.get("content")]
-            sources=[i.get("url","") for i in res if i.get("url")]
+        r = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": TAVILY_API_KEY,
+                "query": query,
+                "search_depth": "advanced",
+                "max_results": 5,
+            },
+            timeout=10,
+        )
+        if r.status_code == 200:
+            res = r.json().get("results", [])
+            snippets = [i.get("content", "") for i in res if i.get("content")]
+            sources = [i.get("url", "") for i in res if i.get("url")]
             return "\n\n".join(snippets), sources
     except Exception as e:
         logger.warning(f"Tavily fail: {e}")
     return "", []
 
+
 def generate_with_groq(prompt, context_text=""):
-    if not groq_client: raise RuntimeError("GROQ_API_KEY missing - get free key at console.groq.com")
+    if not groq_client:
+        raise RuntimeError("GROQ_API_KEY missing - get free key at console.groq.com")
     final_prompt = f"{context_text}\n\n{prompt}" if context_text else prompt
 
     response = groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[
-            {"role": "system", "content": "You are Tempaper, an expert academic writing assistant. Write a clear, well-structured academic paper based on user's request. Use professional academic tone, include suitable title, Markdown headings #, ##, ###, introduction, organized body sections, conclusion. Do not invent citations, statistics, or sources. Be detailed and thorough. Minimum 800 words."},
-            {"role": "user", "content": final_prompt}
+            {
+                "role": "system",
+                "content": (
+                    "You are Tempaper, an expert academic writing assistant. "
+                    "Write a clear, well-structured academic paper based on the user's request. "
+                    "Use a professional academic tone, strong thesis development, "
+                    "coherent structure, and grounded reasoning."
+                ),
+            },
+            {"role": "user", "content": final_prompt},
         ],
         temperature=0.7,
         max_tokens=8192,
-        top_p=0.9
+        top_p=0.9,
     )
     text = response.choices[0].message.content
-    if not text or not text.strip(): raise RuntimeError("Empty Groq response")
+    if not text or not text.strip():
+        raise RuntimeError("Empty Groq response")
     return text.strip()
 
-# --- ROUTES (original term-paper logic preserved) ---
-@app.route("/", methods=["GET","HEAD"])
-def health_check(): return jsonify({"status":"ok","message":f"Tempaper API running - Groq {GROQ_MODEL}"}),200
 
-@app.route("/register", methods=["POST"])
-def register():
-    data=request.get_json(silent=True) or {}
-    username=str(data.get("username","")).strip()
-    email=str(data.get("email","")).strip().lower()
-    password=data.get("password","")
-    if not username or not email or not password: return jsonify({"error":"All fields required"}),400
-    conn=None
-    try:
-        conn=get_db()
-        otp=generate_otp("ver")
-        exp=datetime.utcnow()+timedelta(minutes=15)
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO users (username,email,password_hash,is_verified,otp_code,otp_expires_at) VALUES (%s,%s,%s,FALSE,%s,%s) RETURNING id",(username,email,generate_password_hash(password),otp,exp))
-            uid=cur.fetchone()[0]
-            conn.commit()
-        if not send_email(email,"Verify Your Tempaper Account",f"<p>Your code: <strong>{otp}</strong></p>"): return jsonify({"error":"Email could not be sent"}),502
-        return jsonify({"message":"Registered","user_id":uid}),201
-    except psycopg2.IntegrityError:
-        if conn: conn.rollback()
-        return jsonify({"error":"Username or Email exists"}),400
-    finally:
-        if conn: release_db(conn)
-
-@app.route("/login", methods=["POST"])
-def login():
-    data=request.get_json(silent=True) or {}
-    ident=str(data.get("identifier","")).strip().lower()
-    pwd=data.get("password","")
-    if not ident or not pwd: return jsonify({"error":"Missing fields"}),400
-    conn=None
-    try:
-        conn=get_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT id,username,email,password_hash,is_verified FROM users WHERE LOWER(email)=%s OR LOWER(username)=%s",(ident,ident))
-            r=cur.fetchone()
-        if not r or not check_password_hash(r[3],pwd): return jsonify({"error":"Invalid credentials"}),401
-        if not r[4]: return jsonify({"error":"Verify email first"}),403
-        with conn.cursor() as cur:
-            cur.execute("UPDATE users SET last_login=%s WHERE id=%s",(datetime.utcnow(),r[0]))
-            conn.commit()
-        return jsonify({"message":"Login ok","user_id":r[0],"user":{"id":r[0],"username":r[1],"email":r[2]}}),200
-    finally:
-        if conn: release_db(conn)
-
-@app.route("/verify-email", methods=["POST"])
-def verify_email():
-    data=request.get_json(silent=True) or {}
-    email=str(data.get("email","")).strip().lower()
-    code=str(data.get("code","")).strip()
-    conn=None
-    try:
-        conn=get_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT id,otp_code,otp_expires_at FROM users WHERE LOWER(email)=%s",(email,))
-            row=cur.fetchone()
-            if not row: return jsonify({"error":"User not found"}),404
-            if row[1]!=code: return jsonify({"error":"Invalid code"}),400
-            if row[2] and datetime.utcnow()>row[2]: return jsonify({"error":"Code expired"}),400
-            cur.execute("UPDATE users SET is_verified=TRUE,otp_code=NULL,otp_expires_at=NULL WHERE id=%s",(row[0],))
-            conn.commit()
-        return jsonify({"message":"Verified"}),200
-    finally:
-        if conn: release_db(conn)
-
-@app.route("/resend-verification", methods=["POST"])
-def resend():
-    data=request.get_json(silent=True) or {}
-    email=str(data.get("email","")).strip().lower()
-    conn=None
-    try:
-        conn=get_db()
-        otp=generate_otp("ver")
-        exp=datetime.utcnow()+timedelta(minutes=15)
-        with conn.cursor() as cur:
-            cur.execute("UPDATE users SET otp_code=%s,otp_expires_at=%s WHERE LOWER(email)=%s RETURNING is_verified",(otp,exp,email))
-            row=cur.fetchone()
-            if not row: return jsonify({"error":"Email not found"}),404
-            conn.commit()
-        send_email(email,"Verification Code",f"<p>Code: <strong>{otp}</strong></p>")
-        return jsonify({"message":"Code resent"}),200
-    finally:
-        if conn: release_db(conn)
-
-@app.route("/request-reset", methods=["POST"])
-def req_reset():
-    data=request.get_json(silent=True) or {}
-    email=str(data.get("email","")).strip().lower()
-    conn=None
-    try:
-        conn=get_db()
-        otp=generate_otp("pass")
-        exp=datetime.utcnow()+timedelta(minutes=15)
-        with conn.cursor() as cur:
-            cur.execute("UPDATE users SET otp_code=%s,otp_expires_at=%s WHERE LOWER(email)=%s RETURNING id",(otp,exp,email))
-            if not cur.fetchone(): return jsonify({"message":"If email exists, code sent"}),200
-            conn.commit()
-        send_email(email,"Reset Code",f"<h1>{otp}</h1>")
-        return jsonify({"message":"Code sent"}),200
-    finally:
-        if conn: release_db(conn)
-
-@app.route("/reset-password", methods=["POST"])
-def reset_pwd():
-    data=request.get_json(silent=True) or {}
-    email=str(data.get("email","")).strip().lower()
-    code=str(data.get("code","")).strip()
-    np=data.get("new_password","")
-    conn=None
-    try:
-        conn=get_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT otp_code,otp_expires_at FROM users WHERE LOWER(email)=%s",(email,))
-            r=cur.fetchone()
-            if not r or r[0]!=code: return jsonify({"error":"Invalid code"}),400
-            if r[1] and datetime.utcnow()>r[1]: return jsonify({"error":"Expired"}),400
-            cur.execute("UPDATE users SET password_hash=%s,otp_code=NULL WHERE LOWER(email)=%s",(generate_password_hash(np),email))
-            conn.commit()
-        return jsonify({"message":"Password updated"}),200
-    finally:
-        if conn: release_db(conn)
-
-@app.route("/me", methods=["GET"])
-@cache.cached(timeout=300, query_string=True)
-def get_me():
-    uid=request.args.get("user_id")
-    if not uid or not str(uid).isdigit(): return jsonify({"user":{"id":0,"username":"Guest","email":"guest@tempaper.com"}}),200
-    conn=None
-    try:
-        conn=get_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT id,username,email,is_verified FROM users WHERE id=%s",(int(uid),))
-            r=cur.fetchone()
-            if not r: return jsonify({"error":"Not found"}),404
-        return jsonify({"user":{"id":r[0],"username":r[1],"email":r[2],"is_verified":r[3]}}),200
-    finally:
-        if conn: release_db(conn)
-
-# --- ORIGINAL generate route (TERM PAPER generation) - UNTOUCHED LOGIC --- 
-@app.route("/generate", methods=["POST"])
-def generate_paper():
-    data=request.get_json(silent=True) or {}
-    prompt=str(data.get("prompt","")).strip()
-    user_id=data.get("user_id","guest")
-    if not prompt: return jsonify({"error":"Prompt required"}),400
-    if len(prompt)>20000: return jsonify({"error":"Prompt too long"}),413
-    if not GROQ_API_KEY: return jsonify({"error":"GROQ_API_KEY missing"}),503
-    try:
-        tavily_context,sources=search_tavily(prompt)
-        final_content=f"Topic: {prompt}\n\nReference Material:\n{tavily_context}" if tavily_context else prompt
-        result_text=generate_with_groq(prompt, final_content)
-        word_count=len(result_text.split())
-        page_count=max(1,word_count//250)
-        if str(user_id).isdigit():
-            conn=None
-            try:
-                conn=get_db()
-                sid=''.join(random.choices(string.ascii_letters+string.digits,k=32))
-                with conn.cursor() as cur:
-                    cur.execute("INSERT INTO paper_sessions (user_id,session_id,title,prompt_text,result_text,word_count,page_count) VALUES (%s,%s,%s,%s,%s,%s,%s)",(int(user_id),sid,prompt[:200],prompt,result_text,word_count,page_count))
-                    conn.commit()
-            except Exception as e:
-                logger.warning(f"Save fail: {e}")
-            finally:
-                if conn: release_db(conn)
-        return jsonify({"result":result_text,"sources":sources,"word_count":word_count,"page_count":page_count}),200
-    except Exception as e:
-        logger.exception(f"Generate fail: {e}")
-        msg=str(e)
-        if "429" in msg: return jsonify({"error":"Groq rate limit, wait 10s"}),429
-        return jsonify({"error":"Generation failed","details":msg[:300]}),500
-
-# --- Keep papers listing as before ---
-@app.route("/papers", methods=["GET"])
-def get_papers():
-    uid=request.args.get("user_id")
-    if not uid or not str(uid).isdigit(): return jsonify({"papers":[]}),200
-    conn=None
-    try:
-        conn=get_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT id,session_id,title,prompt_text,word_count,page_count,created_at FROM paper_sessions WHERE user_id=%s ORDER BY created_at DESC LIMIT 50",(int(uid),))
-            rows=cur.fetchall()
-        papers=[{"id":r[0],"session_id":r[1],"title":r[2],"prompt":r[3],"word_count":r[4],"page_count":r[5],"created_at":r[6].isoformat() if r[6] else None} for r in rows]
-        return jsonify({"papers":papers}),200
-    finally:
-        if conn: release_db(conn)
-
-@app.route("/settings", methods=["GET","POST"])
-def settings():
-    # this route retained as-is (same behavior)
-    uid=request.args.get("user_id") or (request.get_json(silent=True) or {}).get("user_id")
-    if not uid or not str(uid).isdigit(): return jsonify({"error":"Valid user_id required"}),400
-    if request.method=="GET":
-        conn=None
-        try:
-            conn=get_db()
-            with conn.cursor() as cur:
-                cur.execute("SELECT theme,font_size,notifications,auto_save FROM user_settings WHERE user_id=%s",(int(uid),))
-                r=cur.fetchone()
-            if not r: return jsonify({"settings":{"theme":"system","font_size":16,"notifications":True,"auto_save":True}}),200
-            return jsonify({"settings":{"theme":r[0],"font_size":r[1],"notifications":r[2],"auto_save":r[3]}}),200
-        finally:
-            if conn: release_db(conn)
-    data=request.get_json(silent=True) or {}
-    conn=None
-    try:
-        conn=get_db()
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO user_settings (user_id,theme,font_size,notifications,auto_save) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (user_id) DO UPDATE SET theme=EXCLUDED.theme,font_size=EXCLUDED.font_size,notifications=EXCLUDED.notifications,auto_save=EXCLUDED.auto_save,updated_at=CURRENT_TIMESTAMP",(int(uid),data.get("theme","system"),data.get("font_size",16),data.get("notifications",True),data.get("auto_save",True)))
-            conn.commit()
-        return jsonify({"message":"Updated"}),200
-    finally:
-        if conn: release_db(conn)
-
-# --- NEW: general AI assistant endpoint (does NOT replace /generate) ---
 def normalize_server_text(text: str) -> str:
     """Light normalization for model output to help frontend rendering/pagination."""
     if not text:
         return text
-    # remove zero-width / BOM characters that can break rendering
-    text = text.replace('\u200b', '').replace('\ufeff', '')
-    # join hyphenated words broken across line boundaries (e.g., 'hy-\nphen' -> 'hyphen')
-    text = re.sub(r'(\w+)-\s*\n\s*(\w+)', r'\1\2', text)
-    # convert bolded single-line headings like "**6.2 Age and Identity**" -> "### 6.2 Age and Identity"
-    text = re.sub(r'^\s*\*\*\s*(\d+(?:\.\d+)*\s*[^\*]+?)\s*\*\*\s*$', r'### \1', text, flags=re.MULTILINE)
-    # catch other bold-wrapped heading-like lines and convert to h3
-    text = re.sub(r'^\s*\*\*\s*(.+?)\s*\*\*\s*$', r'### \1', text, flags=re.MULTILINE)
-    # collapse many blank lines
-    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = text.replace("\u200b", "").replace("\ufeff", "")
+    text = re.sub(r"(\w+)-\s*\n\s*(\w+)", r"\1\2", text)
+    text = re.sub(r"^\s*\*\*\s*(\d+(?:\.\d+)*\s*[^\*]+?)\s*\*\*\s*$", r"### \1", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\*\*\s*(.+?)\s*\*\*\s*$", r"### \1", text, flags=re.MULTILINE)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
+
+def remove_duplicate_sections(text: str) -> str:
+    """
+    Remove exact repeated paragraphs/blocks from model output.
+    This specifically fixes duplicated sections like:
+    'Money of account...' repeated twice in a row.
+    """
+    if not text:
+        return text
+
+    text = normalize_server_text(text)
+
+    blocks = re.split(r"\n\s*\n+", text.strip())
+    kept = []
+    seen = set()
+
+    for block in blocks:
+        cleaned = re.sub(r"\s+", " ", block).strip()
+        if not cleaned:
+            continue
+
+        norm = cleaned.lower()
+        # dedupe exact repeated paragraph blocks
+        if norm in seen:
+            continue
+        seen.add(norm)
+        kept.append(block.strip())
+
+    result = "\n\n".join(kept).strip()
+    return result or text.strip()
+
+
+# --- ROUTES (original term-paper logic preserved) ---
+@app.route("/", methods=["GET", "HEAD"])
+def health_check():
+    return jsonify({"status": "ok", "message": f"Tempaper API running - Groq {GROQ_MODEL}"}), 200
+
+
+@app.route("/register", methods=["POST"])
+def register():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username", "")).strip()
+    email = str(data.get("email", "")).strip().lower()
+    password = data.get("password", "")
+    if not username or not email or not password:
+        return jsonify({"error": "All fields required"}), 400
+
+    conn = None
+    try:
+        conn = get_db()
+        otp = generate_otp("ver")
+        exp = datetime.utcnow() + timedelta(minutes=15)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (username,email,password_hash,is_verified,otp_code,otp_expires_at) VALUES (%s,%s,%s,FALSE,%s,%s) RETURNING id",
+                (username, email, generate_password_hash(password), otp, exp),
+            )
+            uid = cur.fetchone()[0]
+            conn.commit()
+        if not send_email(email, "Verify Your Tempaper Account", f"<p>Your code: <strong>{otp}</strong></p>"):
+            return jsonify({"error": "Email could not be sent"}), 502
+        return jsonify({"message": "Registered", "user_id": uid}), 201
+    except psycopg2.IntegrityError:
+        if conn:
+            conn.rollback()
+        return jsonify({"error": "Username or Email exists"}), 400
+    finally:
+        if conn:
+            release_db(conn)
+
+
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.get_json(silent=True) or {}
+    ident = str(data.get("identifier", "")).strip().lower()
+    pwd = data.get("password", "")
+    if not ident or not pwd:
+        return jsonify({"error": "Missing fields"}), 400
+
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,username,email,password_hash,is_verified FROM users WHERE LOWER(email)=%s OR LOWER(username)=%s",
+                (ident, ident),
+            )
+            r = cur.fetchone()
+
+        if not r or not check_password_hash(r[3], pwd):
+            return jsonify({"error": "Invalid credentials"}), 401
+        if not r[4]:
+            return jsonify({"error": "Verify email first"}), 403
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET last_login=%s WHERE id=%s",
+                (datetime.utcnow(), r[0]),
+            )
+            conn.commit()
+
+        return jsonify(
+            {
+                "message": "Login ok",
+                "user_id": r[0],
+                "user": {"id": r[0], "username": r[1], "email": r[2]},
+            }
+        ), 200
+    finally:
+        if conn:
+            release_db(conn)
+
+
+@app.route("/verify-email", methods=["POST"])
+def verify_email():
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email", "")).strip().lower()
+    code = str(data.get("code", "")).strip()
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,otp_code,otp_expires_at FROM users WHERE LOWER(email)=%s", (email,))
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "User not found"}), 404
+            if row[1] != code:
+                return jsonify({"error": "Invalid code"}), 400
+            if row[2] and datetime.utcnow() > row[2]:
+                return jsonify({"error": "Code expired"}), 400
+            cur.execute("UPDATE users SET is_verified=TRUE,otp_code=NULL,otp_expires_at=NULL WHERE id=%s", (row[0],))
+            conn.commit()
+        return jsonify({"message": "Verified"}), 200
+    finally:
+        if conn:
+            release_db(conn)
+
+
+@app.route("/resend-verification", methods=["POST"])
+def resend():
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email", "")).strip().lower()
+    conn = None
+    try:
+        conn = get_db()
+        otp = generate_otp("ver")
+        exp = datetime.utcnow() + timedelta(minutes=15)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET otp_code=%s,otp_expires_at=%s WHERE LOWER(email)=%s RETURNING is_verified",
+                (otp, exp, email),
+            )
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "Email not found"}), 404
+            conn.commit()
+        send_email(email, "Verification Code", f"<p>Code: <strong>{otp}</strong></p>")
+        return jsonify({"message": "Code resent"}), 200
+    finally:
+        if conn:
+            release_db(conn)
+
+
+@app.route("/request-reset", methods=["POST"])
+def req_reset():
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email", "")).strip().lower()
+    conn = None
+    try:
+        conn = get_db()
+        otp = generate_otp("pass")
+        exp = datetime.utcnow() + timedelta(minutes=15)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET otp_code=%s,otp_expires_at=%s WHERE LOWER(email)=%s RETURNING id",
+                (otp, exp, email),
+            )
+            if not cur.fetchone():
+                return jsonify({"message": "If email exists, code sent"}), 200
+            conn.commit()
+        send_email(email, "Reset Code", f"<h1>{otp}</h1>")
+        return jsonify({"message": "Code sent"}), 200
+    finally:
+        if conn:
+            release_db(conn)
+
+
+@app.route("/reset-password", methods=["POST"])
+def reset_pwd():
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email", "")).strip().lower()
+    code = str(data.get("code", "")).strip()
+    np = data.get("new_password", "")
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT otp_code,otp_expires_at FROM users WHERE LOWER(email)=%s", (email,))
+            r = cur.fetchone()
+            if not r or r[0] != code:
+                return jsonify({"error": "Invalid code"}), 400
+            if r[1] and datetime.utcnow() > r[1]:
+                return jsonify({"error": "Expired"}), 400
+            cur.execute(
+                "UPDATE users SET password_hash=%s,otp_code=NULL WHERE LOWER(email)=%s",
+                (generate_password_hash(np), email),
+            )
+            conn.commit()
+        return jsonify({"message": "Password updated"}), 200
+    finally:
+        if conn:
+            release_db(conn)
+
+
+@app.route("/me", methods=["GET"])
+@cache.cached(timeout=300, query_string=True)
+def get_me():
+    uid = request.args.get("user_id")
+    if not uid or not str(uid).isdigit():
+        return jsonify({"user": {"id": 0, "username": "Guest", "email": "guest@tempaper.com"}}), 200
+
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,username,email,is_verified FROM users WHERE id=%s", (int(uid),))
+            r = cur.fetchone()
+            if not r:
+                return jsonify({"error": "Not found"}), 404
+        return jsonify({"user": {"id": r[0], "username": r[1], "email": r[2], "is_verified": r[3]}}), 200
+    finally:
+        if conn:
+            release_db(conn)
+
+
+# --- ORIGINAL generate route (TERM PAPER generation) - UNTOUCHED LOGIC ---
+@app.route("/generate", methods=["POST"])
+def generate_paper():
+    data = request.get_json(silent=True) or {}
+    prompt = str(data.get("prompt", "")).strip()
+    user_id = data.get("user_id", "guest")
+    if not prompt:
+        return jsonify({"error": "Prompt required"}), 400
+    if len(prompt) > 20000:
+        return jsonify({"error": "Prompt too long"}), 413
+    if not GROQ_API_KEY:
+        return jsonify({"error": "GROQ_API_KEY missing"}), 503
+
+    try:
+        tavily_context, sources = search_tavily(prompt)
+        final_content = f"Topic: {prompt}\n\nReference Material:\n{tavily_context}" if tavily_context else prompt
+
+        result_text = generate_with_groq(prompt, final_content)
+        result_text = remove_duplicate_sections(result_text)
+
+        word_count = len(result_text.split())
+        page_count = max(1, word_count // 250)
+
+        if str(user_id).isdigit():
+            conn = None
+            try:
+                conn = get_db()
+                sid = "".join(random.choices(string.ascii_letters + string.digits, k=32))
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO paper_sessions (user_id,session_id,title,prompt_text,result_text,word_count,page_count) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                        (int(user_id), sid, prompt[:200], prompt, result_text, word_count, page_count),
+                    )
+                    conn.commit()
+            except Exception as e:
+                logger.warning(f"Save fail: {e}")
+            finally:
+                if conn:
+                    release_db(conn)
+
+        return jsonify({"result": result_text, "sources": sources, "word_count": word_count, "page_count": page_count}), 200
+    except Exception as e:
+        logger.exception(f"Generate fail: {e}")
+        msg = str(e)
+        if "429" in msg:
+            return jsonify({"error": "Groq rate limit, wait 10s"}), 429
+        return jsonify({"error": "Generation failed", "details": msg[:300]}), 500
+
+
+# --- Keep papers listing as before ---
+@app.route("/papers", methods=["GET"])
+def get_papers():
+    uid = request.args.get("user_id")
+    if not uid or not str(uid).isdigit():
+        return jsonify({"papers": []}), 200
+
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,session_id,title,prompt_text,word_count,page_count,created_at FROM paper_sessions WHERE user_id=%s ORDER BY created_at DESC LIMIT 50",
+                (int(uid),),
+            )
+            rows = cur.fetchall()
+        papers = [
+            {
+                "id": r[0],
+                "session_id": r[1],
+                "title": r[2],
+                "prompt": r[3],
+                "word_count": r[4],
+                "page_count": r[5],
+                "created_at": r[6].isoformat() if r[6] else None,
+            }
+            for r in rows
+        ]
+        return jsonify({"papers": papers}), 200
+    finally:
+        if conn:
+            release_db(conn)
+
+
+@app.route("/settings", methods=["GET", "POST"])
+def settings():
+    uid = request.args.get("user_id") or (request.get_json(silent=True) or {}).get("user_id")
+    if not uid or not str(uid).isdigit():
+        return jsonify({"error": "Valid user_id required"}), 400
+
+    if request.method == "GET":
+        conn = None
+        try:
+            conn = get_db()
+            with conn.cursor() as cur:
+                cur.execute("SELECT theme,font_size,notifications,auto_save FROM user_settings WHERE user_id=%s", (int(uid),))
+                r = cur.fetchone()
+            if not r:
+                return jsonify({"settings": {"theme": "system", "font_size": 16, "notifications": True, "auto_save": True}}), 200
+            return jsonify({"settings": {"theme": r[0], "font_size": r[1], "notifications": r[2], "auto_save": r[3]}}), 200
+        finally:
+            if conn:
+                release_db(conn)
+
+    data = request.get_json(silent=True) or {}
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO user_settings (user_id,theme,font_size,notifications,auto_save) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (user_id) DO UPDATE SET theme=EXCLUDED.theme,font_size=EXCLUDED.font_size,notifications=EXCLUDED.notifications,auto_save=EXCLUDED.auto_save",
+                (
+                    int(uid),
+                    data.get("theme", "system"),
+                    data.get("font_size", 16),
+                    data.get("notifications", True),
+                    data.get("auto_save", True),
+                ),
+            )
+            conn.commit()
+        return jsonify({"message": "Updated"}), 200
+    finally:
+        if conn:
+            release_db(conn)
+
+
+# --- NEW: general AI assistant endpoint (does NOT replace /generate) ---
 @app.route("/chat", methods=["POST"])
 def chat():
     """
@@ -383,34 +635,36 @@ def chat():
     Response:
       { "result": "...", "sources": [...], "word_count": N }
     """
-    data=request.get_json(silent=True) or {}
-    prompt=str(data.get("prompt","")).strip()
-    user_id=data.get("user_id","guest")
-    save=bool(data.get("save", False))
-    system_prompt=data.get("system_prompt", None)
-    temperature=float(data.get("temperature", 0.7))
-    max_tokens=int(data.get("max_tokens", 1024))
+    data = request.get_json(silent=True) or {}
+    prompt = str(data.get("prompt", "")).strip()
+    user_id = data.get("user_id", "guest")
+    save = bool(data.get("save", False))
+    system_prompt = data.get("system_prompt", None)
+    temperature = float(data.get("temperature", 0.7))
+    max_tokens = int(data.get("max_tokens", 1024))
 
-    if not prompt: return jsonify({"error":"Prompt required"}),400
-    if not GROQ_API_KEY: return jsonify({"error":"GROQ_API_KEY missing"}),503
+    if not prompt:
+        return jsonify({"error": "Prompt required"}), 400
+    if not GROQ_API_KEY:
+        return jsonify({"error": "GROQ_API_KEY missing"}), 503
+
     try:
         tavily_context, sources = search_tavily(prompt)
         final_content = f"{tavily_context}\n\n{prompt}" if tavily_context else prompt
 
-        # Use a neutral assistant system prompt by default (not forcing academic paper)
         system_msg = system_prompt if system_prompt else "You are a helpful, concise assistant. Answer user questions clearly and honestly. If you don't know, say you don't know."
 
         response = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
-                {"role":"system","content":system_msg},
-                {"role":"user","content":final_content}
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": final_content},
             ],
             temperature=temperature,
             max_tokens=max_tokens,
-            top_p=0.9
+            top_p=0.9,
         )
-        # extract text robustly
+
         text = None
         try:
             text = response.choices[0].message.content
@@ -419,34 +673,40 @@ def chat():
                 text = response.choices[0].text
             except Exception:
                 text = str(response)
-        if not text or not str(text).strip(): raise RuntimeError("Empty Groq response")
-        raw_result = str(text).strip()
 
-        cleaned_result = normalize_server_text(raw_result)
+        if not text or not str(text).strip():
+            raise RuntimeError("Empty Groq response")
+
+        raw_result = str(text).strip()
+        cleaned_result = remove_duplicate_sections(raw_result)
         word_count = len(cleaned_result.split())
 
-        # optional save to chat_sessions table
         if save and str(user_id).isdigit():
-            conn=None
+            conn = None
             try:
-                conn=get_db()
-                sid=''.join(random.choices(string.ascii_letters+string.digits,k=32))
+                conn = get_db()
+                sid = "".join(random.choices(string.ascii_letters + string.digits, k=32))
                 with conn.cursor() as cur:
-                    cur.execute("INSERT INTO chat_sessions (user_id,session_id,title,prompt_text,result_text,word_count) VALUES (%s,%s,%s,%s,%s,%s)",
-                                (int(user_id), sid, prompt[:200], prompt, cleaned_result, word_count))
+                    cur.execute(
+                        "INSERT INTO chat_sessions (user_id,session_id,title,prompt_text,result_text,word_count) VALUES (%s,%s,%s,%s,%s,%s)",
+                        (int(user_id), sid, prompt[:200], prompt, cleaned_result, word_count),
+                    )
                     conn.commit()
             except Exception as e:
                 logger.warning(f"Chat save fail: {e}")
             finally:
-                if conn: release_db(conn)
+                if conn:
+                    release_db(conn)
 
         return jsonify({"result": cleaned_result, "sources": sources, "word_count": word_count}), 200
     except Exception as e:
         logger.exception(f"Chat fail: {e}")
-        msg=str(e)
-        if "429" in msg: return jsonify({"error":"Groq rate limit, wait"}),429
-        return jsonify({"error":"Chat generation failed","details":msg[:300]}),500
+        msg = str(e)
+        if "429" in msg:
+            return jsonify({"error": "Groq rate limit, wait"}), 429
+        return jsonify({"error": "Chat generation failed", "details": msg[:300]}), 500
 
-if __name__=="__main__":
-    port=int(os.environ.get("PORT",5000))
-    app.run(host="0.0.0.0",port=port)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
