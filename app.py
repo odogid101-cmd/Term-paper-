@@ -322,7 +322,9 @@ GENERAL PAGE RULE: No chapter may be shorter than 3 A4 pages. Match actual depth
 CHAPTER 1 (opening/introduction/background): LIGHT, 3–4 pages; 2–3 numbered subheadings; exactly one simple numbered list for objectives/questions; no nested A/B list.
 MIDDLE CHAPTERS: rotate structure naturally. A heavy Chapter 2 (literature/conceptual review) should have 4–5 subheadings, two simple lists, one compulsory nested A/B list, and substantial depth targeting 8–12 pages. A medium Chapter 3 should have 3 subheadings, two simple lists, one nested A/B list, targeting 5–7 pages. A light/medium Chapter 4 should have 2–3 subheadings, one or two simple lists, and no nested list unless genuinely useful (maximum one). For further middle chapters rotate 4 headings, then 2, then 3; adapt to the topic rather than forcing irrelevant content.
 FINAL CHAPTER: 3–4 pages; exactly three subheadings titled Summary, Conclusion, and Recommendation/Recommendations; one plain numbered recommendations list; no nested list.
-SUBHEADING STYLE: use bold numbered headings (e.g. 2.1, 2.2), followed by developed explanation of approximately 5–7 substantial lines or equivalent detail. Simple lists use plain 1, 2, 3 numbering, not bold. Nested lists use bold A. and B. labels with explanations only where a parent point has distinct types; at most one nested A/B list in any chapter. Do not add lists merely to satisfy a count if they make the discussion unnatural; preserve the closest applicable pattern and academic relevance.
+SUBHEADING STYLE AND COMPLETENESS: use bold numbered subheadings (e.g. 2.1, 2.2) exactly as listed in the saved TOC and in the same order. Each explanatory subheading must contain a developed, topic-specific explanation (normally at least 5–7 substantial displayed lines or equivalent detail, but do not pad with repetition). Classify each subsection by what the topic requires: explanation, list, example, comparison, procedure, calculation/solution, or a combination. Do not force long prose into a subsection whose correct answer is a concise calculation or direct result.
+LIST EXPLANATION RULE: when the prose introduces a list as types, factors, causes, reasons, characteristics, elements, functions, advantages/disadvantages, stages, methods, or similar items that require discussion, explain EACH list item after naming it. A label-only list is incomplete when the context requires explanation. Each item should normally include a clear sentence explaining what it means, why it matters, or how it applies, plus an example when useful. Keep list items under the correct parent subheading; never let list items become accidental numbered headings. Not every list needs expanded explanations: contents pages, objectives, short factual answers, and simple enumerations may remain concise when academically appropriate. Finish the current subheading completely before starting the next one.
+Simple lists use plain 1, 2, 3 numbering, not bold. Nested lists use bold A. and B. labels with explanations only where a parent point has distinct types; at most one nested A/B list in any chapter. Do not add lists merely to satisfy a count if they make the discussion unnatural; preserve the closest applicable pattern and academic relevance.
 COVER PAGE: include the topic in a prominent centered bold heading and all available metadata below. For every missing item, print a clear blank line such as ____________________, never invent personal/institution/course details.
 PRELIMINARY PAGES: arrange each page heading centered and bold; body paragraphs justified. Use conventional academic order where appropriate: cover/title page, certification/approval, declaration, dedication, acknowledgements, abstract, table of contents, list of tables/figures/abbreviations if relevant. Cover page has no visible page number; preliminary pages use lower-case Roman numerals; main chapters use Arabic numerals. Keep preliminary headings centered and bold, and body paragraphs justified.
 TABLE OF CONTENTS: include preliminary items, every chapter and its subheadings, conclusion/recommendations, references and appendices when relevant. Do not invent page numbers in generated prose. The app will recalculate TOC page numbers from the current rendered/paginated document after each Pull Next or edit/regeneration; preserve TOC entry wording and update matching page values rather than creating a new TOC code.
@@ -472,10 +474,15 @@ def pull_next():
             chapter_role = "closing chapter"
         else:
             chapter_role = "middle chapter"
-        prompt=(f"Write ONLY the next section titled exactly: {title}. Do not write any other chapter or repeat content already generated. Apply ALL automatic Tempaper rules in the saved prompt. Current role: {chapter_role}. Determine topic weight from the actual subject and follow the corresponding page-depth target and varied chapter pattern. Use numbered bold subheadings, appropriate plain numbered lists and at most one nested A/B list when required by the chapter pattern. Keep the chapter at least 3 pages of substantive content; do not pad with repetition. Use academic tone and credible citations. Do not add a new TOC or fabricate page numbers.\n\n"
+        prompt=(f"Write ONLY the next section titled exactly: {title}. Do not write any other chapter or repeat content already generated. Apply ALL automatic Tempaper rules in the saved prompt. Current role: {chapter_role}. Determine topic weight from the actual subject and follow the corresponding page-depth target and varied chapter pattern. Use the saved TOC as the authoritative heading checklist: include every relevant subsection for this chapter in the exact order and preserve its wording. Finish each subsection before starting the next. Identify whether each subsection needs explanation, list, example, comparison, calculation/solution, or a combination. When a list is introduced as types, factors, causes, reasons, characteristics, elements, functions, advantages/disadvantages, stages, or methods that need discussion, explain EACH item under that same subsection; do not leave label-only items. Do not force extra prose into direct-answer/calculation sections or simple objective lists. Use numbered bold subheadings, appropriate plain numbered lists and at most one nested A/B list when required by the chapter pattern. Keep the chapter substantive; do not pad with repetition. Use academic tone and credible citations. Do not add a new TOC or fabricate page numbers.\n\n"
                 f"Original saved instructions (mandatory on every pull):\n{prompt_text}\n\nSaved table of contents:\n{toc_text}\n\nSection {next_index} of {len(sections)}. Write this section only.")
         research,sources=search_tavily(f"{prompt_text}\nSection: {title}")
         content=remove_duplicate_sections(generate_with_groq(prompt,research))
+        # Only pay for a second model call when local checks identify likely omissions.
+        if re.search(r"chapter\s*(?:[1-9]|i\b|one\b)", title, re.I) or chapter_role in {"opening chapter", "middle chapter", "closing chapter"}:
+            content, quality_issues = _repair_incomplete_chapter(content, title, prompt_text, toc_text, research)
+            if quality_issues:
+                logger.info("Chapter quality repair for %s: %s", title, "; ".join(quality_issues))
         with conn.cursor() as cur:
             cur.execute("INSERT INTO paper_sections (project_id,order_no,section_key,section_title,content_text,word_count) VALUES (%s,%s,%s,%s,%s,%s)",(int(pid),next_index,key,title,content,len(content.split())))
             cur.execute("UPDATE paper_projects SET current_index=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s",(next_index,int(pid)))
@@ -656,6 +663,77 @@ def remove_duplicate_sections(text: str, similarity_threshold: float = 0.92) -> 
 
     out = "\n\n".join(cleaned_blocks).strip()
     return out if out else normalized
+
+
+def _chapter_quality_issues(text: str, title: str = "", toc_text: str = ""):
+    """Cheap local checks; avoids extra model calls unless a chapter looks incomplete."""
+    issues = []
+    if not text or len(text.split()) < 120:
+        issues.append("The chapter is unusually short and may be incomplete.")
+    lines = text.splitlines()
+    heading_re = re.compile(r"^\s*(?:#{1,3}\s*)?(?:\*\*)?(\d+\.\d+(?:\.\d+)?)[.)]?\s+(.+?)(?:\*\*)?\s*$")
+    found = []
+    for i, line in enumerate(lines):
+        m = heading_re.match(line.strip())
+        if m:
+            found.append((i, m.group(1), m.group(2).strip()))
+    for pos, (line_index, number, label) in enumerate(found):
+        end = found[pos + 1][0] if pos + 1 < len(found) else len(lines)
+        body = "\n".join(lines[line_index + 1:end]).strip()
+        body_words = len(re.findall(r"\b[\w'-]+\b", body))
+        # A heading with only a label, or a very short body, is a strong omission signal.
+        if body_words < 28:
+            issues.append(f"Subheading {number} ({label}) has only {body_words} words beneath it before the next numbered subheading.")
+    # Compare the generated chapter against the subsection entries already specified in the saved TOC.
+    chapter_number = None
+    cm = re.search(r"chapter\s+(\d+|i{1,3}|iv|v|vi{0,3}|ix|x|one|two|three|four|five|six|seven|eight|nine|ten)\b", title, re.I)
+    if cm:
+        token = cm.group(1).lower()
+        word_nums = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+        roman_nums = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8, "ix": 9, "x": 10}
+        chapter_number = int(token) if token.isdigit() else word_nums.get(token, roman_nums.get(token))
+    if chapter_number and toc_text:
+        expected = []
+        for toc_line in toc_text.splitlines():
+            tm = re.match(r"^\s*(?:[-*]\s*)?(\d+)\.(\d+)(?:\s+|[.)])(.+?)\s*$", re.sub(r"[*#`]", "", toc_line))
+            if tm and int(tm.group(1)) == chapter_number:
+                expected.append((f"{tm.group(1)}.{tm.group(2)}", tm.group(3).strip()))
+        actual_numbers = {number for _, number, _ in found}
+        missing = [f"{number} {label}" for number, label in expected if number not in actual_numbers]
+        if missing:
+            issues.append("Required TOC subheading(s) missing from this chapter: " + "; ".join(missing) + ".")
+    # Flag label-only list items only when the surrounding text explicitly announces
+    # a list of items that should be discussed (not objectives or simple enumerations).
+    for i, line in enumerate(lines):
+        if re.search(r"\b(the following|include the following|following are|major (?:types|factors|causes|reasons|characteristics|elements|functions|advantages|disadvantages)|types of|factors affecting|causes of|reasons for|characteristics of)\b", line, re.I):
+            window = "\n".join(lines[i:min(len(lines), i + 14)])
+            items = re.findall(r"^\s*(?:\d+[.)]|[-*+])\s+(.+)$", window, re.M)
+            if len(items) >= 2 and sum(len(re.findall(r"\b[\w'-]+\b", item)) < 10 for item in items) >= 2:
+                issues.append("A list introduced as requiring discussion contains multiple label-only/very short items; explain each item where the context requires it.")
+                break
+    return issues
+
+
+def _repair_incomplete_chapter(content: str, title: str, prompt_text: str, toc_text: str, research: str = ""):
+    """Run a targeted repair only if deterministic checks find likely omissions."""
+    issues = _chapter_quality_issues(content, title, toc_text)
+    if not issues:
+        return content, []
+    repair_prompt = (
+        f"Review and repair ONLY the existing chapter titled: {title}. Return the complete corrected chapter, not a report. "
+        "Preserve correct material and the original heading names/order. Do not rewrite the whole paper or add unrelated sections. "
+        "Check every numbered subheading has the content its topic requires. Explanatory subsections need a meaningful developed explanation; "
+        "a calculation/solution section may show the method and answer without artificial padding. Where a list is introduced as types, factors, causes, "
+        "reasons, characteristics, elements, functions, advantages/disadvantages, stages or methods requiring discussion, explain each item under its parent heading. "
+        "Do not explain simple objective lists or short enumerations unnecessarily. Keep lists, examples, equations and their explanations under the correct subheading. "
+        "Do not invent sources or citations.\n\nDetected issues:\n- " + "\n- ".join(issues) +
+        f"\n\nSaved requirements:\n{prompt_text}\n\nSaved TOC:\n{toc_text}\n\nResearch notes (use only when relevant):\n{research}\n\nExisting chapter to repair:\n{content}"
+    )
+    repaired = remove_duplicate_sections(generate_with_groq(repair_prompt))
+    # Do not replace the original with a much shorter failed repair.
+    if len(repaired.split()) < max(100, int(len(content.split()) * 0.65)):
+        return content, issues + ["Repair response was too short; original chapter retained."]
+    return repaired, issues
 
 
 # --- ROUTES (original term-paper logic preserved) ---
