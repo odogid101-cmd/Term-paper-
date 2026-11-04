@@ -6,12 +6,19 @@ import string
 import logging
 import functools
 import difflib
+import base64
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from html import escape as html_escape
+from urllib.parse import urlparse
 
+import requests
+import psycopg2
+from psycopg2 import pool
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
+from groq import Groq
 
 # Cache fallback
 cache = None
@@ -44,6 +51,10 @@ except Exception:
 
     cache = FallbackCache()
 
+# Request-size limit includes a little room for multipart boundaries.
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = MAX_IMAGE_BYTES + (1024 * 1024)
+
 CORS(
     app,
     supports_credentials=True,
@@ -57,12 +68,6 @@ CORS(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-import psycopg2
-from psycopg2 import pool
-import requests
-from werkzeug.security import generate_password_hash, check_password_hash
-from groq import Groq
-
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -73,20 +78,24 @@ TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 
+# Set this in the Render Flask web service environment.
+# Never put this value in dashboard HTML or browser JavaScript.
+IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY")
+
 groq_client = None
 if GROQ_API_KEY:
     try:
         groq_client = Groq(api_key=GROQ_API_KEY)
-        logger.info(f"Groq initialized with model {GROQ_MODEL}")
+        logger.info("Groq initialized with model %s", GROQ_MODEL)
     except Exception as e:
-        logger.error(f"Groq init failed: {e}")
+        logger.error("Groq init failed: %s", e)
 
 db_pool = None
 if DATABASE_URL:
     try:
         db_pool = psycopg2.pool.SimpleConnectionPool(5, 20, DATABASE_URL)
     except Exception as e:
-        logger.exception(f"DB pool error: {e}")
+        logger.exception("DB pool error: %s", e)
 
 
 def get_db():
@@ -167,7 +176,6 @@ def init_db():
                 """
             )
 
-            # migration-safe: add last_login if it doesn't already exist
             cur.execute(
                 """
                 SELECT 1
@@ -178,11 +186,11 @@ def init_db():
             if not cur.fetchone():
                 cur.execute("ALTER TABLE users ADD COLUMN last_login TIMESTAMP")
 
-            conn.commit()
+        conn.commit()
     except Exception as e:
         if conn:
             conn.rollback()
-        logger.exception(f"DB init fail: {e}")
+        logger.exception("DB init fail: %s", e)
     finally:
         if conn:
             release_db(conn)
@@ -199,52 +207,148 @@ def init_workflow_db():
     try:
         conn = get_db()
         with conn.cursor() as cur:
-            cur.execute("""CREATE TABLE IF NOT EXISTS paper_prompts (
-                id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                prompt_code VARCHAR(5) NOT NULL UNIQUE, title VARCHAR(300) NOT NULL,
-                config_json JSONB NOT NULL, prompt_text TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS paper_tocs (
-                id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                prompt_code VARCHAR(5) NOT NULL UNIQUE REFERENCES paper_prompts(prompt_code) ON DELETE CASCADE,
-                toc_code VARCHAR(5) NOT NULL UNIQUE, toc_text TEXT NOT NULL,
-                sections_json JSONB NOT NULL DEFAULT '[]'::jsonb, page_map_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS paper_projects (
-                id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                prompt_code VARCHAR(5) NOT NULL REFERENCES paper_prompts(prompt_code) ON DELETE CASCADE,
-                toc_code VARCHAR(5) NOT NULL REFERENCES paper_tocs(toc_code) ON DELETE CASCADE,
-                current_index INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id,prompt_code,toc_code))""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS paper_sections (
-                id SERIAL PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES paper_projects(id) ON DELETE CASCADE,
-                order_no INTEGER NOT NULL, section_key VARCHAR(100) NOT NULL, section_title VARCHAR(300) NOT NULL,
-                content_text TEXT NOT NULL, word_count INTEGER NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(project_id,order_no))""")
-            # Backward-compatible migrations for merge and final-document editing.
-            cur.execute("ALTER TABLE paper_projects ADD COLUMN IF NOT EXISTS merged BOOLEAN NOT NULL DEFAULT FALSE")
-            cur.execute("ALTER TABLE paper_projects ADD COLUMN IF NOT EXISTS merged_content TEXT")
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS paper_prompts (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    prompt_code VARCHAR(5) NOT NULL UNIQUE,
+                    title VARCHAR(300) NOT NULL,
+                    config_json JSONB NOT NULL,
+                    prompt_text TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS paper_tocs (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    prompt_code VARCHAR(5) NOT NULL UNIQUE
+                        REFERENCES paper_prompts(prompt_code) ON DELETE CASCADE,
+                    toc_code VARCHAR(5) NOT NULL UNIQUE,
+                    toc_text TEXT NOT NULL,
+                    sections_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    page_map_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS paper_projects (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    prompt_code VARCHAR(5) NOT NULL
+                        REFERENCES paper_prompts(prompt_code) ON DELETE CASCADE,
+                    toc_code VARCHAR(5) NOT NULL
+                        REFERENCES paper_tocs(toc_code) ON DELETE CASCADE,
+                    current_index INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, prompt_code, toc_code)
+                )"""
+            )
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS paper_sections (
+                    id SERIAL PRIMARY KEY,
+                    project_id INTEGER NOT NULL
+                        REFERENCES paper_projects(id) ON DELETE CASCADE,
+                    order_no INTEGER NOT NULL,
+                    section_key VARCHAR(100) NOT NULL,
+                    section_title VARCHAR(300) NOT NULL,
+                    content_text TEXT NOT NULL,
+                    word_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(project_id, order_no)
+                )"""
+            )
+
+            # Existing merge fields; safe on databases where they already exist.
+            cur.execute(
+                "ALTER TABLE paper_projects "
+                "ADD COLUMN IF NOT EXISTS merged BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+            cur.execute(
+                "ALTER TABLE paper_projects "
+                "ADD COLUMN IF NOT EXISTS merged_content TEXT"
+            )
+
+            # Persistent image records are linked to the account, saved project,
+            # and chapter (paper_sections.order_no).
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS paper_images (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    project_id INTEGER NOT NULL
+                        REFERENCES paper_projects(id) ON DELETE CASCADE,
+                    order_no INTEGER NOT NULL,
+                    placeholder_id VARCHAR(100),
+                    image_url TEXT,
+                    image_meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    caption TEXT NOT NULL DEFAULT '',
+                    figure_number VARCHAR(30),
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    width_pct NUMERIC(6,2) NOT NULL DEFAULT 70,
+                    aspect_ratio NUMERIC(10,5),
+                    placement_mode VARCHAR(10) NOT NULL DEFAULT 'flow',
+                    position_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    page_number VARCHAR(20) NOT NULL DEFAULT '',
+                    upload_status VARCHAR(20) NOT NULL DEFAULT 'placeholder',
+                    upload_key VARCHAR(100),
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, project_id, order_no, upload_key)
+                )"""
+            )
+            cur.execute(
+                """CREATE INDEX IF NOT EXISTS paper_images_chapter_idx
+                   ON paper_images(user_id, project_id, order_no, is_active)"""
+            )
+
         conn.commit()
     except Exception:
-        if conn: conn.rollback()
+        if conn:
+            conn.rollback()
         logger.exception("Workflow DB initialization failed")
     finally:
-        if conn: release_db(conn)
+        if conn:
+            release_db(conn)
+
 
 init_workflow_db()
 
 
-
 RICH_HTML_MARKER = "[[TEMPAPER_RICH_HTML]]"
+
 _ALLOWED_RICH_TAGS = {
     "p", "div", "span", "h1", "h2", "h3", "h4", "strong", "b", "em", "i",
-    "u", "s", "del", "ul", "ol", "li", "blockquote", "br", "sub", "sup", "font"
+    "u", "s", "del", "ul", "ol", "li", "blockquote", "br", "sub", "sup",
+    "font", "figure", "figcaption", "img"
 }
-_VOID_RICH_TAGS = {"br"}
-_ALLOWED_STYLE_PROPS = {"font-family", "font-size", "color", "background-color", "text-align", "margin-left", "text-indent"}
+_VOID_RICH_TAGS = {"br", "img"}
+_ALLOWED_STYLE_PROPS = {
+    "font-family", "font-size", "color", "background-color", "text-align",
+    "margin-left", "text-indent", "width", "max-width", "height",
+    "position", "left", "top", "display", "object-fit"
+}
+
+
+def _is_allowed_image_url(value):
+    """Accept only HTTPS ImgBB URLs for image sources."""
+    try:
+        parsed = urlparse(str(value or ""))
+        host = (parsed.hostname or "").lower()
+        return (
+            parsed.scheme == "https"
+            and (host == "ibb.co" or host.endswith(".ibb.co")
+                 or host == "imgbb.com" or host.endswith(".imgbb.com"))
+        )
+    except Exception:
+        return False
+
 
 class _RichHTMLSanitizer(HTMLParser):
-    """Small allow-list sanitizer for editor HTML saved by Tempaper."""
+    """Allow-list sanitizer for editor HTML, including hosted image markup."""
+
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.parts = []
@@ -254,12 +358,39 @@ class _RichHTMLSanitizer(HTMLParser):
         tag = tag.lower()
         if tag not in _ALLOWED_RICH_TAGS:
             return
+
         safe_attrs = []
         legacy_style = []
+
         for key, value in attrs:
             key = key.lower()
-            if not value:
+            if value is None:
                 continue
+
+            if tag == "img":
+                if key == "src" and _is_allowed_image_url(value):
+                    safe_attrs.append(("src", value))
+                elif key == "alt":
+                    safe_attrs.append(("alt", value[:500]))
+                elif key in {"data-image-id", "data-figure-number"}:
+                    if re.fullmatch(r"[A-Za-z0-9._-]{1,100}", value):
+                        safe_attrs.append((key, value))
+                elif key == "style":
+                    styles = []
+                    for declaration in value.split(";"):
+                        if ":" not in declaration:
+                            continue
+                        prop, val = declaration.split(":", 1)
+                        prop, val = prop.strip().lower(), val.strip()
+                        if prop not in _ALLOWED_STYLE_PROPS:
+                            continue
+                        if not re.fullmatch(r"[A-Za-z0-9#(),.%\s'\"_-]{1,100}", val):
+                            continue
+                        styles.append(f"{prop}: {val}")
+                    if styles:
+                        safe_attrs.append(("style", "; ".join(styles)))
+                continue
+
             if tag == "font" and key in {"face", "color", "size"}:
                 if key == "face" and re.fullmatch(r"[A-Za-z0-9 ,_-]{1,80}", value):
                     legacy_style.append("font-family: " + value)
@@ -268,25 +399,31 @@ class _RichHTMLSanitizer(HTMLParser):
                 elif key == "size" and re.fullmatch(r"[1-7]", value):
                     legacy_style.append("font-size: " + str(8 + int(value) * 2) + "pt")
                 continue
-            if key != "style":
-                continue
-            styles = []
-            for declaration in value.split(";"):
-                if ":" not in declaration:
-                    continue
-                prop, val = declaration.split(":", 1)
-                prop, val = prop.strip().lower(), val.strip()
-                if prop not in _ALLOWED_STYLE_PROPS:
-                    continue
-                if not re.fullmatch(r"[A-Za-z0-9#(),.%\s'\"_-]{1,100}", val):
-                    continue
-                styles.append(f"{prop}: {val}")
-            if styles:
-                safe_attrs.append(("style", "; ".join(styles)))
+
+            if key == "style":
+                styles = []
+                for declaration in value.split(";"):
+                    if ":" not in declaration:
+                        continue
+                    prop, val = declaration.split(":", 1)
+                    prop, val = prop.strip().lower(), val.strip()
+                    if prop not in _ALLOWED_STYLE_PROPS:
+                        continue
+                    if not re.fullmatch(r"[A-Za-z0-9#(),.%\s'\"_-]{1,100}", val):
+                        continue
+                    styles.append(f"{prop}: {val}")
+                if styles:
+                    safe_attrs.append(("style", "; ".join(styles)))
+
         if legacy_style:
             safe_attrs.append(("style", "; ".join(legacy_style)))
-        attr_text = "".join(f' {k}="{html_escape(v, quote=True)}"' for k, v in safe_attrs)
+
+        attr_text = "".join(
+            f' {key}="{html_escape(value, quote=True)}"'
+            for key, value in safe_attrs
+        )
         self.parts.append(f"<{tag}{attr_text}>")
+
         if tag not in _VOID_RICH_TAGS:
             self.stack.append(tag)
 
@@ -309,23 +446,32 @@ class _RichHTMLSanitizer(HTMLParser):
             self.parts.append(f"</{self.stack.pop()}>")
         return "".join(self.parts)
 
+
 def sanitize_rich_html(value):
     parser = _RichHTMLSanitizer()
     parser.feed(str(value or ""))
     parser.close()
     return RICH_HTML_MARKER + parser.get_html()
 
+
 class _PlainTextExtractor(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.parts = []
+
     def handle_data(self, data):
         self.parts.append(data)
+
     def handle_starttag(self, tag, attrs):
-        if tag in {"p", "div", "h1", "h2", "h3", "h4", "li", "br", "blockquote"}:
+        if tag in {"p", "div", "h1", "h2", "h3", "h4", "li", "br",
+                   "blockquote", "figure", "figcaption"}:
             self.parts.append("\n")
+
     def get_text(self):
-        return re.sub(r"[ \t]+\n", "\n", re.sub(r"\n{3,}", "\n\n", "".join(self.parts))).strip()
+        text = "".join(self.parts)
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        return re.sub(r"\n{3,}", "\n\n", text).strip()
+
 
 def content_plain_text(value):
     value = str(value or "")
@@ -345,87 +491,1573 @@ def _inline_markdown_html(text):
     escaped = re.sub(r"\+\+(.+?)\+\+", r"<u>\1</u>", escaped)
     return escaped
 
+
 def content_rich_html(value):
     value = str(value or "")
     if value.startswith(RICH_HTML_MARKER):
         return value[len(RICH_HTML_MARKER):]
-    output=[]
-    paragraph=[]
-    list_tag=None
-    list_items=[]
+
+    output = []
+    paragraph = []
+    list_tag = None
+    list_items = []
+
     def flush_paragraph():
         nonlocal paragraph
         if paragraph:
-            output.append("<p>" + _inline_markdown_html(" ".join(paragraph).strip()) + "</p>")
-            paragraph=[]
+            output.append(
+                "<p>" + _inline_markdown_html(" ".join(paragraph).strip()) + "</p>"
+            )
+            paragraph = []
+
     def flush_list():
-        nonlocal list_tag,list_items
+        nonlocal list_tag, list_items
         if list_items:
-            output.append(f"<{list_tag}>" + "".join("<li>"+_inline_markdown_html(item)+"</li>" for item in list_items) + f"</{list_tag}>")
-        list_tag=None
-        list_items=[]
-    for raw_line in value.replace("\r","").split("\n"):
-        line=raw_line.strip()
+            output.append(
+                f"<{list_tag}>"
+                + "".join(
+                    "<li>" + _inline_markdown_html(item) + "</li>"
+                    for item in list_items
+                )
+                + f"</{list_tag}>"
+            )
+        list_tag = None
+        list_items = []
+
+    for raw_line in value.replace("\r", "").split("\n"):
+        line = raw_line.strip()
         if not line:
-            flush_paragraph(); flush_list(); continue
-        hm=re.match(r"^(#{1,3})\s+(.+)$",line)
-        if hm:
-            flush_paragraph(); flush_list()
-            level=len(hm.group(1))
-            output.append(f"<h{level}>"+_inline_markdown_html(hm.group(2))+f"</h{level}>")
-            continue
-        hm=re.match(r"^\*\*\s*(.+?)\s*\*\*$",line)
-        if hm:
-            flush_paragraph(); flush_list()
-            output.append("<h3>"+_inline_markdown_html(hm.group(1))+"</h3>")
-            continue
-        om=re.match(r"^\d+[.)]\s+(.+)$",line)
-        um=re.match(r"^[-*+]\s+(.+)$",line)
-        if om or um:
             flush_paragraph()
-            desired="ol" if om else "ul"
-            if list_tag and list_tag!=desired: flush_list()
-            list_tag=desired
-            list_items.append((om or um).group(1))
+            flush_list()
             continue
+
+        heading = re.match(r"^(#{1,3})\s+(.+)$", line)
+        if heading:
+            flush_paragraph()
+            flush_list()
+            level = len(heading.group(1))
+            output.append(
+                f"<h{level}>"
+                + _inline_markdown_html(heading.group(2))
+                + f"</h{level}>"
+            )
+            continue
+
+        bold_heading = re.match(r"^\*\*\s*(.+?)\s*\*\*$", line)
+        if bold_heading:
+            flush_paragraph()
+            flush_list()
+            output.append("<h3>" + _inline_markdown_html(bold_heading.group(1)) + "</h3>")
+            continue
+
+        ordered = re.match(r"^\d+[.)]\s+(.+)$", line)
+        unordered = re.match(r"^[-*+]\s+(.+)$", line)
+        if ordered or unordered:
+            flush_paragraph()
+            desired = "ol" if ordered else "ul"
+            if list_tag and list_tag != desired:
+                flush_list()
+            list_tag = desired
+            list_items.append((ordered or unordered).group(1))
+            continue
+
         flush_list()
         paragraph.append(line.lstrip("> ").strip())
-    flush_paragraph(); flush_list()
+
+    flush_paragraph()
+    flush_list()
     return "".join(output)
-
-
-def _new_short_code(conn, table, column):
-    allowed = {"paper_prompts": "prompt_code", "paper_tocs": "toc_code"}
+    def _new_short_code(conn, table, column):
+    allowed = {
+        "paper_prompts": "prompt_code",
+        "paper_tocs": "toc_code",
+    }
     if allowed.get(table) != column:
         raise ValueError("Invalid code target")
+
     with conn.cursor() as cur:
         for _ in range(100):
             code = "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
-            cur.execute("SELECT EXISTS(SELECT 1 FROM paper_prompts WHERE prompt_code=%s) OR EXISTS(SELECT 1 FROM paper_tocs WHERE toc_code=%s)", (code, code))
-            if not cur.fetchone()[0]: return code
+            cur.execute(
+                """SELECT
+                     EXISTS(SELECT 1 FROM paper_prompts WHERE prompt_code=%s)
+                     OR EXISTS(SELECT 1 FROM paper_tocs WHERE toc_code=%s)""",
+                (code, code),
+            )
+            if not cur.fetchone()[0]:
+                return code
     raise RuntimeError("Could not allocate unique code")
 
 
 def _owned_prompt(conn, user_id, code):
     with conn.cursor() as cur:
-        cur.execute("SELECT prompt_code,title,config_json,prompt_text FROM paper_prompts WHERE user_id=%s AND prompt_code=%s",
-                    (int(user_id), code.upper()))
+        cur.execute(
+            """SELECT prompt_code, title, config_json, prompt_text
+               FROM paper_prompts
+               WHERE user_id=%s AND prompt_code=%s""",
+            (int(user_id), str(code).upper()),
+        )
         return cur.fetchone()
 
 
 def _owned_toc(conn, user_id, code):
     with conn.cursor() as cur:
-        cur.execute("SELECT prompt_code,toc_code,toc_text,sections_json,page_map_json FROM paper_tocs WHERE user_id=%s AND toc_code=%s",
-                    (int(user_id), code.upper()))
+        cur.execute(
+            """SELECT prompt_code, toc_code, toc_text, sections_json, page_map_json
+               FROM paper_tocs
+               WHERE user_id=%s AND toc_code=%s""",
+            (int(user_id), str(code).upper()),
+        )
         return cur.fetchone()
 
 
-def _chapter_page_budget(config, title, sections):
-    """Allocate the requested main-body page count across chapters only.
+def _section_items(toc_text, config):
+    headings = []
+    for line in (toc_text or "").splitlines():
+        line = re.sub(r"[*#`]", "", line).strip()
+        line = re.sub(r"\s+\.{2,}\s*[ivxlcdm\d]+\s*$", "", line, flags=re.I)
+        if not line or len(line) > 240:
+            continue
 
-    Preliminary pages, references, and appendices are intentionally excluded.
-    The word target is an estimate because actual page breaks depend on rendered layout.
-    """
+        low = line.lower()
+        if low in {"table of contents", "contents"}:
+            continue
+
+        looks_like_section = (
+            re.match(
+                r"^(chapter\s+[ivxlcdm\d]+|chapter\s+\w+|(?:\d+|[ivxlcdm]+)[.)]?\s+\w)",
+                line,
+                re.I,
+            )
+            or any(
+                word in low
+                for word in (
+                    "conclusion", "recommendation", "references",
+                    "bibliography", "appendix",
+                )
+            )
+        )
+        if looks_like_section and not any(h.lower() == line.lower() for h in headings):
+            headings.append(line)
+
+    try:
+        chapters = max(1, min(12, int((config or {}).get("chapters") or 5)))
+    except (TypeError, ValueError):
+        chapters = 5
+
+    if not any(re.search(r"chapter\s+(?:one|i)\b", h, re.I) for h in headings):
+        headings = [f"CHAPTER {n}" for n in range(1, chapters + 1)]
+        headings += ["Conclusion", "References"]
+
+    final = []
+    for heading in headings:
+        low = heading.lower()
+        if any(
+            x in low
+            for x in (
+                "certification", "dedication", "acknowledg",
+                "abstract", "title page", "cover page",
+            )
+        ):
+            continue
+        if not any(existing.lower() == low for existing in final):
+            final.append(heading)
+
+    return [
+        {
+            "key": re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-")[:90],
+            "title": heading,
+        }
+        for heading in final
+    ]
+
+
+def _image_format_from_bytes(data):
+    """Determine supported image formats from their file signatures."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"BM"):
+        return "image/bmp"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _valid_imgbb_url(value):
+    """Allow HTTPS links from ImgBB's image hosts only."""
+    try:
+        parsed = urlparse(str(value or ""))
+        host = (parsed.hostname or "").lower()
+        return (
+            parsed.scheme == "https"
+            and (
+                host == "ibb.co"
+                or host.endswith(".ibb.co")
+                or host == "imgbb.com"
+                or host.endswith(".imgbb.com")
+            )
+        )
+    except Exception:
+        return False
+
+
+def _require_owned_project_section(conn, user_id, project_id, order_no):
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT 1
+               FROM paper_projects p
+               JOIN paper_sections s ON s.project_id=p.id
+               WHERE p.id=%s AND p.user_id=%s AND s.order_no=%s""",
+            (int(project_id), int(user_id), int(order_no)),
+        )
+        return cur.fetchone() is not None
+
+
+def _chapter_number_for_section(conn, project_id, order_no):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT section_title FROM paper_sections WHERE project_id=%s AND order_no=%s",
+            (int(project_id), int(order_no)),
+        )
+        row = cur.fetchone()
+
+    title = row[0] if row else ""
+    match = re.search(
+        r"\bchapter\s+(one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|[1-9]|1[0-2]|i{1,3}|iv|v|vi{0,3}|ix|x|xi|xii)\b",
+        str(title),
+        re.I,
+    )
+    if not match:
+        return max(1, int(order_no))
+
+    token = match.group(1).lower()
+    words = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "eleven": 11, "twelve": 12,
+    }
+    romans = {
+        "i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6,
+        "vii": 7, "viii": 8, "ix": 9, "x": 10, "xi": 11, "xii": 12,
+    }
+    if token.isdigit():
+        return int(token)
+    return words.get(token, romans.get(token, max(1, int(order_no))))
+
+
+def _renumber_images_for_chapter(cur, project_id, order_no):
+    chapter_number = _chapter_number_for_section(
+        cur.connection, project_id, order_no
+    )
+    cur.execute(
+        """SELECT id, caption
+           FROM paper_images
+           WHERE project_id=%s AND order_no=%s
+             AND is_active=TRUE AND upload_status='uploaded'
+           ORDER BY sort_order, id""",
+        (int(project_id), int(order_no)),
+    )
+
+    for figure_index, (image_id, caption) in enumerate(cur.fetchall(), start=1):
+        figure_number = f"{chapter_number}.{figure_index}"
+        clean_caption = re.sub(
+            r"^\s*Figure\s+\d+\.\d+\s*[:—-]\s*",
+            "",
+            str(caption or ""),
+            flags=re.I,
+        ).strip()
+        cur.execute(
+            """UPDATE paper_images
+               SET figure_number=%s, caption=%s, updated_at=CURRENT_TIMESTAMP
+               WHERE id=%s""",
+            (figure_number, clean_caption, image_id),
+        )
+
+
+def _image_record(row):
+    return {
+        "id": row[0],
+        "order_no": row[1],
+        "placeholder_id": row[2],
+        "image_url": row[3],
+        "image_meta": row[4] or {},
+        "caption": row[5] or "",
+        "figure_number": row[6] or "",
+        "sort_order": row[7],
+        "width_pct": float(row[8] or 70),
+        "aspect_ratio": float(row[9]) if row[9] else None,
+        "placement_mode": row[10],
+        "position": row[11] or {},
+        "page_number": row[12] or "",
+        "upload_status": row[13],
+    }
+
+
+_IMAGE_SELECT = """SELECT id, order_no, placeholder_id, image_url, image_meta,
+                          caption, figure_number, sort_order, width_pct,
+                          aspect_ratio, placement_mode, position_json,
+                          page_number, upload_status
+                   FROM paper_images"""
+
+
+@app.route("/paper-images/upload", methods=["POST"])
+def upload_paper_image():
+    user_id = str(request.form.get("user_id", ""))
+    project_id = str(request.form.get("project_id", ""))
+    order_no = str(request.form.get("order_no", ""))
+    upload_key = str(request.form.get("upload_key", "")).strip()[:100]
+    placeholder_id = str(request.form.get("placeholder_id", "")).strip()[:100]
+    caption = str(request.form.get("caption", "")).strip()[:1000]
+
+    if not user_id.isdigit() or not project_id.isdigit() or not order_no.isdigit():
+        return jsonify({"error": "Valid account, project, and chapter are required."}), 400
+    if not upload_key:
+        return jsonify({"error": "An upload key is required to safely retry uploads."}), 400
+    if not IMGBB_API_KEY:
+        return jsonify({"error": "Image hosting is not configured on the server."}), 503
+
+    image_file = request.files.get("image")
+    if image_file is None:
+        return jsonify({"error": "Choose an image to upload."}), 400
+
+    image_bytes = image_file.read(MAX_IMAGE_BYTES + 1)
+    if not image_bytes:
+        return jsonify({"error": "The selected image is empty."}), 400
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        return jsonify({"error": "Images must be 10 MB or smaller."}), 413
+
+    mime_type = _image_format_from_bytes(image_bytes)
+    if not mime_type:
+        return jsonify(
+            {"error": "Unsupported image. Use JPEG, PNG, GIF, BMP, or WebP."}
+        ), 415
+
+    conn = None
+    try:
+        conn = get_db()
+        if not _require_owned_project_section(conn, user_id, project_id, order_no):
+            return jsonify({"error": "Saved chapter not found in this account."}), 404
+
+        # Return the existing row when a client retries the same upload key.
+        with conn.cursor() as cur:
+            cur.execute(
+                _IMAGE_SELECT
+                + """ WHERE user_id=%s AND project_id=%s AND order_no=%s
+                       AND upload_key=%s""",
+                (int(user_id), int(project_id), int(order_no), upload_key),
+            )
+            existing = cur.fetchone()
+        if existing and existing[3]:
+            return jsonify({"image": _image_record(existing), "reused": True}), 200
+
+        response = requests.post(
+            "https://api.imgbb.com/1/upload",
+            data={"key": IMGBB_API_KEY},
+            files={
+                "image": (
+                    image_file.filename or "upload",
+                    image_bytes,
+                    mime_type,
+                )
+            },
+            timeout=(10, 45),
+        )
+        try:
+            hosted = response.json()
+        except ValueError:
+            hosted = {}
+
+        if response.status_code != 200 or not hosted.get("success"):
+            logger.warning("ImgBB upload failed: HTTP %s", response.status_code)
+            return jsonify(
+                {"error": "The image host could not accept this upload. Please retry."}
+            ), 502
+
+        hosted_data = hosted.get("data") or {}
+        image_url = hosted_data.get("url")
+        if not _valid_imgbb_url(image_url):
+            return jsonify({"error": "The image host returned an invalid image URL."}), 502
+
+        width = hosted_data.get("width")
+        height = hosted_data.get("height")
+        aspect_ratio = None
+        try:
+            if int(width) > 0 and int(height) > 0:
+                aspect_ratio = float(width) / float(height)
+        except (TypeError, ValueError):
+            pass
+
+        image_meta = {
+            "mime_type": mime_type,
+            "original_name": (image_file.filename or "")[:255],
+            "size_bytes": len(image_bytes),
+            "width": width,
+            "height": height,
+            "display_url": hosted_data.get("display_url"),
+        }
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO paper_images
+                     (user_id, project_id, order_no, placeholder_id, image_url,
+                      image_meta, caption, aspect_ratio, upload_status, upload_key)
+                   VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s,'uploaded',%s)
+                   ON CONFLICT (user_id, project_id, order_no, upload_key)
+                   DO UPDATE SET image_url=EXCLUDED.image_url,
+                                 image_meta=EXCLUDED.image_meta,
+                                 upload_status='uploaded',
+                                 updated_at=CURRENT_TIMESTAMP
+                   RETURNING id""",
+                (
+                    int(user_id), int(project_id), int(order_no),
+                    placeholder_id or None, image_url, json.dumps(image_meta),
+                    caption, aspect_ratio, upload_key,
+                ),
+            )
+            image_id = cur.fetchone()[0]
+            _renumber_images_for_chapter(cur, project_id, order_no)
+            cur.execute(
+                _IMAGE_SELECT + " WHERE id=%s AND user_id=%s",
+                (image_id, int(user_id)),
+            )
+            saved = cur.fetchone()
+
+        conn.commit()
+        return jsonify({"image": _image_record(saved)}), 201
+
+    except requests.RequestException:
+        if conn:
+            conn.rollback()
+        return jsonify(
+            {"error": "Image upload failed because the image host could not be reached."}
+        ), 502
+    except Exception:
+        if conn:
+            conn.rollback()
+        logger.exception("Image upload failed")
+        return jsonify({"error": "Could not save the uploaded image."}), 500
+    finally:
+        if conn:
+            release_db(conn)
+
+
+@app.route("/paper-images", methods=["GET"])
+def get_paper_images():
+    user_id = request.args.get("user_id", "")
+    project_id = request.args.get("project_id", "")
+    order_no = request.args.get("order_no", "")
+
+    if not user_id.isdigit() or not project_id.isdigit() or not order_no.isdigit():
+        return jsonify({"error": "Valid account, project, and chapter are required."}), 400
+
+    conn = None
+    try:
+        conn = get_db()
+        if not _require_owned_project_section(conn, user_id, project_id, order_no):
+            return jsonify({"error": "Saved chapter not found in this account."}), 404
+
+        with conn.cursor() as cur:
+            cur.execute(
+                _IMAGE_SELECT
+                + """ WHERE user_id=%s AND project_id=%s AND order_no=%s
+                       AND is_active=TRUE
+                     ORDER BY sort_order, id""",
+                (int(user_id), int(project_id), int(order_no)),
+            )
+            rows = cur.fetchall()
+
+        return jsonify({"images": [_image_record(row) for row in rows]}), 200
+    finally:
+        if conn:
+            release_db(conn)
+
+
+@app.route("/paper-images/commit", methods=["POST"])
+def commit_paper_images():
+    data = request.get_json(silent=True) or {}
+    user_id = str(data.get("user_id", ""))
+    project_id = str(data.get("project_id", ""))
+    order_no = str(data.get("order_no", ""))
+
+    if not user_id.isdigit() or not project_id.isdigit() or not order_no.isdigit():
+        return jsonify({"error": "Valid account, project, and chapter are required."}), 400
+
+    content = str(data.get("content", "") or "").strip()
+    image_updates = data.get("images") or []
+    deleted_ids = data.get("deleted_image_ids") or []
+
+    if not content:
+        return jsonify(
+            {"error": "Updated chapter content is required to commit image changes."}
+        ), 400
+    if not isinstance(image_updates, list) or not isinstance(deleted_ids, list):
+        return jsonify({"error": "Image changes must be supplied as lists."}), 400
+
+    if content.startswith(RICH_HTML_MARKER):
+        saved_content = sanitize_rich_html(content[len(RICH_HTML_MARKER):])
+    else:
+        saved_content = sanitize_rich_html(content_rich_html(content))
+
+    conn = None
+    try:
+        conn = get_db()
+        if not _require_owned_project_section(conn, user_id, project_id, order_no):
+            return jsonify({"error": "Saved chapter not found in this account."}), 404
+
+        plain_content = content_plain_text(saved_content)
+
+        with conn.cursor() as cur:
+            for item in image_updates:
+                if not isinstance(item, dict):
+                    continue
+
+                image_id = item.get("id")
+                if not str(image_id or "").isdigit():
+                    continue
+
+                caption = str(item.get("caption", "") or "").strip()[:1000]
+                mode = str(item.get("placement_mode", "flow")).lower()
+                if mode not in {"flow", "free"}:
+                    return jsonify({"error": "Invalid image positioning mode."}), 400
+
+                try:
+                    width_pct = float(item.get("width_pct", 70))
+                except (TypeError, ValueError):
+                    return jsonify({"error": "Image width must be numeric."}), 400
+                width_pct = max(10.0, min(100.0, width_pct))
+
+                position = item.get("position") or {}
+                if not isinstance(position, dict):
+                    position = {}
+                safe_position = {}
+                for key in ("x", "y"):
+                    try:
+                        safe_position[key] = max(
+                            0.0, min(1.0, float(position.get(key, 0)))
+                        )
+                    except (TypeError, ValueError):
+                        safe_position[key] = 0.0
+
+                try:
+                    sort_order = max(0, int(item.get("sort_order", 0)))
+                except (TypeError, ValueError):
+                    sort_order = 0
+
+                page_number = str(item.get("page_number", "") or "")[:20]
+
+                cur.execute(
+                    """UPDATE paper_images
+                       SET caption=%s, width_pct=%s, placement_mode=%s,
+                           position_json=%s::jsonb, sort_order=%s, page_number=%s,
+                           updated_at=CURRENT_TIMESTAMP
+                       WHERE id=%s AND user_id=%s AND project_id=%s
+                         AND order_no=%s AND is_active=TRUE
+                         AND upload_status='uploaded'""",
+                    (
+                        caption, width_pct, mode, json.dumps(safe_position),
+                        sort_order, page_number, int(image_id), int(user_id),
+                        int(project_id), int(order_no),
+                    ),
+                )
+                if cur.rowcount != 1:
+                    return jsonify(
+                        {"error": "An image was not found in this saved chapter."}
+                    ), 404
+
+            for image_id in deleted_ids:
+                if not str(image_id or "").isdigit():
+                    continue
+                cur.execute(
+                    """UPDATE paper_images
+                       SET is_active=FALSE, updated_at=CURRENT_TIMESTAMP
+                       WHERE id=%s AND user_id=%s AND project_id=%s AND order_no=%s""",
+                    (int(image_id), int(user_id), int(project_id), int(order_no)),
+                )
+
+            _renumber_images_for_chapter(cur, project_id, order_no)
+
+            # Update only the selected paper_sections row. Other chapters are untouched.
+            cur.execute(
+                """UPDATE paper_sections
+                   SET content_text=%s, word_count=%s, updated_at=CURRENT_TIMESTAMP
+                   WHERE project_id=%s AND order_no=%s""",
+                (
+                    saved_content, len(plain_content.split()),
+                    int(project_id), int(order_no),
+                ),
+            )
+            if cur.rowcount != 1:
+                return jsonify({"error": "The saved chapter could not be updated."}), 404
+
+            cur.execute(
+                _IMAGE_SELECT
+                + """ WHERE user_id=%s AND project_id=%s AND order_no=%s
+                       AND is_active=TRUE
+                     ORDER BY sort_order, id""",
+                (int(user_id), int(project_id), int(order_no)),
+            )
+            rows = cur.fetchall()
+
+        conn.commit()
+        return jsonify(
+            {
+                "message": "Chapter and image changes saved.",
+                "order_no": int(order_no),
+                "images": [_image_record(row) for row in rows],
+            }
+        ), 200
+
+    except Exception:
+        if conn:
+            conn.rollback()
+        logger.exception("Chapter image commit failed")
+        return jsonify(
+            {"error": "Could not save chapter image changes. Please retry."}
+        ), 500
+    finally:
+        if conn:
+            release_db(conn)
+
+
+@app.route("/prompt-builder", methods=["GET", "POST"])
+def prompt_builder():
+    if request.method == "GET":
+        user_id = request.args.get("user_id", "")
+        if not user_id.isdigit():
+            return jsonify({"error": "Please sign in to use Prompt Builder."}), 401
+
+        conn = None
+        try:
+            conn = get_db()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT prompt_code, title, config_json, prompt_text, created_at
+                       FROM paper_prompts
+                       WHERE user_id=%s
+                       ORDER BY created_at DESC LIMIT 50""",
+                    (int(user_id),),
+                )
+                rows = cur.fetchall()
+
+            return jsonify(
+                {
+                    "prompts": [
+                        {
+                            "prompt_code": row[0],
+                            "title": row[1],
+                            "config": row[2],
+                            "prompt_text": row[3],
+                            "created_at": row[4].isoformat() if row[4] else None,
+                        }
+                        for row in rows
+                    ]
+                }
+            ), 200
+        finally:
+            if conn:
+                release_db(conn)
+
+    data = request.get_json(silent=True) or {}
+    user_id = str(data.get("user_id", ""))
+    config = data.get("config") or {}
+    if not isinstance(config, dict):
+        return jsonify({"error": "Prompt configuration must be an object."}), 400
+
+    title = str(config.get("topic") or data.get("title") or "").strip()
+    if not user_id.isdigit():
+        return jsonify({"error": "Sign in to save a prompt to your account."}), 401
+    if not title:
+        return jsonify({"error": "Enter the term-paper topic."}), 400
+
+    try:
+        config = dict(config)
+        config.update(
+            {
+                "topic": title,
+                "pages": max(1, min(500, int(config.get("pages", 20)))),
+                "chapters": max(1, min(12, int(config.get("chapters", 5)))),
+                "body_font_size": max(8, min(24, int(config.get("body_font_size", 12)))),
+                "heading1_size": max(8, min(36, int(config.get("heading1_size", 14)))),
+                "heading2_size": max(8, min(32, int(config.get("heading2_size", 14)))),
+                "heading3_size": max(8, min(28, int(config.get("heading3_size", 12)))),
+            }
+        )
+    except (TypeError, ValueError):
+        return jsonify(
+            {"error": "Page, chapter, and font-size values must be numbers."}
+        ), 400
+
+    text_fields = (
+        "instructions", "structure", "institution", "faculty", "department",
+        "course_title", "course_code", "student_name", "registration_number",
+        "lecturer_name", "academic_session", "submission_date",
+    )
+    for field in text_fields:
+        config[field] = str(config.get(field) or "").strip()
+
+    cover_fields = {
+        "institution": "Institution / University",
+        "faculty": "Faculty",
+        "department": "Department",
+        "course_code": "Course Code",
+        "course_title": "Course Title",
+        "student_name": "Student Name",
+        "registration_number": "Registration / Matriculation Number",
+        "lecturer_name": "Lecturer / Supervisor",
+        "academic_session": "Academic Session",
+        "submission_date": "Date of Submission",
+    }
+    cover_lines = "\n".join(
+        f"- {label}: {config[field] or '[Leave a blank line for the student to fill in]'}"
+        for field, label in cover_fields.items()
+    )
+
+    automatic_rules = """AUTOMATIC TEMPAPER STRUCTURE RULES:
+The requested page count applies only to the main body, from Chapter One through the final chapter. Preliminary pages, references, and appendices are additional. Use the allocated chapter page and word target supplied during each pull; do not pad with repetition or claim an exact rendered page count.
+Use the saved TOC as the authoritative heading list. Preserve its wording, order, and numbering. Explain each subsection according to its subject. Explain items in lists when the context calls for discussion, but keep simple objectives and enumerations concise.
+Use academic language, meaningful transitions, and credible citations. Do not invent personal, institution, course, source, quotation, or data details.
+The cover page should include the topic and available metadata; leave a visible blank line for missing details. Preliminary headings should be centered and bold, with preliminary pages numbered in lower-case Roman numerals. Main chapters use Arabic page numbering.
+Include a List of Figures when figures are used. Figure captions must remain associated with their images. Do not invent TOC page numbers; the application updates them from the rendered document.
+"""
+
+    prompt_text = (
+        f"Term-paper topic: {title}\n"
+        f"Target main-body length: {config['pages']} A4 pages from Chapter One through the final chapter; preliminary pages and references are additional.\n"
+        f"Required chapters: {config['chapters']}.\n"
+        f"Cover-page details (leave a blank line for any missing value):\n{cover_lines}\n"
+        f"Body font: {config['body_font_size']} pt; "
+        f"Heading 1: {config['heading1_size']} pt; "
+        f"Heading 2: {config['heading2_size']} pt; "
+        f"Heading 3: {config['heading3_size']} pt.\n"
+        f"Structure: {config.get('structure') or 'Standard academic structure'}.\n"
+        f"Additional instructions: {config.get('instructions') or 'Use formal academic writing, credible sources, and consistent citations.'}\n\n"
+        f"{automatic_rules}"
+    )
+
+    conn = None
+    try:
+        conn = get_db()
+        code = _new_short_code(conn, "paper_prompts", "prompt_code")
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO paper_prompts
+                     (user_id, prompt_code, title, config_json, prompt_text)
+                   VALUES (%s,%s,%s,%s::jsonb,%s)""",
+                (int(user_id), code, title, json.dumps(config), prompt_text),
+            )
+        conn.commit()
+        return jsonify(
+            {
+                "message": "Prompt saved to your account.",
+                "prompt_code": code,
+                "title": title,
+                "prompt_text": prompt_text,
+            }
+        ), 201
+    except Exception:
+        if conn:
+            conn.rollback()
+        logger.exception("Prompt save failed")
+        return jsonify({"error": "Could not save prompt."}), 500
+    finally:
+        if conn:
+            release_db(conn)
+
+
+@app.route("/build-toc", methods=["POST"])
+def build_toc():
+    data = request.get_json(silent=True) or {}
+    user_id = str(data.get("user_id", ""))
+    prompt_code = str(data.get("prompt_code", "")).strip().upper()
+
+    if not user_id.isdigit() or not re.fullmatch(r"[A-Z0-9]{5}", prompt_code):
+        return jsonify(
+            {"error": "Provide a valid account and five-character prompt code."}
+        ), 400
+
+    conn = None
+    try:
+        conn = get_db()
+        prompt_row = _owned_prompt(conn, user_id, prompt_code)
+        if not prompt_row:
+            return jsonify({"error": "Prompt code not found in this account."}), 404
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT toc_code, toc_text
+                   FROM paper_tocs
+                   WHERE user_id=%s AND prompt_code=%s""",
+                (int(user_id), prompt_code),
+            )
+            existing = cur.fetchone()
+
+        if existing:
+            return jsonify(
+                {
+                    "message": "Retrieved the saved table of contents.",
+                    "toc_code": existing[0],
+                    "toc": existing[1],
+                    "prompt_code": prompt_code,
+                    "updated": True,
+                }
+            ), 200
+
+        _, title, config, prompt_text = prompt_row
+        toc_prompt = (
+            "Create a complete, logically ordered academic term-paper TABLE OF "
+            "CONTENTS only. Include required preliminary pages, exactly the requested "
+            "number of chapters, useful numbered chapter subsections, conclusion, "
+            "recommendations, references, and appendices where appropriate. "
+            "Do not write the paper. Use clean Markdown, one entry per line, and do "
+            "not invent page numbers.\n\n"
+            f"Saved instructions:\n{prompt_text}\n\n"
+            f"Topic: {title}\nRequested chapters: {config.get('chapters', 5)}"
+        )
+
+        toc_text = normalize_server_text(generate_with_groq(toc_prompt))
+        sections = _section_items(toc_text, config)
+        toc_code = _new_short_code(conn, "paper_tocs", "toc_code")
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO paper_tocs
+                     (user_id, prompt_code, toc_code, toc_text, sections_json)
+                   VALUES (%s,%s,%s,%s,%s::jsonb)""",
+                (
+                    int(user_id), prompt_code, toc_code,
+                    toc_text, json.dumps(sections),
+                ),
+            )
+        conn.commit()
+        return jsonify(
+            {
+                "message": "Table of contents created and saved.",
+                "prompt_code": prompt_code,
+                "toc_code": toc_code,
+                "toc": toc_text,
+                "sections": sections,
+                "updated": False,
+            }
+        ), 201
+
+    except Exception:
+        if conn:
+            conn.rollback()
+        logger.exception("TOC creation failed")
+        return jsonify({"error": "Could not create the table of contents."}), 500
+    finally:
+        if conn:
+            release_db(conn)
+@app.route("/paper-start", methods=["POST"])
+def paper_start():
+    data = request.get_json(silent=True) or {}
+    user_id = str(data.get("user_id", ""))
+    prompt_code = str(data.get("prompt_code", "")).strip().upper()
+    toc_code = str(data.get("toc_code", "")).strip().upper()
+
+    if (
+        not user_id.isdigit()
+        or not re.fullmatch(r"[A-Z0-9]{5}", prompt_code)
+        or not re.fullmatch(r"[A-Z0-9]{5}", toc_code)
+    ):
+        return jsonify({"error": "Enter both five-character codes and sign in."}), 400
+
+    conn = None
+    try:
+        conn = get_db()
+        prompt_row = _owned_prompt(conn, user_id, prompt_code)
+        toc_row = _owned_toc(conn, user_id, toc_code)
+
+        if not prompt_row or not toc_row or toc_row[0] != prompt_code:
+            return jsonify(
+                {
+                    "error": "These codes do not match a saved prompt and TOC in your account."
+                }
+            ), 404
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, current_index, merged, merged_content
+                   FROM paper_projects
+                   WHERE user_id=%s AND prompt_code=%s AND toc_code=%s""",
+                (int(user_id), prompt_code, toc_code),
+            )
+            project = cur.fetchone()
+
+        if project:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT order_no, section_title, content_text
+                       FROM paper_sections
+                       WHERE project_id=%s
+                       ORDER BY order_no""",
+                    (project[0],),
+                )
+                rows = cur.fetchall()
+
+            return jsonify(
+                {
+                    "message": "Resumed your saved paper.",
+                    "project_id": project[0],
+                    "current_index": project[1],
+                    "merged": bool(project[2]),
+                    "merged_content": project[3] or "",
+                    "sections": [
+                        {"order_no": row[0], "title": row[1], "content": row[2]}
+                        for row in rows
+                    ],
+                }
+            ), 200
+
+        _, title, config, prompt_text = prompt_row
+        _, _, toc_text, _, _ = toc_row
+
+        research, sources = search_tavily(prompt_text)
+        preliminary_prompt = (
+            "Write ONLY the cover/title page and required preliminary pages. "
+            "Do NOT generate, include, or preview the Table of Contents. "
+            "Do NOT write Chapter One or any chapter content. "
+            "Follow every formatting rule in the saved prompt. "
+            "Use lower-case Roman numerals for following preliminary pages. "
+            "Keep preliminary headings centered and bold, with justified body text. "
+            "Do not include TOC entries or fabricated page numbers.\n\n"
+            f"SAVED PROMPT:\n{prompt_text}\n\nResearch notes:\n{research}\n\nWrite the preliminary material only."
+        )
+
+        prelim = remove_duplicate_sections(generate_with_groq(preliminary_prompt))
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO paper_projects
+                     (user_id, prompt_code, toc_code, current_index)
+                   VALUES (%s,%s,%s,0) RETURNING id""",
+                (int(user_id), prompt_code, toc_code),
+            )
+            project_id = cur.fetchone()[0]
+            cur.execute(
+                """INSERT INTO paper_sections
+                     (project_id, order_no, section_key, section_title,
+                      content_text, word_count)
+                   VALUES (%s,0,'preliminary','Preliminary Pages and Table of Contents',%s,%s)""",
+                (project_id, prelim, len(prelim.split())),
+            )
+        conn.commit()
+
+        return jsonify(
+            {
+                "message": "Preliminary pages created. Chapter One has not been generated yet.",
+                "project_id": project_id,
+                "current_index": 0,
+                "result": prelim,
+                "toc": toc_text,
+                "toc_code": toc_code,
+                "sources": sources,
+                "word_count": len(prelim.split()),
+                "page_count": max(1, (len(prelim.split()) + 249) // 250),
+            }
+        ), 201
+
+    except Exception:
+        if conn:
+            conn.rollback()
+        logger.exception("Paper start failed")
+        return jsonify({"error": "Could not start the paper."}), 500
+    finally:
+        if conn:
+            release_db(conn)
+
+
+@app.route("/pull-next", methods=["POST"])
+def pull_next():
+    data = request.get_json(silent=True) or {}
+    user_id = str(data.get("user_id", ""))
+    project_id = str(data.get("project_id", ""))
+    action = str(data.get("action", "next")).lower()
+
+    if not user_id.isdigit() or not project_id.isdigit():
+        return jsonify({"error": "Sign in and open a saved paper first."}), 400
+
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT p.id, p.prompt_code, p.toc_code, p.current_index,
+                          pr.prompt_text, pr.config_json, t.toc_text, t.sections_json
+                   FROM paper_projects p
+                   JOIN paper_prompts pr ON pr.prompt_code = p.prompt_code
+                   JOIN paper_tocs t ON t.toc_code = p.toc_code
+                   WHERE p.id=%s AND p.user_id=%s""",
+                (int(project_id), int(user_id)),
+            )
+            project = cur.fetchone()
+
+        if not project:
+            return jsonify({"error": "Saved paper not found in your account."}), 404
+
+        _, prompt_code, toc_code, current_index, prompt_text, config, toc_text, sections = project
+        sections = sections or []
+
+        # Edit TOC
+        if action == "edit_toc":
+            incoming = str(data.get("content", ""))
+            edited_toc = content_plain_text(incoming).strip()
+            if not edited_toc:
+                return jsonify({"error": "Table of contents cannot be empty."}), 400
+
+            inline_enabled = bool(data.get("inline_enabled", False))
+            if inline_enabled:
+                refined = generate_with_groq(
+                    "Clean up and refine ONLY this academic table of contents. "
+                    "Preserve all chapter and subsection names, their numbering, "
+                    "and their order. Use one entry per line. Do not write the paper and "
+                    "do not invent page numbers. Return only the corrected TOC.\n\n"
+                    + edited_toc
+                )
+                edited_toc = normalize_server_text(refined)
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE paper_tocs
+                       SET toc_text=%s,
+                           sections_json=%s::jsonb,
+                           updated_at=CURRENT_TIMESTAMP
+                       WHERE user_id=%s AND toc_code=%s""",
+                    (
+                        edited_toc,
+                        json.dumps(_section_items(edited_toc, config)),
+                        int(user_id),
+                        toc_code,
+                    ),
+                )
+            conn.commit()
+
+            return jsonify(
+                {
+                    "message": "Table of contents updated.",
+                    "title": "Table of Contents",
+                    "result": edited_toc,
+                    "inline_applied": inline_enabled,
+                    "kind": "toc",
+                }
+            ), 200
+
+        # Edit section or merged document
+        if action in {"edit", "edit_merged"}:
+            incoming = str(data.get("content", ""))
+            if not content_plain_text(incoming).strip():
+                return jsonify({"error": "Edited content cannot be empty."}), 400
+
+            if action == "edit_merged":
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT merged
+                           FROM paper_projects
+                           WHERE id=%s AND user_id=%s""",
+                        (int(project_id), int(user_id)),
+                    )
+                    merged_row = cur.fetchone()
+                    if not merged_row or not merged_row[0]:
+                        return jsonify({"error": "This paper has not been merged yet."}), 409
+
+                    saved_content = incoming.strip()
+                    if incoming.startswith(RICH_HTML_MARKER):
+                        saved_content = sanitize_rich_html(incoming[len(RICH_HTML_MARKER):])
+
+                    cur.execute(
+                        """UPDATE paper_projects
+                           SET merged_content=%s,
+                               updated_at=CURRENT_TIMESTAMP
+                           WHERE id=%s AND user_id=%s""",
+                        (saved_content, int(project_id), int(user_id)),
+                    )
+                conn.commit()
+                return jsonify(
+                    {
+                        "message": "Merged document changes saved directly.",
+                        "title": "Complete Term Paper",
+                        "result": saved_content,
+                        "merged": True,
+                    }
+                ), 200
+
+            edited_plain = content_plain_text(incoming).strip()
+            order_no = int(data.get("order_no", current_index))
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT merged
+                       FROM paper_projects
+                       WHERE id=%s AND user_id=%s""",
+                    (int(project_id), int(user_id)),
+                )
+                merged_row = cur.fetchone()
+                if not merged_row:
+                    return jsonify({"error": "Paper project not found."}), 404
+                merged = bool(merged_row[0])
+
+            inline_enabled = bool(data.get("inline_enabled", False)) and not merged
+            if inline_enabled:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT section_title
+                           FROM paper_sections
+                           WHERE project_id=%s AND order_no=%s""",
+                        (int(project_id), order_no),
+                    )
+                    title_row = cur.fetchone()
+                    cur.execute(
+                        """SELECT order_no, section_title, content_text
+                           FROM paper_sections
+                           WHERE project_id=%s AND order_no<>%s
+                           ORDER BY order_no""",
+                        (int(project_id), order_no),
+                    )
+                    neighbors = cur.fetchall()
+
+                if not title_row:
+                    return jsonify({"error": "Section not found."}), 404
+
+                title = title_row[0]
+                previous = next(
+                    (content_plain_text(row[2]) for row in reversed(neighbors) if row[0] < order_no),
+                    "",
+                )
+                following = next(
+                    (content_plain_text(row[2]) for row in neighbors if row[0] > order_no),
+                    "",
+                )
+
+                refine_prompt = (
+                    "Refine ONLY the edited academic section below so its paragraphs, "
+                    "subheadings, transitions, and chapter flow smoothly. Use the surrounding "
+                    "context only to maintain coherence. Preserve the user's intended meaning, "
+                    "facts, key points, heading numbering, and any required equations or citations. "
+                    "Do not invent sources, add unrelated headings, rewrite the entire paper, "
+                    "or mention that you are an AI. Return only the improved section text.\n\n"
+                    f"Saved term-paper instructions:\n{prompt_text}\n\nSaved TOC:\n{toc_text}\n\n"
+                    f"Previous section context:\n{previous[-3500:]}\n\n"
+                    f"Next section context:\n{following[:3500]}\n\n"
+                    f"Section title: {title}\n\nUser-edited section to refine:\n{edited_plain}"
+                )
+                saved = remove_duplicate_sections(generate_with_groq(refine_prompt))
+            else:
+                saved = incoming.strip()
+                if incoming.startswith(RICH_HTML_MARKER):
+                    saved = sanitize_rich_html(incoming[len(RICH_HTML_MARKER):])
+
+            plain = content_plain_text(saved)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE paper_sections
+                       SET content_text=%s, word_count=%s, updated_at=CURRENT_TIMESTAMP
+                       WHERE project_id=%s AND order_no=%s
+                       RETURNING section_title""",
+                    (saved, len(plain.split()), int(project_id), order_no),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "Section not found."}), 404
+
+                cur.execute(
+                    "UPDATE paper_tocs SET updated_at=CURRENT_TIMESTAMP WHERE toc_code=%s",
+                    (toc_code,),
+                )
+
+                if merged:
+                    cur.execute(
+                        """SELECT section_title, content_text
+                           FROM paper_sections
+                           WHERE project_id=%s ORDER BY order_no""",
+                        (int(project_id),),
+                    )
+                    all_rows = cur.fetchall()
+                    merged_text = "\n\n".join(
+                        (
+                            f"# {section_title}\n\n{content_plain_text(content)}"
+                            if section_title
+                            else content_plain_text(content)
+                        )
+                        for section_title, content in all_rows
+                    )
+                    cur.execute(
+                        """UPDATE paper_projects
+                           SET merged_content=%s, updated_at=CURRENT_TIMESTAMP
+                           WHERE id=%s""",
+                        (merged_text, int(project_id)),
+                    )
+            conn.commit()
+            return jsonify(
+                {
+                    "message": "Section refined with Groq."
+                    if inline_enabled
+                    else "Section updated and saved directly.",
+                    "title": row[0],
+                    "result": saved,
+                    "order_no": order_no,
+                    "inline_applied": inline_enabled,
+                    "merged": merged,
+                }
+            ), 200
+
+        if action == "resend":
+            order_no = int(data.get("order_no", current_index))
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT section_title
+                       FROM paper_sections
+                       WHERE project_id=%s AND order_no=%s""",
+                    (int(project_id), order_no),
+                )
+                row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "There is no saved section to regenerate."}), 404
+
+            title = row[0]
+            page_budget = _chapter_page_budget(config, title, sections)
+            budget_note = (
+                f"\nTHIS CHAPTER'S SHARE OF THE MAIN-BODY PAGE TARGET: approximately "
+                f"{page_budget['pages']} A4 pages and about {page_budget['words']} words. "
+                f"This is chapter {page_budget['chapter_index']} of {page_budget['chapter_count']}; "
+                f"the complete main body target is {page_budget['total_pages']} pages total. "
+                f"Preliminary pages and references are excluded.\n"
+                if page_budget
+                else ""
+            )
+            prompt = (
+                f"Regenerate ONLY this existing section titled {title}. Do not repeat other "
+                f"chapters or preliminary pages. Apply every automatic Tempaper rule in the "
+                f"saved instructions, including chapter role, topic-weight page-depth target, "
+                f"varied heading/list pattern, and numbering. Preserve the section's position "
+                f"in the saved TOC.{budget_note}\n\n"
+                f"{prompt_text}\n\nTOC:\n{toc_text}\n\nSection: {title}"
+            )
+            content = remove_duplicate_sections(generate_with_groq(prompt))
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE paper_sections
+                       SET content_text=%s, word_count=%s, updated_at=CURRENT_TIMESTAMP
+                       WHERE project_id=%s AND order_no=%s""",
+                    (content, len(content.split()), int(project_id), order_no),
+                )
+                cur.execute(
+                    "UPDATE paper_tocs SET updated_at=CURRENT_TIMESTAMP WHERE toc_code=%s",
+                    (toc_code,),
+                )
+            conn.commit()
+
+            return jsonify(
+                {
+                    "message": "Section regenerated without adding a duplicate.",
+                    "title": title,
+                    "result": content,
+                    "order_no": order_no,
+                }
+            ), 200
+
+        next_index = int(current_index) + 1
+        if next_index > len(sections):
+            return jsonify(
+                {"message": "All sections in the saved table of contents have been generated.", "done": True}
+            ), 200
+
+        item = sections[next_index - 1]
+        title = str(item.get("title") or f"Section {next_index}")
+        key = str(item.get("key") or f"section-{next_index}")
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT section_title, content_text
+                   FROM paper_sections
+                   WHERE project_id=%s AND order_no=%s""",
+                (int(project_id), next_index),
+            )
+            existing = cur.fetchone()
+
+        if existing:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE paper_projects
+                       SET current_index=%s, updated_at=CURRENT_TIMESTAMP
+                       WHERE id=%s""",
+                    (next_index, int(project_id)),
+                )
+            conn.commit()
+            return jsonify(
+                {
+                    "message": "Resumed the next saved section.",
+                    "title": existing[0],
+                    "result": existing[1],
+                    "order_no": next_index,
+                    "current_index": next_index,
+                }
+            ), 200
+
+        chapter_titles = [
+            str(x.get("title") or "")
+            for x in sections
+            if re.search(r"chapter\s+(?:[ivxlcdm]+|\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+                         str(x.get("title") or ""), re.I)
+        ]
+        is_last_chapter = bool(chapter_titles and title.strip().lower() == chapter_titles[-1].strip().lower())
+        title_low = title.lower()
+
+        if any(term in title_low for term in ("references", "bibliography", "appendix", "appendices")):
+            chapter_role = "supplementary section"
+        elif re.search(r"chapter\s*(1|i|one)\b|introduction|background", title, re.I):
+            chapter_role = "opening chapter"
+        elif is_last_chapter or re.search(r"conclusion|recommendations?$", title, re.I):
+            chapter_role = "closing chapter"
+        else:
+            chapter_role = "middle chapter"
+
+        page_budget = _chapter_page_budget(config, title, sections)
+        budget_note = (
+            f"THIS CHAPTER'S SHARE OF THE MAIN-BODY PAGE TARGET: approximately "
+            f"{page_budget['pages']} A4 pages and about {page_budget['words']} words. "
+            f"This is chapter {page_budget['chapter_index']} of {page_budget['chapter_count']}; "
+            f"across all chapters, aim for {page_budget['total_pages']} A4 pages total from "
+            f"Chapter One to the final chapter. Cover and preliminary pages, references, and "
+            f"appendices are additional and do not count toward that total.\n"
+            if page_budget
+            else ""
+        )
+
+        prompt = (
+            f"Write ONLY the next section titled exactly: {title}. Do not write any other chapter "
+            f"or repeat content already generated. Apply ALL automatic Tempaper rules in the "
+            f"saved prompt. Current role: {chapter_role}. {budget_note}"
+            f"Use the saved TOC as the authoritative heading checklist: include every relevant "
+            f"subsection for this chapter in the exact order and preserve its wording. Finish each "
+            f"subsection before starting the next. Identify whether each subsection needs explanation, "
+            f"list, example, comparison, calculation/solution, or a combination. When a list is introduced "
+            f"as types, factors, causes, reasons, characteristics, elements, functions, advantages/disadvantages, "
+            f"stages or methods requiring discussion, explain EACH item under that same subsection. "
+            f"Keep the chapter substantive; do not pad with repetition. Use academic tone and credible "
+            f"citations. Do not add a new TOC or fabricate page numbers.\n\n"
+            f"Original saved instructions (mandatory on every pull):\n{prompt_text}\n\n"
+            f"Saved table of contents:\n{toc_text}\n\n"
+            f"Section {next_index} of {len(sections)}. Write this section only."
+        )
+
+        research, sources = search_tavily(f"{prompt_text}\nSection: {title}")
+        content = remove_duplicate_sections(generate_with_groq(prompt, research))
+
+        if re.search(r"chapter\s*(?:[1-9]|i\b|one\b)", title, re.I) or chapter_role in {
+            "opening chapter", "middle chapter", "closing chapter"
+        }:
+            content, quality_issues = _repair_incomplete_chapter(content, title, prompt_text, toc_text, research)
+            if quality_issues:
+                logger.info("Chapter quality repair for %s: %s", title, "; ".join(quality_issues))
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO paper_sections
+                     (project_id, order_no, section_key, section_title, content_text, word_count)
+                   VALUES (%s,%s,%s,%s,%s,%s)""",
+                (int(project_id), next_index, key, title, content, len(content.split())),
+            )
+            cur.execute(
+                """UPDATE paper_projects
+                   SET current_index=%s, updated_at=CURRENT_TIMESTAMP
+                   WHERE id=%s""",
+                (next_index, int(project_id)),
+            )
+            cur.execute(
+                "UPDATE paper_tocs SET updated_at=CURRENT_TIMESTAMP WHERE toc_code=%s",
+                (toc_code,),
+            )
+        conn.commit()
+
+        return jsonify(
+            {
+                "message": f"{title} generated.",
+                "title": title,
+                "result": content,
+                "order_no": next_index,
+                "current_index": next_index,
+                "sources": sources,
+                "word_count": len(content.split()),
+                "page_count": max(1, (len(content.split()) + 249) // 250),
+                "toc_code": toc_code,
+                "toc": toc_text,
+            }
+        ), 201
+
+    except Exception:
+        if conn:
+            conn.rollback()
+        logger.exception("Pull next failed")
+        return jsonify({"error": "Could not generate the next section."}), 500
+    finally:
+        if conn:
+            release_db(conn)
+
+
+@app.route("/merge-paper", methods=["POST"])
+def merge_paper():
+    data = request.get_json(silent=True) or {}
+    user_id = str(data.get("user_id", ""))
+    project_id = str(data.get("project_id", ""))
+
+    if not user_id.isdigit() or not project_id.isdigit():
+        return jsonify({"error": "Sign in and open a saved paper first."}), 400
+
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT p.current_index, p.merged_content, t.sections_json, t.toc_text
+                   FROM paper_projects p
+                   JOIN paper_tocs t ON t.toc_code = p.toc_code
+                   WHERE p.id=%s AND p.user_id=%s""",
+                (int(project_id), int(user_id)),
+            )
+            project = cur.fetchone()
+
+            if not project:
+                return jsonify({"error": "Saved paper not found in your account."}), 404
+
+            current_index, old_content, sections, toc_text = project
+            sections = sections or []
+
+            if int(current_index or 0) < len(sections):
+                return jsonify(
+                    {"error": "Generate every section in the saved TOC before merging the complete paper."}
+                ), 409
+
+            cur.execute(
+                """SELECT section_title, content_text
+                   FROM paper_sections
+                   WHERE project_id=%s ORDER BY order_no""",
+                (int(project_id),),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                return jsonify({"error": "There is no generated content to merge."}), 400
+
+            chunks = []
+            toc_inserted = False
+
+            for title, content in rows:
+                rich = content_rich_html(content)
+                plain = content_plain_text(content)
+                is_preliminary = (title or "").lower() in {
+                    "preliminary pages and table of contents",
+                    "preliminary pages",
+                }
+                if is_preliminary:
+                    chunks.append(rich)
+                    if not toc_inserted and toc_text:
+                        toc_html = "<h2>TABLE OF CONTENTS</h2>" + "".join(
+                            "<p>" + _inline_markdown_html(line.strip()) + "</p>"
+                            for line in str(toc_text).splitlines()
+                            if line.strip()
+                        )
+                        chunks.append(toc_html)
+                        toc_inserted = True
+                else:
+                    if title and not plain.lower().lstrip().startswith(title.lower().lstrip()):
+                        chunks.append("<h1>" + html_escape(str(title)) + "</h1>" + rich)
+                    else:
+                        chunks.append(rich)
+
+            if not toc_inserted and toc_text:
+                toc_html = "<h2>TABLE OF CONTENTS</h2>" + "".join(
+                    "<p>" + _inline_markdown_html(line.strip()) + "</p>"
+                    for line in str(toc_text).splitlines()
+                    if line.strip()
+                )
+                chunks.insert(1 if chunks else 0, toc_html)
+
+            merged_content = RICH_HTML_MARKER + "".join(x for x in chunks if x.strip())
+            cur.execute(
+                """UPDATE paper_projects
+                   SET merged=TRUE, merged_content=%s, updated_at=CURRENT_TIMESTAMP
+                   WHERE id=%s AND user_id=%s""",
+                (merged_content, int(project_id), int(user_id)),
+            )
+
+        conn.commit()
+        return jsonify(
+            {
+                "message": "Paper merged into one document. Inline Edit is now disabled for this merged file.",
+                "merged": True,
+                "merged_content": merged_content,
+                "title": "Complete Term Paper",
+            }
+        ), 200
+    except Exception:
+        if conn:
+            conn.rollback()
+        logger.exception("Paper merge failed")
+        return jsonify({"error": "Could not merge the paper."}), 500
+    finally:
+        if conn:
+            release_db(conn)
+
+
+@app.route("/sync-toc-pages", methods=["POST"])
+def sync_toc_pages():
+    data = request.get_json(silent=True) or {}
+    user_id = str(data.get("user_id", ""))
+    toc_code = str(data.get("toc_code", "")).upper()
+    page_map = data.get("page_map") or {}
+
+    if not user_id.isdigit() or not re.fullmatch(r"[A-Z0-9]{5}", toc_code):
+        return jsonify({"error": "Valid account and TOC code required."}), 400
+
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT toc_text FROM paper_tocs WHERE user_id=%s AND toc_code=%s",
+                (int(user_id), toc_code),
+            )
+            saved = cur.fetchone()
+            if not saved:
+                return jsonify({"error": "TOC code not found in this account."}), 404
+
+            toc_text = saved[0] or ""
+            refreshed = []
+            for line in toc_text.splitlines():
+                plain = re.sub(r"[*#`]", "", line).strip()
+                match = None
+                for title, info in page_map.items():
+                    if plain.lower().startswith(str(title).lower()):
+                        match = info
+                        break
+
+                if match is not None:
+                    page = match.get("page_start", "")
+                    line = re.sub(r"\s*(?:\.{2,}|…+)\s*[ivxlcdm\d]+\s*$", "", line, flags=re.I)
+                    line = re.sub(r"\s+[ivxlcdm\d]+\s*$", "", line, flags=re.I)
+                    line = f"{line.rstrip()}  ........  {page}"
+
+                refreshed.append(line)
+
+            new_toc = "\n".join(refreshed)
+            cur.execute(
+                """UPDATE paper_tocs
+                   SET toc_text=%s, page_map_json=%s::jsonb, updated_at=CURRENT_TIMESTAMP
+                   WHERE user_id=%s AND toc_code=%s""",
+                (new_toc, json.dumps(page_map), int(user_id), toc_code),
+            )
+        conn.commit()
+        return jsonify({"message": "TOC page numbers updated.", "toc_code": toc_code, "toc": new_toc}), 200
+    finally:
+        if conn:
+            release_db(conn)
+
+
+def _chapter_page_budget(config, title, sections):
+    """Estimate body-page budget per chapter without counting preliminaries."""
     try:
         target_pages = max(1, min(500, int((config or {}).get("pages", 20))))
         requested_chapters = max(1, min(12, int((config or {}).get("chapters", 5))))
@@ -433,7 +2065,7 @@ def _chapter_page_budget(config, title, sections):
         target_pages, requested_chapters = 20, 5
 
     chapter_titles = []
-    for item in (sections or []):
+    for item in sections or []:
         label = str(item.get("title") or "").strip()
         if re.search(r"\bchapter\s+(?:[ivxlcdm]+|\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b", label, re.I):
             if not any(label.lower() == old.lower() for old in chapter_titles):
@@ -442,19 +2074,36 @@ def _chapter_page_budget(config, title, sections):
     if not chapter_titles:
         chapter_titles = [f"Chapter {n}" for n in range(1, requested_chapters + 1)]
 
-    index = next((i for i, label in enumerate(chapter_titles) if label.lower() == str(title or "").strip().lower()), None)
+    index = next(
+        (
+            i
+            for i, label in enumerate(chapter_titles)
+            if label.lower() == str(title or "").strip().lower()
+        ),
+        None,
+    )
+
     if index is None:
-        # Some TOCs use different capitalization or a suffix after the chapter number.
-        current_match = re.search(r"\bchapter\s+(iv|v|vi|vii|viii|ix|x|xi|xii|[1-9]|1[0-2]|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b", str(title or ""), re.I)
-        if current_match:
-            token = current_match.group(1).lower()
-            number_words = {"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,"eight":8,"nine":9,"ten":10,"eleven":11,"twelve":12}
-            try:
-                current_number = int(token) if token.isdigit() else number_words.get(token, {"i":1,"ii":2,"iii":3,"iv":4,"v":5,"vi":6,"vii":7,"viii":8,"ix":9,"x":10,"xi":11,"xii":12}.get(token))
-            except ValueError:
-                current_number = None
-            if current_number and 1 <= current_number <= len(chapter_titles):
-                index = current_number - 1
+        match = re.search(
+            r"\bchapter\s+(iv|v|vi|vii|viii|ix|x|xi|xii|[1-9]|1[0-2]|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b",
+            str(title or ""),
+            re.I,
+        )
+        if match:
+            token = match.group(1).lower()
+            words = {
+                "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+                "eleven": 11, "twelve": 12,
+            }
+            romans = {
+                "i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6,
+                "vii": 7, "viii": 8, "ix": 9, "x": 10, "xi": 11, "xii": 12,
+            }
+            numeric = int(token) if token.isdigit() else words.get(token, romans.get(token))
+            if numeric and 1 <= numeric <= len(chapter_titles):
+                index = numeric - 1
+
     if index is None:
         return None
 
@@ -472,498 +2121,15 @@ def _chapter_page_budget(config, title, sections):
         else:
             weight = 1.0
         weights.append(weight)
+
     budget = target_pages * weights[index] / sum(weights)
-    return {"pages": max(1, round(budget, 1)), "words": max(300, round(budget * 300)), "chapter_index": index + 1, "chapter_count": count, "total_pages": target_pages}
-
-
-def _section_items(toc_text, config):
-    headings = []
-    for line in (toc_text or "").splitlines():
-        line = re.sub(r"[*#`]", "", line).strip()
-        line = re.sub(r"\s+\.{2,}\s*[ivxlcdm\d]+\s*$", "", line, flags=re.I)
-        if not line or len(line) > 240: continue
-        low = line.lower()
-        if low in {"table of contents", "contents"}: continue
-        if re.match(r"^(chapter\s+[ivxlcdm\d]+|chapter\s+\w+|(?:\d+|[ivxlcdm]+)[.)]?\s+\w)", line, re.I) or any(
-            word in low for word in ("conclusion", "recommendation", "references", "bibliography", "appendix")):
-            if not any(h.lower() == line.lower() for h in headings): headings.append(line)
-    chapters = int(config.get("chapters") or 5)
-    if not any(re.search(r"chapter\s+one|chapter\s+i\b", h, re.I) for h in headings):
-        headings = [f"CHAPTER {n}" for n in range(1, chapters + 1)] + ["Conclusion", "References"]
-    final = []
-    for heading in headings:
-        low = heading.lower()
-        if any(x in low for x in ("certification", "dedication", "acknowledg", "abstract", "title page", "cover page")):
-            continue
-        if not any(h.lower() == low for h in final): final.append(heading)
-    return [{"key": re.sub(r"[^a-z0-9]+", "-", h.lower()).strip("-")[:90], "title": h} for h in final]
-
-
-@app.route("/prompt-builder", methods=["POST", "GET"])
-def prompt_builder():
-    if request.method == "GET":
-        uid = request.args.get("user_id", "")
-        if not uid.isdigit(): return jsonify({"error": "Please sign in to use Prompt Builder."}), 401
-        conn = None
-        try:
-            conn = get_db()
-            with conn.cursor() as cur:
-                cur.execute("SELECT prompt_code,title,config_json,prompt_text,created_at FROM paper_prompts WHERE user_id=%s ORDER BY created_at DESC LIMIT 50", (int(uid),))
-                rows = cur.fetchall()
-            return jsonify({"prompts":[{"prompt_code":r[0],"title":r[1],"config":r[2],"prompt_text":r[3],"created_at":r[4].isoformat() if r[4] else None} for r in rows]}), 200
-        finally:
-            if conn: release_db(conn)
-    data=request.get_json(silent=True) or {}
-    uid=str(data.get("user_id","")); config=data.get("config") or {}
-    title=str(config.get("topic") or data.get("title") or "").strip()
-    if not uid.isdigit(): return jsonify({"error":"Sign in to save a prompt to your account."}),401
-    if not title: return jsonify({"error":"Enter the term-paper topic."}),400
-    try:
-        config.update({
-            "topic":title, "pages":max(1,min(500,int(config.get("pages",20)))),
-            "chapters":max(1,min(12,int(config.get("chapters",5)))),
-            "body_font_size":max(8,min(24,int(config.get("body_font_size",12)))),
-            "heading1_size":max(8,min(36,int(config.get("heading1_size",14)))),
-            "heading2_size":max(8,min(32,int(config.get("heading2_size",14)))),
-            "heading3_size":max(8,min(28,int(config.get("heading3_size",12))))
-        })
-    except (ValueError,TypeError): return jsonify({"error":"Page, chapter, and font-size values must be numbers."}),400
-    # Persist cover metadata so the generation prompt can fill known details and leave blanks for unknown ones.
-    cover_fields = {
-        "institution": "Institution / University", "faculty": "Faculty", "department": "Department",
-        "course_code": "Course Code", "course_title": "Course Title", "student_name": "Student Name",
-        "registration_number": "Registration / Matriculation Number", "lecturer_name": "Lecturer / Supervisor",
-        "academic_session": "Academic Session", "submission_date": "Date of Submission"
+    return {
+        "pages": max(1, round(budget, 1)),
+        "words": max(300, round(budget * 300)),
+        "chapter_index": index + 1,
+        "chapter_count": count,
+        "total_pages": target_pages,
     }
-    for field in cover_fields:
-        config[field] = str(config.get(field) or "").strip()
-    cover_lines = "\n".join(f"- {label}: {config[field] if config[field] else '[Leave a blank line for the student to fill in]'}" for field, label in cover_fields.items())
-    automatic_rules = '''AUTOMATIC TEMPAPER STRUCTURE RULES — ALWAYS APPLY TO THIS PAPER AND EVERY NEXT PULL:
-PAGE-COUNT RULE (IMPORTANT): The requested page count in the prompt builder applies ONLY to the main body, starting at Chapter One and ending at the final chapter. Do NOT count the cover page, certification/approval, declaration, dedication, acknowledgements, abstract, table of contents, lists of tables/figures, references/bibliography, or appendices toward this requested number. Those pages are additional. Across all chapters combined, aim for the requested number of rendered A4 pages. Each chapter prompt will provide its own proportional page and word target; follow that target rather than applying a fixed minimum or an oversized page target to every chapter. As a rough drafting guide, aim for about 280–320 words per body page, adjusted naturally for headings, lists, tables, equations, and topic complexity. Do not claim an exact page count in the prose.
-CHAPTER 1 (opening/introduction/background): use the allocated page target; usually 2–3 numbered subheadings and one simple numbered list for objectives/questions; no nested A/B list unless genuinely required.
-MIDDLE CHAPTERS: allocate depth according to each chapter's supplied target. A literature/conceptual review can receive a larger share than other chapters when the budget allows. Rotate heading and list structures naturally; do not force irrelevant lists or exceed the total requested main-body page budget.
-FINAL CHAPTER: follow its allocated page target; use suitable subheadings such as Summary, Conclusion, and Recommendation/Recommendations when appropriate, with a concise numbered recommendations list where useful. Do not force the final chapter to exceed its allocated share.
-SUBHEADING STYLE AND COMPLETENESS: use bold numbered subheadings (e.g. 2.1, 2.2) exactly as listed in the saved TOC and in the same order. Each explanatory subheading must contain a developed, topic-specific explanation (normally at least 5–7 substantial displayed lines or equivalent detail, but do not pad with repetition). Classify each subsection by what the topic requires: explanation, list, example, comparison, procedure, calculation/solution, or a combination. Do not force long prose into a subsection whose correct answer is a concise calculation or direct result.
-LIST EXPLANATION RULE: when the prose introduces a list as types, factors, causes, reasons, characteristics, elements, functions, advantages/disadvantages, stages, methods, or similar items that require discussion, explain EACH list item after naming it. A label-only list is incomplete when the context requires explanation. Each item should normally include a clear sentence explaining what it means, why it matters, or how it applies, plus an example when useful. Keep list items under the correct parent subheading; never let list items become accidental numbered headings. Not every list needs expanded explanations: contents pages, objectives, short factual answers, and simple enumerations may remain concise when academically appropriate. Finish the current subheading completely before starting the next one.
-Simple lists use plain 1, 2, 3 numbering, not bold. Nested lists use bold A. and B. labels with explanations only where a parent point has distinct types; at most one nested A/B list in any chapter. Do not add lists merely to satisfy a count if they make the discussion unnatural; preserve the closest applicable pattern and academic relevance.
-COVER PAGE: include the topic in a prominent centered bold heading and all available metadata below. For every missing item, print a clear blank line such as ____________________, never invent personal/institution/course details.
-PRELIMINARY PAGES: arrange each page heading centered and bold; body paragraphs justified. Use conventional academic order where appropriate: cover/title page, certification/approval, declaration, dedication, acknowledgements, abstract, table of contents, list of tables/figures/abbreviations if relevant. Cover page has no visible page number; preliminary pages use lower-case Roman numerals; main chapters use Arabic numerals. Keep preliminary headings centered and bold, and body paragraphs justified.
-TABLE OF CONTENTS: include preliminary items, every chapter and its subheadings, conclusion/recommendations, references and appendices when relevant. Do not invent page numbers in generated prose. The app will recalculate TOC page numbers from the current rendered/paginated document after each Pull Next or edit/regeneration; preserve TOC entry wording and update matching page values rather than creating a new TOC code.
-ACADEMIC QUALITY: formal clear language, meaningful transitions, topic-specific discussion, credible sources and consistent citations. Do not fabricate sources, quotations, data, or claims. Each next pull must follow this full rule set plus the saved TOC and current chapter's role.'''
-    prompt_text=(f"Term-paper topic: {title}\nTarget main-body length: {config['pages']} A4 pages from Chapter One through the final chapter; preliminary pages and references are additional.\nRequired chapters: {config['chapters']}.\n"
-        f"Cover-page details (leave a blank line for any missing value):\n{cover_lines}\n"
-        f"Body font: {config['body_font_size']} pt; Heading 1: {config['heading1_size']} pt ({'bold' if config.get('heading1_bold',True) else 'regular'}); "
-        f"Heading 2: {config['heading2_size']} pt ({'bold' if config.get('heading2_bold',True) else 'regular'}); "
-        f"Heading 3: {config['heading3_size']} pt ({'bold' if config.get('heading3_bold',True) else 'regular'}).\n"
-        f"Structure and preliminary pages: {config.get('structure','Standard academic structure')}.\n"
-        f"Additional instructions: {config.get('instructions','Use formal academic writing, credible sources, and consistent citations.')}\n\n"
-        f"{automatic_rules}")
-    conn=None
-    try:
-        conn=get_db(); code=_new_short_code(conn,"paper_prompts","prompt_code")
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO paper_prompts (user_id,prompt_code,title,config_json,prompt_text) VALUES (%s,%s,%s,%s::jsonb,%s)",
-                        (int(uid),code,title,json.dumps(config),prompt_text))
-        conn.commit()
-        return jsonify({"message":"Prompt saved to your account.","prompt_code":code,"title":title,"prompt_text":prompt_text}),201
-    except Exception as e:
-        if conn: conn.rollback()
-        logger.exception("Prompt save failed")
-        return jsonify({"error":"Could not save prompt.","details":str(e)[:200]}),500
-    finally:
-        if conn: release_db(conn)
-
-
-@app.route("/build-toc", methods=["POST"])
-def build_toc():
-    data=request.get_json(silent=True) or {}; uid=str(data.get("user_id","")); code=str(data.get("prompt_code","")).strip().upper()
-    if not uid.isdigit() or not re.fullmatch(r"[A-Z0-9]{5}",code): return jsonify({"error":"Provide a valid account and five-character prompt code."}),400
-    conn=None
-    try:
-        conn=get_db(); row=_owned_prompt(conn,uid,code)
-        if not row: return jsonify({"error":"Prompt code not found in this account."}),404
-        with conn.cursor() as cur:
-            cur.execute("SELECT toc_code,toc_text FROM paper_tocs WHERE user_id=%s AND prompt_code=%s",(int(uid),code)); existing=cur.fetchone()
-        if existing: return jsonify({"message":"Retrieved the saved table of contents.","toc_code":existing[0],"toc":existing[1],"updated":True}),200
-        _,title,config,prompt_text=row
-        prompt=("Create a complete, logically ordered academic term-paper TABLE OF CONTENTS only. Include required preliminary pages, exactly the requested number of chapters, useful numbered chapter subsections, conclusion/recommendations/references/appendices where appropriate. Reflect the automatic varied chapter-pattern rules in the saved prompt. Do not write the paper. Use clean Markdown, one entry per line, and do not invent page numbers.\n\n"
-                f"Saved instructions:\n{prompt_text}\n\nTopic: {title}\nRequested chapters: {config.get('chapters',5)}")
-        toc_text=normalize_server_text(generate_with_groq(prompt))
-        sections=_section_items(toc_text,config); toc_code=_new_short_code(conn,"paper_tocs","toc_code")
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO paper_tocs (user_id,prompt_code,toc_code,toc_text,sections_json) VALUES (%s,%s,%s,%s,%s::jsonb)",
-                        (int(uid),code,toc_code,toc_text,json.dumps(sections)))
-        conn.commit()
-        return jsonify({"message":"Table of contents created and saved.","toc_code":toc_code,"toc":toc_text,"sections":sections,"updated":False}),201
-    except Exception as e:
-        if conn: conn.rollback()
-        logger.exception("TOC creation failed")
-        return jsonify({"error":"Could not create the table of contents.","details":str(e)[:200]}),500
-    finally:
-        if conn: release_db(conn)
-
-
-@app.route("/paper-start", methods=["POST"])
-def paper_start():
-    data=request.get_json(silent=True) or {}; uid=str(data.get("user_id",""))
-    pc=str(data.get("prompt_code","")).strip().upper(); tc=str(data.get("toc_code","")).strip().upper()
-    if not uid.isdigit() or not re.fullmatch(r"[A-Z0-9]{5}",pc) or not re.fullmatch(r"[A-Z0-9]{5}",tc):
-        return jsonify({"error":"Enter both five-character codes and sign in."}),400
-    conn=None
-    try:
-        conn=get_db(); pr=_owned_prompt(conn,uid,pc); toc=_owned_toc(conn,uid,tc)
-        if not pr or not toc or toc[0]!=pc: return jsonify({"error":"These codes do not match a saved prompt and TOC in your account."}),404
-        with conn.cursor() as cur:
-            cur.execute("SELECT id,current_index,merged,merged_content FROM paper_projects WHERE user_id=%s AND prompt_code=%s AND toc_code=%s",(int(uid),pc,tc)); project=cur.fetchone()
-        if project:
-            with conn.cursor() as cur:
-                cur.execute("SELECT order_no,section_title,content_text FROM paper_sections WHERE project_id=%s ORDER BY order_no",(project[0],)); rows=cur.fetchall()
-            return jsonify({"message":"Resumed your saved paper.","project_id":project[0],"current_index":project[1],
-                            "merged":bool(project[2]),"merged_content":project[3] or "",
-                            "sections":[{"order_no":r[0],"title":r[1],"content":r[2]} for r in rows]}),200
-        _,title,config,prompt_text=pr; _,_,toc_text,sections,_=toc
-        research,sources=search_tavily(prompt_text)
-        prompt=("Write ONLY the cover/title page and required preliminary pages. Do NOT generate, include, or preview the Table of Contents. Do NOT write Chapter One or any chapter content. The TOC is a separate stage and will appear only when the user clicks Pull Next after these preliminary pages. Follow every automatic formatting rule in the saved prompt. COVER PAGE: center the full topic in bold; include institution, faculty, department, course title/code, student name, registration number, lecturer/supervisor, academic session, and submission date. For each missing value, leave a visible blank line (____________________); do not invent details. Each preliminary-page heading must be centered and bold; body paragraphs must be justified. Put the cover first with no visible page number; use lower-case Roman numeral pagination for following preliminary pages. Do not include TOC entries or fabricated page numbers.\n\n"
-                f"SAVED PROMPT:\n{prompt_text}\n\nResearch notes:\n{research}\n\nWrite the preliminary material only.")
-        prelim=remove_duplicate_sections(generate_with_groq(prompt))
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO paper_projects (user_id,prompt_code,toc_code,current_index) VALUES (%s,%s,%s,0) RETURNING id",(int(uid),pc,tc)); pid=cur.fetchone()[0]
-            cur.execute("INSERT INTO paper_sections (project_id,order_no,section_key,section_title,content_text,word_count) VALUES (%s,0,'preliminary','Preliminary Pages and Table of Contents',%s,%s)",(pid,prelim,len(prelim.split())))
-        conn.commit()
-        return jsonify({"message":"Preliminary pages created. Chapter One has not been generated yet.","project_id":pid,"current_index":0,
-                        "result":prelim,"toc":toc_text,"toc_code":tc,"sources":sources,"word_count":len(prelim.split()),
-                        "page_count":max(1,(len(prelim.split())+249)//250)}),201
-    except Exception as e:
-        if conn: conn.rollback()
-        logger.exception("Paper start failed")
-        return jsonify({"error":"Could not start the paper.","details":str(e)[:200]}),500
-    finally:
-        if conn: release_db(conn)
-
-
-@app.route("/pull-next", methods=["POST"])
-def pull_next():
-    data=request.get_json(silent=True) or {}; uid=str(data.get("user_id","")); pid=data.get("project_id")
-    action=str(data.get("action","next")).lower()
-    if not uid.isdigit() or not str(pid or "").isdigit(): return jsonify({"error":"Sign in and open a saved paper first."}),400
-    conn=None
-    try:
-        conn=get_db()
-        with conn.cursor() as cur:
-            cur.execute("""SELECT p.id,p.prompt_code,p.toc_code,p.current_index,pr.prompt_text,pr.config_json,t.toc_text,t.sections_json
-                FROM paper_projects p JOIN paper_prompts pr ON pr.prompt_code=p.prompt_code
-                JOIN paper_tocs t ON t.toc_code=p.toc_code WHERE p.id=%s AND p.user_id=%s""",(int(pid),int(uid)))
-            project=cur.fetchone()
-        if not project: return jsonify({"error":"Saved paper not found in your account."}),404
-        _,pc,tc,current_index,prompt_text,config,toc_text,sections=project
-        sections=sections or []
-        if action == "edit_toc":
-            incoming=str(data.get("content",""))
-            edited_toc=content_plain_text(incoming).strip()
-            if not edited_toc:
-                return jsonify({"error":"Table of contents cannot be empty."}),400
-            inline_enabled=bool(data.get("inline_enabled",False))
-            if inline_enabled:
-                refined=generate_with_groq(
-                    "Clean up and refine ONLY this academic table of contents. Preserve all chapter and subsection names, their numbering, and their order. "
-                    "Use one entry per line. Do not write the paper and do not invent page numbers. Return only the corrected TOC.\n\n"+edited_toc
-                )
-                edited_toc=normalize_server_text(refined)
-            with conn.cursor() as cur:
-                cur.execute("UPDATE paper_tocs SET toc_text=%s,sections_json=%s::jsonb,updated_at=CURRENT_TIMESTAMP WHERE user_id=%s AND toc_code=%s",
-                            (edited_toc,json.dumps(_section_items(edited_toc,config)),int(uid),tc))
-            conn.commit()
-            return jsonify({"message":"Table of contents updated.","title":"Table of Contents","result":edited_toc,"inline_applied":inline_enabled,"kind":"toc"}),200
-
-        if action in {"edit", "edit_merged"}:
-            incoming=str(data.get("content",""))
-            if not content_plain_text(incoming).strip():
-                return jsonify({"error":"Edited content cannot be empty."}),400
-
-            if action == "edit_merged":
-                with conn.cursor() as cur:
-                    cur.execute("SELECT merged FROM paper_projects WHERE id=%s AND user_id=%s",(int(pid),int(uid)))
-                    merged_row=cur.fetchone()
-                    if not merged_row or not merged_row[0]:
-                        return jsonify({"error":"This paper has not been merged yet."}),409
-                    saved = sanitize_rich_html(incoming[len(RICH_HTML_MARKER):]) if incoming.startswith(RICH_HTML_MARKER) else incoming.strip()
-                    cur.execute("UPDATE paper_projects SET merged_content=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s AND user_id=%s",(saved,int(pid),int(uid)))
-                conn.commit()
-                return jsonify({"message":"Merged document changes saved directly.","title":"Complete Term Paper","result":saved,"merged":True}),200
-
-            edited_plain=content_plain_text(incoming).strip()
-            order_no=int(data.get("order_no",current_index))
-            with conn.cursor() as cur:
-                cur.execute("SELECT merged FROM paper_projects WHERE id=%s AND user_id=%s",(int(pid),int(uid)))
-                merged_row=cur.fetchone()
-                if not merged_row:
-                    return jsonify({"error":"Paper project not found."}),404
-                merged=bool(merged_row[0])
-            inline_enabled=bool(data.get("inline_enabled",False)) and not merged
-            if inline_enabled:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT section_title FROM paper_sections WHERE project_id=%s AND order_no=%s",(int(pid),order_no))
-                    title_row=cur.fetchone()
-                    cur.execute("SELECT order_no,section_title,content_text FROM paper_sections WHERE project_id=%s AND order_no<>%s ORDER BY order_no",(int(pid),order_no))
-                    neighbors=cur.fetchall()
-                if not title_row:
-                    return jsonify({"error":"Section not found."}),404
-                title=title_row[0]
-                previous=next((content_plain_text(r[2]) for r in reversed(neighbors) if r[0] < order_no), "")
-                following=next((content_plain_text(r[2]) for r in neighbors if r[0] > order_no), "")
-                refine_prompt=(
-                    "Refine ONLY the edited academic section below so its paragraphs, subheadings, transitions, and chapter flow smoothly. "
-                    "Use the surrounding context only to maintain coherence. Preserve the user's intended meaning, facts, key points, heading numbering, "
-                    "and any required equations or citations. Do not invent sources, add unrelated headings, rewrite the entire paper, or mention that you are an AI. "
-                    "Return only the improved section text.\n\n"
-                    f"Saved term-paper instructions:\n{prompt_text}\n\nSaved TOC:\n{toc_text}\n\n"
-                    f"Previous section context:\n{previous[-3500:]}\n\nNext section context:\n{following[:3500]}\n\n"
-                    f"Section title: {title}\n\nUser-edited section to refine:\n{edited_plain}"
-                )
-                saved=remove_duplicate_sections(generate_with_groq(refine_prompt))
-            else:
-                saved = sanitize_rich_html(incoming[len(RICH_HTML_MARKER):]) if incoming.startswith(RICH_HTML_MARKER) else incoming.strip()
-            plain=content_plain_text(saved)
-            with conn.cursor() as cur:
-                cur.execute("UPDATE paper_sections SET content_text=%s,word_count=%s,updated_at=CURRENT_TIMESTAMP WHERE project_id=%s AND order_no=%s RETURNING section_title",(saved,len(plain.split()),int(pid),order_no)); row=cur.fetchone()
-                if not row:return jsonify({"error":"Section not found."}),404
-                cur.execute("UPDATE paper_tocs SET updated_at=CURRENT_TIMESTAMP WHERE toc_code=%s",(tc,))
-                # Keep the merged export synchronized if a project was merged before a direct edit.
-                if merged:
-                    cur.execute("SELECT section_title,content_text FROM paper_sections WHERE project_id=%s ORDER BY order_no",(int(pid),))
-                    all_rows=cur.fetchall()
-                    merged_text="\n\n".join((f"# {r[0]}\n\n{content_plain_text(r[1])}" if r[0] else content_plain_text(r[1])) for r in all_rows)
-                    cur.execute("UPDATE paper_projects SET merged_content=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s",(merged_text,int(pid)))
-            conn.commit()
-            return jsonify({"message":"Section refined with Groq." if inline_enabled else "Section updated and saved directly.",
-                            "title":row[0],"result":saved,"order_no":order_no,"inline_applied":inline_enabled,"merged":merged}),200
-        if action=="resend":
-            order_no=int(data.get("order_no",current_index))
-            with conn.cursor() as cur:
-                cur.execute("SELECT section_title FROM paper_sections WHERE project_id=%s AND order_no=%s",(int(pid),order_no)); row=cur.fetchone()
-            if not row:return jsonify({"error":"There is no saved section to regenerate."}),404
-            title=row[0]; page_budget = _chapter_page_budget(config, title, sections); budget_note = (f"\nTHIS CHAPTER'S SHARE OF THE MAIN-BODY PAGE TARGET: approximately {page_budget['pages']} A4 pages and about {page_budget['words']} words. This is chapter {page_budget['chapter_index']} of {page_budget['chapter_count']}; the complete main body target is {page_budget['total_pages']} pages total. Preliminary pages and references are excluded.\n" if page_budget else ""); prompt=(f"Regenerate ONLY this existing section titled {title}. Do not repeat other chapters or preliminary pages. Apply every automatic Tempaper rule in the saved instructions, including chapter role, topic-weight page-depth target, varied heading/list pattern, and numbering. Preserve the section's position in the saved TOC.{budget_note}\n\n{prompt_text}\n\nTOC:\n{toc_text}\n\nSection: {title}")
-            content=remove_duplicate_sections(generate_with_groq(prompt))
-            with conn.cursor() as cur:
-                cur.execute("UPDATE paper_sections SET content_text=%s,word_count=%s,updated_at=CURRENT_TIMESTAMP WHERE project_id=%s AND order_no=%s",(content,len(content.split()),int(pid),order_no))
-                cur.execute("UPDATE paper_tocs SET updated_at=CURRENT_TIMESTAMP WHERE toc_code=%s",(tc,))
-            conn.commit(); return jsonify({"message":"Section regenerated without adding a duplicate.","title":title,"result":content,"order_no":order_no}),200
-        next_index=int(current_index)+1
-        if next_index>len(sections): return jsonify({"message":"All sections in the saved table of contents have been generated.","done":True}),200
-        item=sections[next_index-1]; title=str(item.get("title") or f"Section {next_index}"); key=str(item.get("key") or f"section-{next_index}")
-        with conn.cursor() as cur:
-            cur.execute("SELECT section_title,content_text FROM paper_sections WHERE project_id=%s AND order_no=%s",(int(pid),next_index)); existing=cur.fetchone()
-        if existing:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE paper_projects SET current_index=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s",(next_index,int(pid)))
-            conn.commit(); return jsonify({"message":"Resumed the next saved section.","title":existing[0],"result":existing[1],"order_no":next_index,"current_index":next_index}),200
-        title_low = title.lower()
-        chapter_titles = [str(x.get("title") or "") for x in sections if re.search(r"chapter\s+(?:[ivxlcdm]+|\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b", str(x.get("title") or ""), re.I)]
-        is_last_chapter = bool(chapter_titles and title.strip().lower() == chapter_titles[-1].strip().lower())
-        if any(term in title_low for term in ("references", "bibliography", "appendix", "appendices")):
-            chapter_role = "supplementary section"
-        elif re.search(r"chapter\s*(1|i|one)\b|introduction|background", title, re.I):
-            chapter_role = "opening chapter"
-        elif is_last_chapter or re.search(r"conclusion|recommendations?$", title, re.I):
-            chapter_role = "closing chapter"
-        else:
-            chapter_role = "middle chapter"
-        page_budget = _chapter_page_budget(config, title, sections)
-        budget_note = (f"THIS CHAPTER'S SHARE OF THE MAIN-BODY PAGE TARGET: approximately {page_budget['pages']} A4 pages and about {page_budget['words']} words. This is chapter {page_budget['chapter_index']} of {page_budget['chapter_count']}; across all chapters, aim for {page_budget['total_pages']} A4 pages total from Chapter One to the final chapter. Cover and preliminary pages, references, and appendices are additional and do not count toward that total. Aim for roughly 280–320 words per rendered body page; use the supplied word target as a guide, not filler.\n" if page_budget else "This is supplementary material and does not count toward the requested main-body page total.\n")
-        prompt=(f"Write ONLY the next section titled exactly: {title}. Do not write any other chapter or repeat content already generated. Apply ALL automatic Tempaper rules in the saved prompt. Current role: {chapter_role}. {budget_note}Use the saved TOC as the authoritative heading checklist: include every relevant subsection for this chapter in the exact order and preserve its wording. Finish each subsection before starting the next. Identify whether each subsection needs explanation, list, example, comparison, calculation/solution, or a combination. When a list is introduced as types, factors, causes, reasons, characteristics, elements, functions, advantages/disadvantages, stages, or methods that need discussion, explain EACH item under that same subsection; do not leave label-only items. Do not force extra prose into direct-answer/calculation sections or simple objective lists. Use numbered bold subheadings, appropriate plain numbered lists and at most one nested A/B list when required by the chapter pattern. Keep the chapter substantive; do not pad with repetition. Use academic tone and credible citations. Do not add a new TOC or fabricate page numbers.\n\n"
-                f"Original saved instructions (mandatory on every pull):\n{prompt_text}\n\nSaved table of contents:\n{toc_text}\n\nSection {next_index} of {len(sections)}. Write this section only.")
-        research,sources=search_tavily(f"{prompt_text}\nSection: {title}")
-        content=remove_duplicate_sections(generate_with_groq(prompt,research))
-        # Only pay for a second model call when local checks identify likely omissions.
-        if re.search(r"chapter\s*(?:[1-9]|i\b|one\b)", title, re.I) or chapter_role in {"opening chapter", "middle chapter", "closing chapter"}:
-            content, quality_issues = _repair_incomplete_chapter(content, title, prompt_text, toc_text, research)
-            if quality_issues:
-                logger.info("Chapter quality repair for %s: %s", title, "; ".join(quality_issues))
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO paper_sections (project_id,order_no,section_key,section_title,content_text,word_count) VALUES (%s,%s,%s,%s,%s,%s)",(int(pid),next_index,key,title,content,len(content.split())))
-            cur.execute("UPDATE paper_projects SET current_index=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s",(next_index,int(pid)))
-            cur.execute("UPDATE paper_tocs SET updated_at=CURRENT_TIMESTAMP WHERE toc_code=%s",(tc,))
-        conn.commit()
-        return jsonify({"message":f"{title} generated.","title":title,"result":content,"order_no":next_index,"current_index":next_index,
-                        "sources":sources,"word_count":len(content.split()),"page_count":max(1,(len(content.split())+249)//250),"toc_code":tc,"toc":toc_text}),201
-    except Exception as e:
-        if conn: conn.rollback()
-        logger.exception("Pull next failed")
-        return jsonify({"error":"Could not generate the next section.","details":str(e)[:200]}),500
-    finally:
-        if conn: release_db(conn)
-
-
-
-@app.route("/merge-paper", methods=["POST"])
-def merge_paper():
-    data=request.get_json(silent=True) or {}
-    uid=str(data.get("user_id","")); pid=data.get("project_id")
-    if not uid.isdigit() or not str(pid or "").isdigit():
-        return jsonify({"error":"Sign in and open a saved paper first."}),400
-    conn=None
-    try:
-        conn=get_db()
-        with conn.cursor() as cur:
-            cur.execute("""SELECT p.current_index,p.merged_content,t.sections_json,t.toc_text
-                           FROM paper_projects p JOIN paper_tocs t ON t.toc_code=p.toc_code
-                           WHERE p.id=%s AND p.user_id=%s""",(int(pid),int(uid)))
-            project=cur.fetchone()
-            if not project:
-                return jsonify({"error":"Saved paper not found in your account."}),404
-            current_index,old_content,sections,toc_text=project
-            sections=sections or []
-            if int(current_index or 0) < len(sections):
-                return jsonify({"error":"Generate every section in the saved TOC before merging the complete paper."}),409
-            cur.execute("SELECT section_title,content_text FROM paper_sections WHERE project_id=%s ORDER BY order_no",(int(pid),))
-            rows=cur.fetchall()
-            if not rows:
-                return jsonify({"error":"There is no generated content to merge."}),400
-            chunks=[]
-            toc_inserted=False
-            for row_index,(title,content) in enumerate(rows):
-                rich=content_rich_html(content)
-                plain=content_plain_text(content)
-                is_preliminary = (title or "").lower() in {"preliminary pages and table of contents","preliminary pages"}
-                if is_preliminary:
-                    chunks.append(rich)
-                    if not toc_inserted and toc_text:
-                        toc_html="<h2>TABLE OF CONTENTS</h2>"+"".join("<p>"+_inline_markdown_html(line.strip())+"</p>" for line in str(toc_text).splitlines() if line.strip())
-                        chunks.append(toc_html)
-                        toc_inserted=True
-                else:
-                    if title and not plain.lower().lstrip().startswith(title.lower().lstrip()):
-                        chunks.append("<h1>"+html_escape(str(title))+"</h1>"+rich)
-                    else:
-                        chunks.append(rich)
-            if not toc_inserted and toc_text:
-                toc_html="<h2>TABLE OF CONTENTS</h2>"+"".join("<p>"+_inline_markdown_html(line.strip())+"</p>" for line in str(toc_text).splitlines() if line.strip())
-                chunks.insert(1 if chunks else 0, toc_html)
-            merged_content=RICH_HTML_MARKER+"".join(x for x in chunks if x.strip())
-            cur.execute("UPDATE paper_projects SET merged=TRUE,merged_content=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s AND user_id=%s",
-                        (merged_content,int(pid),int(uid)))
-        conn.commit()
-        return jsonify({"message":"Paper merged into one document. Inline Edit is now disabled for this merged file.",
-                        "merged":True,"merged_content":merged_content,"title":"Complete Term Paper"}),200
-    except Exception as e:
-        if conn: conn.rollback()
-        logger.exception("Paper merge failed")
-        return jsonify({"error":"Could not merge the paper.","details":str(e)[:200]}),500
-    finally:
-        if conn: release_db(conn)
-
-
-@app.route("/sync-toc-pages", methods=["POST"])
-def sync_toc_pages():
-    data=request.get_json(silent=True) or {}; uid=str(data.get("user_id","")); code=str(data.get("toc_code","")).upper(); page_map=data.get("page_map") or {}
-    if not uid.isdigit() or not re.fullmatch(r"[A-Z0-9]{5}",code): return jsonify({"error":"Valid account and TOC code required."}),400
-    conn=None
-    try:
-        conn=get_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT toc_text FROM paper_tocs WHERE user_id=%s AND toc_code=%s",(int(uid),code))
-            saved=cur.fetchone()
-            if not saved:return jsonify({"error":"TOC code not found in this account."}),404
-            toc_text=saved[0] or ""
-            # Keep the existing TOC code but refresh displayed page numbers from the current layout.
-            refreshed=[]
-            for line in toc_text.splitlines():
-                plain=re.sub(r"[*#`]", "", line).strip()
-                match=None
-                for title, info in page_map.items():
-                    if plain.lower().startswith(str(title).lower()):
-                        match=info
-                        break
-                if match is not None:
-                    page=match.get("page_start","")
-                    line=re.sub(r"\s*(?:\.{2,}|…+)\s*[ivxlcdm\d]+\s*$","",line,flags=re.I)
-                    line=re.sub(r"\s+[ivxlcdm\d]+\s*$","",line,flags=re.I)
-                    line=f"{line.rstrip()}  ........  {page}"
-                refreshed.append(line)
-            new_toc="\n".join(refreshed)
-            cur.execute("UPDATE paper_tocs SET toc_text=%s,page_map_json=%s::jsonb,updated_at=CURRENT_TIMESTAMP WHERE user_id=%s AND toc_code=%s",
-                        (new_toc,json.dumps(page_map),int(uid),code))
-        conn.commit(); return jsonify({"message":"TOC page numbers updated; TOC code unchanged.","toc_code":code,"toc":new_toc}),200
-    finally:
-        if conn:release_db(conn)
-
-
-def generate_otp(prefix):
-    return f"{prefix}{''.join(random.choices(string.digits, k=3))}"
-
-
-def send_email(to_email, subject, html_content):
-    if not RESEND_API_KEY:
-        return False
-    try:
-        r = requests.post(
-            "https://api.resend.com/emails",
-            json={
-                "from": RESEND_FROM_EMAIL,
-                "to": [to_email],
-                "subject": subject,
-                "html": html_content,
-            },
-            headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
-            timeout=15,
-        )
-        return r.status_code in (200, 201)
-    except Exception:
-        return False
-
-
-def search_tavily(query):
-    if not TAVILY_API_KEY:
-        return "", []
-    try:
-        r = requests.post(
-            "https://api.tavily.com/search",
-            json={
-                "api_key": TAVILY_API_KEY,
-                "query": query,
-                "search_depth": "advanced",
-                "max_results": 5,
-            },
-            timeout=10,
-        )
-        if r.status_code == 200:
-            res = r.json().get("results", [])
-            snippets = [i.get("content", "") for i in res if i.get("content")]
-            sources = [i.get("url", "") for i in res if i.get("url")]
-            return "\n\n".join(snippets), sources
-    except Exception as e:
-        logger.warning(f"Tavily fail: {e}")
-    return "", []
-
-
-def generate_with_groq(prompt, context_text=""):
-    if not groq_client:
-        raise RuntimeError("GROQ_API_KEY missing - get free key at console.groq.com")
-    final_prompt = f"{context_text}\n\n{prompt}" if context_text else prompt
-
-    response = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are Tempaper, an expert academic writing assistant. "
-                    "Write a clear, well-structured academic paper based on the user's request. "
-                    "Use a professional academic tone, strong thesis development, coherent structure, "
-                    "and grounded reasoning. Avoid repeating headings, paragraphs, sections, or references. "
-                    "Keep each section unique and concise, with smooth transitions."
-                ),
-            },
-            {"role": "user", "content": final_prompt},
-        ],
-        temperature=0.7,
-        max_tokens=8192,
-        top_p=0.9,
-    )
-    text = response.choices[0].message.content
-    if not text or not text.strip():
-        raise RuntimeError("Empty Groq response")
-    return text.strip()
 
 
 def normalize_server_text(text: str) -> str:
@@ -983,10 +2149,6 @@ def normalize_server_text(text: str) -> str:
 
 
 def remove_duplicate_sections(text: str, similarity_threshold: float = 0.92) -> str:
-    """
-    Remove exact repeated blocks and near-duplicate consecutive blocks.
-    Helps prevent repetitive conclusions, summaries, and references.
-    """
     if not text:
         return text
 
@@ -1000,7 +2162,6 @@ def remove_duplicate_sections(text: str, similarity_threshold: float = 0.92) -> 
         b = block.strip()
         if not b:
             continue
-
         exact_key = re.sub(r"\s+", " ", b).strip().lower()
         if exact_key in seen_exact:
             continue
@@ -1020,72 +2181,149 @@ def remove_duplicate_sections(text: str, similarity_threshold: float = 0.92) -> 
     return out if out else normalized
 
 
+def search_tavily(query):
+    if not TAVILY_API_KEY:
+        return "", []
+    try:
+        response = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": TAVILY_API_KEY,
+                "query": query,
+                "search_depth": "advanced",
+                "max_results": 5,
+            },
+            timeout=10,
+        )
+        if response.status_code == 200:
+            results = response.json().get("results", [])
+            snippets = [item.get("content", "") for item in results if item.get("content")]
+            sources = [item.get("url", "") for item in results if item.get("url")]
+            return "\n\n".join(snippets), sources
+    except Exception as exc:
+        logger.warning("Tavily fail: %s", exc)
+    return "", []
+
+
+def generate_with_groq(prompt, context_text=""):
+    if not groq_client:
+        raise RuntimeError("GROQ_API_KEY missing - get free key at console.groq.com")
+
+    final_prompt = f"{context_text}\n\n{prompt}" if context_text else prompt
+    response = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are Tempaper, an expert academic writing assistant. "
+                    "Write a clear, well-structured academic paper based on the user's request. "
+                    "Use a professional academic tone, strong thesis development, coherent structure, "
+                    "and grounded reasoning. Avoid repeating headings, paragraphs, sections, or references. "
+                    "Keep each section unique and concise, with smooth transitions."
+                ),
+            },
+            {"role": "user", "content": final_prompt},
+        ],
+        temperature=0.7,
+        max_tokens=8192,
+        top_p=0.9,
+    )
+
+    text = response.choices[0].message.content
+    if not text or not text.strip():
+        raise RuntimeError("Empty Groq response")
+    return text.strip()
+
+
 def _chapter_quality_issues(text: str, title: str = "", toc_text: str = ""):
     """Cheap local checks; avoids extra model calls unless a chapter looks incomplete."""
     issues = []
     if not text or len(text.split()) < 120:
         issues.append("The chapter is unusually short and may be incomplete.")
+
     lines = text.splitlines()
-    heading_re = re.compile(r"^\s*(?:#{1,3}\s*)?(?:\*\*)?(\d+\.\d+(?:\.\d+)?)[.)]?\s+(.+?)(?:\*\*)?\s*$")
+    heading_re = re.compile(
+        r"^\s*(?:#{1,3}\s*)?(?:\*\*)?(\d+\.\d+(?:\.\d+)?)[.)]?\s+(.+?)(?:\*\*)?\s*$"
+    )
     found = []
-    for i, line in enumerate(lines):
-        m = heading_re.match(line.strip())
-        if m:
-            found.append((i, m.group(1), m.group(2).strip()))
+    for idx, line in enumerate(lines):
+        match = heading_re.match(line.strip())
+        if match:
+            found.append((idx, match.group(1), match.group(2).strip()))
+
     for pos, (line_index, number, label) in enumerate(found):
         end = found[pos + 1][0] if pos + 1 < len(found) else len(lines)
         body = "\n".join(lines[line_index + 1:end]).strip()
         body_words = len(re.findall(r"\b[\w'-]+\b", body))
-        # A heading with only a label, or a very short body, is a strong omission signal.
         if body_words < 28:
-            issues.append(f"Subheading {number} ({label}) has only {body_words} words beneath it before the next numbered subheading.")
-    # Compare the generated chapter against the subsection entries already specified in the saved TOC.
+            issues.append(
+                f"Subheading {number} ({label}) has only {body_words} words beneath it."
+            )
+
     chapter_number = None
-    cm = re.search(r"chapter\s+(\d+|i{1,3}|iv|v|vi{0,3}|ix|x|one|two|three|four|five|six|seven|eight|nine|ten)\b", title, re.I)
-    if cm:
-        token = cm.group(1).lower()
-        word_nums = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
-        roman_nums = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8, "ix": 9, "x": 10}
+    match = re.search(
+        r"chapter\s+(\d+|i{1,3}|iv|v|vi{0,3}|ix|x|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+        title,
+        re.I,
+    )
+    if match:
+        token = match.group(1).lower()
+        word_nums = {
+            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+            "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        }
+        roman_nums = {
+            "i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6,
+            "vii": 7, "viii": 8, "ix": 9, "x": 10,
+        }
         chapter_number = int(token) if token.isdigit() else word_nums.get(token, roman_nums.get(token))
+
     if chapter_number and toc_text:
         expected = []
         for toc_line in toc_text.splitlines():
-            tm = re.match(r"^\s*(?:[-*]\s*)?(\d+)\.(\d+)(?:\s+|[.)])(.+?)\s*$", re.sub(r"[*#`]", "", toc_line))
+            tm = re.match(
+                r"^\s*(?:[-*]\s*)?(\d+)\.(\d+)(?:\s+|[.)])(.+?)\s*$",
+                re.sub(r"[*#`]", "", toc_line),
+            )
             if tm and int(tm.group(1)) == chapter_number:
                 expected.append((f"{tm.group(1)}.{tm.group(2)}", tm.group(3).strip()))
         actual_numbers = {number for _, number, _ in found}
         missing = [f"{number} {label}" for number, label in expected if number not in actual_numbers]
         if missing:
             issues.append("Required TOC subheading(s) missing from this chapter: " + "; ".join(missing) + ".")
-    # Flag label-only list items only when the surrounding text explicitly announces
-    # a list of items that should be discussed (not objectives or simple enumerations).
-    for i, line in enumerate(lines):
-        if re.search(r"\b(the following|include the following|following are|major (?:types|factors|causes|reasons|characteristics|elements|functions|advantages|disadvantages)|types of|factors affecting|causes of|reasons for|characteristics of)\b", line, re.I):
-            window = "\n".join(lines[i:min(len(lines), i + 14)])
+
+    for idx, line in enumerate(lines):
+        if re.search(
+            r"\b(the following|include the following|following are|major (?:types|factors|causes|reasons|characteristics|elements|functions|advantages|disadvantages)|types of|factors affecting|causes of|reasons for|characteristics of)\b",
+            line,
+            re.I,
+        ):
+            window = "\n".join(lines[idx:min(len(lines), idx + 14)])
             items = re.findall(r"^\s*(?:\d+[.)]|[-*+])\s+(.+)$", window, re.M)
             if len(items) >= 2 and sum(len(re.findall(r"\b[\w'-]+\b", item)) < 10 for item in items) >= 2:
-                issues.append("A list introduced as requiring discussion contains multiple label-only/very short items; explain each item where the context requires it.")
+                issues.append("A list introduced as requiring discussion contains multiple label-only items; explain each item.")
                 break
+
     return issues
 
 
 def _repair_incomplete_chapter(content: str, title: str, prompt_text: str, toc_text: str, research: str = ""):
-    """Run a targeted repair only if deterministic checks find likely omissions."""
     issues = _chapter_quality_issues(content, title, toc_text)
     if not issues:
         return content, []
+
     repair_prompt = (
-        f"Review and repair ONLY the existing chapter titled: {title}. Return the complete corrected chapter, not a report. "
-        "Preserve correct material and the original heading names/order. Do not rewrite the whole paper or add unrelated sections. "
-        "Check every numbered subheading has the content its topic requires. Explanatory subsections need a meaningful developed explanation; "
-        "a calculation/solution section may show the method and answer without artificial padding. Where a list is introduced as types, factors, causes, "
-        "reasons, characteristics, elements, functions, advantages/disadvantages, stages or methods requiring discussion, explain each item under its parent heading. "
-        "Do not explain simple objective lists or short enumerations unnecessarily. Keep lists, examples, equations and their explanations under the correct subheading. "
-        "Do not invent sources or citations.\n\nDetected issues:\n- " + "\n- ".join(issues) +
-        f"\n\nSaved requirements:\n{prompt_text}\n\nSaved TOC:\n{toc_text}\n\nResearch notes (use only when relevant):\n{research}\n\nExisting chapter to repair:\n{content}"
+        f"Review and repair ONLY the existing chapter titled: {title}. Return the complete corrected chapter, "
+        "not a report. Preserve correct material and the original heading names/order. Do not rewrite the whole paper "
+        "or add unrelated sections. Check every numbered subheading has the content its topic requires. "
+        "Explanatory subsections need a meaningful developed explanation; a calculation/solution section may show the method and answer without artificial padding. "
+        "Where a list is introduced as types, factors, causes, reasons, characteristics, elements, functions, advantages/disadvantages, stages or methods requiring discussion, explain each item under its parent heading. "
+        "Do not invent sources or citations.\n\nDetected issues:\n- "
+        + "\n- ".join(issues)
+        + f"\n\nSaved requirements:\n{prompt_text}\n\nSaved TOC:\n{toc_text}\n\nResearch notes (use only when relevant):\n{research}\n\nExisting chapter to repair:\n{content}"
     )
     repaired = remove_duplicate_sections(generate_with_groq(repair_prompt))
-    # Do not replace the original with a much shorter failed repair.
     if len(repaired.split()) < max(100, int(len(content.split()) * 0.65)):
         return content, issues + ["Repair response was too short; original chapter retained."]
     return repaired, issues
@@ -1110,17 +2348,25 @@ def register():
     try:
         conn = get_db()
         otp = generate_otp("ver")
-        exp = datetime.utcnow() + timedelta(minutes=15)
+        expiry = datetime.utcnow() + timedelta(minutes=15)
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO users (username,email,password_hash,is_verified,otp_code,otp_expires_at) VALUES (%s,%s,%s,FALSE,%s,%s) RETURNING id",
-                (username, email, generate_password_hash(password), otp, exp),
+                """INSERT INTO users
+                   (username, email, password_hash, is_verified, otp_code, otp_expires_at)
+                   VALUES (%s,%s,%s,FALSE,%s,%s) RETURNING id""",
+                (username, email, generate_password_hash(password), otp, expiry),
             )
-            uid = cur.fetchone()[0]
+            user_id = cur.fetchone()[0]
             conn.commit()
-        if not send_email(email, "Verify Your Tempaper Account", f"<p>Your code: <strong>{otp}</strong></p>"):
+
+        if not send_email(
+            email,
+            "Verify Your Tempaper Account",
+            f"<p>Your code: <strong>{otp}</strong></p>",
+        ):
             return jsonify({"error": "Email could not be sent"}), 502
-        return jsonify({"message": "Registered", "user_id": uid}), 201
+
+        return jsonify({"message": "Registered", "user_id": user_id}), 201
     except psycopg2.IntegrityError:
         if conn:
             conn.rollback()
@@ -1134,8 +2380,8 @@ def register():
 def login():
     data = request.get_json(silent=True) or {}
     ident = str(data.get("identifier", "")).strip().lower()
-    pwd = data.get("password", "")
-    if not ident or not pwd:
+    password = data.get("password", "")
+    if not ident or not password:
         return jsonify({"error": "Missing fields"}), 400
 
     conn = None
@@ -1143,28 +2389,27 @@ def login():
         conn = get_db()
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id,username,email,password_hash,is_verified FROM users WHERE LOWER(email)=%s OR LOWER(username)=%s",
+                """SELECT id, username, email, password_hash, is_verified
+                   FROM users
+                   WHERE LOWER(email)=%s OR LOWER(username)=%s""",
                 (ident, ident),
             )
-            r = cur.fetchone()
+            row = cur.fetchone()
 
-        if not r or not check_password_hash(r[3], pwd):
+        if not row or not check_password_hash(row[3], password):
             return jsonify({"error": "Invalid credentials"}), 401
-        if not r[4]:
+        if not row[4]:
             return jsonify({"error": "Verify email first"}), 403
 
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE users SET last_login=%s WHERE id=%s",
-                (datetime.utcnow(), r[0]),
-            )
+            cur.execute("UPDATE users SET last_login=%s WHERE id=%s", (datetime.utcnow(), row[0]))
             conn.commit()
 
         return jsonify(
             {
                 "message": "Login ok",
-                "user_id": r[0],
-                "user": {"id": r[0], "username": r[1], "email": r[2]},
+                "user_id": row[0],
+                "user": {"id": row[0], "username": row[1], "email": row[2]},
             }
         ), 200
     finally:
@@ -1177,11 +2422,15 @@ def verify_email():
     data = request.get_json(silent=True) or {}
     email = str(data.get("email", "")).strip().lower()
     code = str(data.get("code", "")).strip()
+
     conn = None
     try:
         conn = get_db()
         with conn.cursor() as cur:
-            cur.execute("SELECT id,otp_code,otp_expires_at FROM users WHERE LOWER(email)=%s", (email,))
+            cur.execute(
+                "SELECT id, otp_code, otp_expires_at FROM users WHERE LOWER(email)=%s",
+                (email,),
+            )
             row = cur.fetchone()
             if not row:
                 return jsonify({"error": "User not found"}), 404
@@ -1189,8 +2438,13 @@ def verify_email():
                 return jsonify({"error": "Invalid code"}), 400
             if row[2] and datetime.utcnow() > row[2]:
                 return jsonify({"error": "Code expired"}), 400
-            cur.execute("UPDATE users SET is_verified=TRUE,otp_code=NULL,otp_expires_at=NULL WHERE id=%s", (row[0],))
+
+            cur.execute(
+                "UPDATE users SET is_verified=TRUE, otp_code=NULL, otp_expires_at=NULL WHERE id=%s",
+                (row[0],),
+            )
             conn.commit()
+
         return jsonify({"message": "Verified"}), 200
     finally:
         if conn:
@@ -1201,20 +2455,22 @@ def verify_email():
 def resend():
     data = request.get_json(silent=True) or {}
     email = str(data.get("email", "")).strip().lower()
+
     conn = None
     try:
         conn = get_db()
         otp = generate_otp("ver")
-        exp = datetime.utcnow() + timedelta(minutes=15)
+        expiry = datetime.utcnow() + timedelta(minutes=15)
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE users SET otp_code=%s,otp_expires_at=%s WHERE LOWER(email)=%s RETURNING is_verified",
-                (otp, exp, email),
+                "UPDATE users SET otp_code=%s, otp_expires_at=%s WHERE LOWER(email)=%s RETURNING is_verified",
+                (otp, expiry, email),
             )
             row = cur.fetchone()
             if not row:
                 return jsonify({"error": "Email not found"}), 404
             conn.commit()
+
         send_email(email, "Verification Code", f"<p>Code: <strong>{otp}</strong></p>")
         return jsonify({"message": "Code resent"}), 200
     finally:
@@ -1226,19 +2482,21 @@ def resend():
 def req_reset():
     data = request.get_json(silent=True) or {}
     email = str(data.get("email", "")).strip().lower()
+
     conn = None
     try:
         conn = get_db()
         otp = generate_otp("pass")
-        exp = datetime.utcnow() + timedelta(minutes=15)
+        expiry = datetime.utcnow() + timedelta(minutes=15)
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE users SET otp_code=%s,otp_expires_at=%s WHERE LOWER(email)=%s RETURNING id",
-                (otp, exp, email),
+                "UPDATE users SET otp_code=%s, otp_expires_at=%s WHERE LOWER(email)=%s RETURNING id",
+                (otp, expiry, email),
             )
             if not cur.fetchone():
                 return jsonify({"message": "If email exists, code sent"}), 200
             conn.commit()
+
         send_email(email, "Reset Code", f"<h1>{otp}</h1>")
         return jsonify({"message": "Code sent"}), 200
     finally:
@@ -1251,22 +2509,28 @@ def reset_pwd():
     data = request.get_json(silent=True) or {}
     email = str(data.get("email", "")).strip().lower()
     code = str(data.get("code", "")).strip()
-    np = data.get("new_password", "")
+    new_password = data.get("new_password", "")
+
     conn = None
     try:
         conn = get_db()
         with conn.cursor() as cur:
-            cur.execute("SELECT otp_code,otp_expires_at FROM users WHERE LOWER(email)=%s", (email,))
-            r = cur.fetchone()
-            if not r or r[0] != code:
-                return jsonify({"error": "Invalid code"}), 400
-            if r[1] and datetime.utcnow() > r[1]:
-                return jsonify({"error": "Expired"}), 400
             cur.execute(
-                "UPDATE users SET password_hash=%s,otp_code=NULL WHERE LOWER(email)=%s",
-                (generate_password_hash(np), email),
+                "SELECT otp_code, otp_expires_at FROM users WHERE LOWER(email)=%s",
+                (email,),
+            )
+            row = cur.fetchone()
+            if not row or row[0] != code:
+                return jsonify({"error": "Invalid code"}), 400
+            if row[1] and datetime.utcnow() > row[1]:
+                return jsonify({"error": "Expired"}), 400
+
+            cur.execute(
+                "UPDATE users SET password_hash=%s, otp_code=NULL WHERE LOWER(email)=%s",
+                (generate_password_hash(new_password), email),
             )
             conn.commit()
+
         return jsonify({"message": "Password updated"}), 200
     finally:
         if conn:
@@ -1276,25 +2540,37 @@ def reset_pwd():
 @app.route("/me", methods=["GET"])
 @cache.cached(timeout=300, query_string=True)
 def get_me():
-    uid = request.args.get("user_id")
-    if not uid or not str(uid).isdigit():
+    user_id = request.args.get("user_id")
+    if not user_id or not str(user_id).isdigit():
         return jsonify({"user": {"id": 0, "username": "Guest", "email": "guest@tempaper.com"}}), 200
 
     conn = None
     try:
         conn = get_db()
         with conn.cursor() as cur:
-            cur.execute("SELECT id,username,email,is_verified FROM users WHERE id=%s", (int(uid),))
-            r = cur.fetchone()
-            if not r:
+            cur.execute(
+                "SELECT id, username, email, is_verified FROM users WHERE id=%s",
+                (int(user_id),),
+            )
+            row = cur.fetchone()
+            if not row:
                 return jsonify({"error": "Not found"}), 404
-        return jsonify({"user": {"id": r[0], "username": r[1], "email": r[2], "is_verified": r[3]}}), 200
+
+        return jsonify(
+            {
+                "user": {
+                    "id": row[0],
+                    "username": row[1],
+                    "email": row[2],
+                    "is_verified": row[3],
+                }
+            }
+        ), 200
     finally:
         if conn:
             release_db(conn)
 
 
-# --- ORIGINAL generate route (TERM PAPER generation) - UNTOUCHED LOGIC ---
 @app.route("/generate", methods=["POST"])
 def generate_paper():
     data = request.get_json(silent=True) or {}
@@ -1310,7 +2586,6 @@ def generate_paper():
     try:
         tavily_context, sources = search_tavily(prompt)
         final_content = f"Topic: {prompt}\n\nReference Material:\n{tavily_context}" if tavily_context else prompt
-
         result_text = generate_with_groq(prompt, final_content)
         result_text = remove_duplicate_sections(result_text)
 
@@ -1321,33 +2596,34 @@ def generate_paper():
             conn = None
             try:
                 conn = get_db()
-                sid = "".join(random.choices(string.ascii_letters + string.digits, k=32))
+                session_id = "".join(random.choices(string.ascii_letters + string.digits, k=32))
                 with conn.cursor() as cur:
                     cur.execute(
-                        "INSERT INTO paper_sessions (user_id,session_id,title,prompt_text,result_text,word_count,page_count) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                        (int(user_id), sid, prompt[:200], prompt, result_text, word_count, page_count),
+                        """INSERT INTO paper_sessions
+                           (user_id, session_id, title, prompt_text, result_text, word_count, page_count)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                        (int(user_id), session_id, prompt[:200], prompt, result_text, word_count, page_count),
                     )
                     conn.commit()
-            except Exception as e:
-                logger.warning(f"Save fail: {e}")
+            except Exception as exc:
+                logger.warning("Save fail: %s", exc)
             finally:
                 if conn:
                     release_db(conn)
 
         return jsonify({"result": result_text, "sources": sources, "word_count": word_count, "page_count": page_count}), 200
-    except Exception as e:
-        logger.exception(f"Generate fail: {e}")
-        msg = str(e)
+    except Exception as exc:
+        logger.exception("Generate fail: %s", exc)
+        msg = str(exc)
         if "429" in msg:
             return jsonify({"error": "Groq rate limit, wait 10s"}), 429
         return jsonify({"error": "Generation failed", "details": msg[:300]}), 500
 
 
-# --- Keep papers listing as before ---
 @app.route("/papers", methods=["GET"])
 def get_papers():
-    uid = request.args.get("user_id")
-    if not uid or not str(uid).isdigit():
+    user_id = request.args.get("user_id")
+    if not user_id or not str(user_id).isdigit():
         return jsonify({"papers": []}), 200
 
     conn = None
@@ -1355,21 +2631,25 @@ def get_papers():
         conn = get_db()
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id,session_id,title,prompt_text,word_count,page_count,created_at FROM paper_sessions WHERE user_id=%s ORDER BY created_at DESC LIMIT 50",
-                (int(uid),),
+                """SELECT id, session_id, title, prompt_text, word_count, page_count, created_at
+                   FROM paper_sessions
+                   WHERE user_id=%s
+                   ORDER BY created_at DESC LIMIT 50""",
+                (int(user_id),),
             )
             rows = cur.fetchall()
+
         papers = [
             {
-                "id": r[0],
-                "session_id": r[1],
-                "title": r[2],
-                "prompt": r[3],
-                "word_count": r[4],
-                "page_count": r[5],
-                "created_at": r[6].isoformat() if r[6] else None,
+                "id": row[0],
+                "session_id": row[1],
+                "title": row[2],
+                "prompt": row[3],
+                "word_count": row[4],
+                "page_count": row[5],
+                "created_at": row[6].isoformat() if row[6] else None,
             }
-            for r in rows
+            for row in rows
         ]
         return jsonify({"papers": papers}), 200
     finally:
@@ -1379,8 +2659,8 @@ def get_papers():
 
 @app.route("/settings", methods=["GET", "POST"])
 def settings():
-    uid = request.args.get("user_id") or (request.get_json(silent=True) or {}).get("user_id")
-    if not uid or not str(uid).isdigit():
+    user_id = request.args.get("user_id") or (request.get_json(silent=True) or {}).get("user_id")
+    if not user_id or not str(user_id).isdigit():
         return jsonify({"error": "Valid user_id required"}), 400
 
     if request.method == "GET":
@@ -1388,11 +2668,27 @@ def settings():
         try:
             conn = get_db()
             with conn.cursor() as cur:
-                cur.execute("SELECT theme,font_size,notifications,auto_save FROM user_settings WHERE user_id=%s", (int(uid),))
-                r = cur.fetchone()
-            if not r:
-                return jsonify({"settings": {"theme": "system", "font_size": 16, "notifications": True, "auto_save": True}}), 200
-            return jsonify({"settings": {"theme": r[0], "font_size": r[1], "notifications": r[2], "auto_save": r[3]}}), 200
+                cur.execute(
+                    "SELECT theme, font_size, notifications, auto_save FROM user_settings WHERE user_id=%s",
+                    (int(user_id),),
+                )
+                row = cur.fetchone()
+
+            if not row:
+                return jsonify({
+                    "settings": {"theme": "system", "font_size": 16, "notifications": True, "auto_save": True}
+                }), 200
+
+            return jsonify(
+                {
+                    "settings": {
+                        "theme": row[0],
+                        "font_size": row[1],
+                        "notifications": row[2],
+                        "auto_save": row[3],
+                    }
+                }
+            ), 200
         finally:
             if conn:
                 release_db(conn)
@@ -1403,9 +2699,16 @@ def settings():
         conn = get_db()
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO user_settings (user_id,theme,font_size,notifications,auto_save) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (user_id) DO UPDATE SET theme=EXCLUDED.theme,font_size=EXCLUDED.font_size,notifications=EXCLUDED.notifications,auto_save=EXCLUDED.auto_save",
+                """INSERT INTO user_settings
+                   (user_id, theme, font_size, notifications, auto_save)
+                   VALUES (%s,%s,%s,%s,%s)
+                   ON CONFLICT (user_id) DO UPDATE
+                   SET theme=EXCLUDED.theme,
+                       font_size=EXCLUDED.font_size,
+                       notifications=EXCLUDED.notifications,
+                       auto_save=EXCLUDED.auto_save""",
                 (
-                    int(uid),
+                    int(user_id),
                     data.get("theme", "system"),
                     data.get("font_size", 16),
                     data.get("notifications", True),
@@ -1419,7 +2722,6 @@ def settings():
             release_db(conn)
 
 
-# --- General AI assistant endpoint (does NOT replace /generate) ---
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json(silent=True) or {}
@@ -1438,13 +2740,15 @@ def chat():
     try:
         tavily_context, sources = search_tavily(prompt)
         final_content = f"{tavily_context}\n\n{prompt}" if tavily_context else prompt
-
-        system_msg = system_prompt if system_prompt else "You are a helpful, concise assistant. Answer user questions clearly and honestly. If you don't know, say you don't know."
+        system_message = system_prompt if system_prompt else (
+            "You are a helpful, concise assistant. Answer user questions clearly and honestly. "
+            "If you don't know, say you don't know."
+        )
 
         response = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
-                {"role": "system", "content": system_msg},
+                {"role": "system", "content": system_message},
                 {"role": "user", "content": final_content},
             ],
             temperature=temperature,
@@ -1472,26 +2776,53 @@ def chat():
             conn = None
             try:
                 conn = get_db()
-                sid = "".join(random.choices(string.ascii_letters + string.digits, k=32))
+                session_id = "".join(random.choices(string.ascii_letters + string.digits, k=32))
                 with conn.cursor() as cur:
                     cur.execute(
-                        "INSERT INTO chat_sessions (user_id,session_id,title,prompt_text,result_text,word_count) VALUES (%s,%s,%s,%s,%s,%s)",
-                        (int(user_id), sid, prompt[:200], prompt, cleaned_result, word_count),
+                        """INSERT INTO chat_sessions
+                           (user_id, session_id, title, prompt_text, result_text, word_count)
+                           VALUES (%s,%s,%s,%s,%s,%s)""",
+                        (int(user_id), session_id, prompt[:200], prompt, cleaned_result, word_count),
                     )
                     conn.commit()
-            except Exception as e:
-                logger.warning(f"Chat save fail: {e}")
+            except Exception as exc:
+                logger.warning("Chat save fail: %s", exc)
             finally:
                 if conn:
                     release_db(conn)
 
         return jsonify({"result": cleaned_result, "sources": sources, "word_count": word_count}), 200
-    except Exception as e:
-        logger.exception(f"Chat fail: {e}")
-        msg = str(e)
+    except Exception as exc:
+        logger.exception("Chat fail: %s", exc)
+        msg = str(exc)
         if "429" in msg:
             return jsonify({"error": "Groq rate limit, wait"}), 429
         return jsonify({"error": "Chat generation failed", "details": msg[:300]}), 500
+
+
+def generate_otp(prefix):
+    return f"{prefix}{''.join(random.choices(string.digits, k=3))}"
+
+
+def send_email(to_email, subject, html_content):
+    if not RESEND_API_KEY:
+        return False
+
+    try:
+        response = requests.post(
+            "https://api.resend.com/emails",
+            json={
+                "from": RESEND_FROM_EMAIL,
+                "to": [to_email],
+                "subject": subject,
+                "html": html_content,
+            },
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+            timeout=15,
+        )
+        return response.status_code in (200, 201)
+    except Exception:
+        return False
 
 
 if __name__ == "__main__":
