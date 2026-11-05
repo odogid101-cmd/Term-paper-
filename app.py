@@ -72,6 +72,7 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
+IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY")
 
 groq_client = None
 if GROQ_API_KEY:
@@ -221,17 +222,9 @@ def init_workflow_db():
                 content_text TEXT NOT NULL, word_count INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(project_id,order_no))""")
-            # Backward-compatible migrations: retain the structured source of truth
-            # alongside the legacy merged_content field used by older dashboards.
+            # Backward-compatible migrations for merge and final-document editing.
             cur.execute("ALTER TABLE paper_projects ADD COLUMN IF NOT EXISTS merged BOOLEAN NOT NULL DEFAULT FALSE")
             cur.execute("ALTER TABLE paper_projects ADD COLUMN IF NOT EXISTS merged_content TEXT")
-            cur.execute("ALTER TABLE paper_projects ADD COLUMN IF NOT EXISTS document_json JSONB NOT NULL DEFAULT '{}'::jsonb")
-            cur.execute("ALTER TABLE paper_projects ADD COLUMN IF NOT EXISTS document_version INTEGER NOT NULL DEFAULT 1")
-            cur.execute("ALTER TABLE paper_projects ADD COLUMN IF NOT EXISTS merged_version INTEGER NOT NULL DEFAULT 0")
-            cur.execute("ALTER TABLE paper_sections ADD COLUMN IF NOT EXISTS section_type VARCHAR(40) NOT NULL DEFAULT 'body'")
-            cur.execute("ALTER TABLE paper_sections ADD COLUMN IF NOT EXISTS formatting_json JSONB NOT NULL DEFAULT '{}'::jsonb")
-            cur.execute("ALTER TABLE paper_sections ADD COLUMN IF NOT EXISTS page_break_before BOOLEAN NOT NULL DEFAULT TRUE")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_paper_sections_project_order ON paper_sections(project_id, order_no)")
         conn.commit()
     except Exception:
         if conn: conn.rollback()
@@ -246,10 +239,15 @@ init_workflow_db()
 RICH_HTML_MARKER = "[[TEMPAPER_RICH_HTML]]"
 _ALLOWED_RICH_TAGS = {
     "p", "div", "span", "h1", "h2", "h3", "h4", "strong", "b", "em", "i",
-    "u", "s", "del", "ul", "ol", "li", "blockquote", "br", "sub", "sup", "font"
+    "u", "s", "del", "ul", "ol", "li", "blockquote", "br", "sub", "sup", "font",
+    "img", "figure", "figcaption"
 }
-_VOID_RICH_TAGS = {"br"}
-_ALLOWED_STYLE_PROPS = {"font-family", "font-size", "color", "background-color", "text-align", "margin-left", "text-indent"}
+_VOID_RICH_TAGS = {"br", "img"}
+_ALLOWED_STYLE_PROPS = {
+    "font-family", "font-size", "color", "background-color", "text-align",
+    "margin-left", "margin-right", "text-indent", "width", "max-width",
+    "height", "max-height", "object-fit", "display"
+}
 
 class _RichHTMLSanitizer(HTMLParser):
     """Small allow-list sanitizer for editor HTML saved by Tempaper."""
@@ -276,6 +274,23 @@ class _RichHTMLSanitizer(HTMLParser):
                 elif key == "size" and re.fullmatch(r"[1-7]", value):
                     legacy_style.append("font-size: " + str(8 + int(value) * 2) + "pt")
                 continue
+            # Allow safe attributes for images and figures
+            if tag == "img" and key in {"src", "alt", "class", "loading"}:
+                if key == "src" and re.match(r"^https?://[A-Za-z0-9._~:/?#\[\]@!$&\'()*+,;=%-]+$", value):
+                    safe_attrs.append((key, value))
+                elif key == "alt" and re.fullmatch(r"[A-Za-z0-9 .,_\\-()/:;]{0,200}", value):
+                    safe_attrs.append((key, value))
+                elif key == "class" and re.fullmatch(r"[A-Za-z0-9 _\\-]{1,80}", value):
+                    safe_attrs.append((key, value))
+                elif key == "loading" and value in {"lazy", "eager"}:
+                    safe_attrs.append((key, value))
+                continue
+            if tag in {"div", "figure", "span", "figcaption"} and key in {"class", "data-fig-label", "data-fig-url"}:
+                if key == "class" and re.fullmatch(r"[A-Za-z0-9 _\\-]{1,80}", value):
+                    safe_attrs.append((key, value))
+                elif key.startswith("data-") and re.fullmatch(r"[A-Za-z0-9 ._\\-:/?#%]{1,500}", value):
+                    safe_attrs.append((key, value))
+                continue
             if key != "style":
                 continue
             styles = []
@@ -286,7 +301,7 @@ class _RichHTMLSanitizer(HTMLParser):
                 prop, val = prop.strip().lower(), val.strip()
                 if prop not in _ALLOWED_STYLE_PROPS:
                     continue
-                if not re.fullmatch(r"[A-Za-z0-9#(),.%\s'\"_-]{1,100}", val):
+                if not re.fullmatch(r"[A-Za-z0-9#(),.%\s'\\\"_-]{1,100}", val):
                     continue
                 styles.append(f"{prop}: {val}")
             if styles:
@@ -330,8 +345,14 @@ class _PlainTextExtractor(HTMLParser):
     def handle_data(self, data):
         self.parts.append(data)
     def handle_starttag(self, tag, attrs):
-        if tag in {"p", "div", "h1", "h2", "h3", "h4", "li", "br", "blockquote"}:
+        if tag in {"p", "div", "h1", "h2", "h3", "h4", "li", "br", "blockquote", "figure", "figcaption"}:
             self.parts.append("\n")
+        if tag == "img":
+            # Prefer alt text so word counts stay meaningful
+            for k, v in attrs:
+                if k.lower() == "alt" and v:
+                    self.parts.append(v + " ")
+                    break
     def get_text(self):
         return re.sub(r"[ \t]+\n", "\n", re.sub(r"\n{3,}", "\n\n", "".join(self.parts))).strip()
 
@@ -507,206 +528,6 @@ def _section_items(toc_text, config):
     return [{"key": re.sub(r"[^a-z0-9]+", "-", h.lower()).strip("-")[:90], "title": h} for h in final]
 
 
-_PRELIMINARY_NAMES = (
-    "certification", "declaration", "dedication", "acknowledgement", "acknowledgment",
-    "abstract", "list of tables", "list of figures", "list of abbreviations", "table of contents",
-)
-
-
-def _classify_paper_section(title, content="", order_no=0):
-    """Return stable semantic type and page-break policy for a saved paper section."""
-    label = re.sub(r"\s+", " ", str(title or "")).strip().lower()
-    plain = content_plain_text(content)
-    if order_no == 0 or "preliminary" in label or "cover page" in label:
-        return "preliminary", True
-    if "table of contents" in label or label in {"toc", "contents"}:
-        return "toc", True
-    if re.search(r"\bchapter\s+(?:[ivxlcdm]+|\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b", label, re.I):
-        return "chapter", True
-    if re.search(r"\bconclusion\b", label):
-        return "conclusion", True
-    if re.search(r"\b(references|bibliography|works cited)\b", label):
-        return "references", True
-    if re.search(r"\bappend(?:ix|ices)\b", label):
-        return "appendix", True
-    if any(name in label for name in _PRELIMINARY_NAMES):
-        return "preliminary", True
-    # Catch a section whose title is generic but its first heading is meaningful.
-    first = next((x.strip().lower() for x in plain.splitlines() if x.strip()), "")
-    if any(first.startswith(name) for name in _PRELIMINARY_NAMES):
-        return "preliminary", True
-    return "body", True
-
-
-def _toc_entry_html(toc_text):
-    """Render TOC source as semantic entry rows; no fabricated page numbers."""
-    rows = []
-    for raw in str(toc_text or "").splitlines():
-        line = re.sub(r"[*#`]", "", raw).strip()
-        if not line or line.lower() in {"table of contents", "contents"}:
-            continue
-        line = re.sub(r"\s+\.{2,}\s*[ivxlcdm\d]+\s*$", "", line, flags=re.I).strip()
-        # Preserve page values only when the saved TOC already contains one.
-        match = re.match(r"^(.*?)(?:\s*\.{2,}\s*|\s{2,})([ivxlcdm]+|\d+)\s*$", line, re.I)
-        label, page = (match.group(1).strip(), match.group(2).strip()) if match else (line, "")
-        if not label:
-            continue
-        level = 1 if re.match(r"^(?:\d+\.\d+|\d+\.\d+\.\d+)", label) else 0
-        rows.append((label, page, level))
-    body = []
-    for label, page, level in rows:
-        safe_label = html_escape(label)
-        safe_page = html_escape(page)
-        indent = "28px" if level else "0"
-        body.append(
-            '<div class="tp-toc-row" style="display:flex;align-items:baseline;gap:8px;'
-            f'margin-left:{indent};margin-bottom:7px">'
-            f'<span class="tp-toc-label">{safe_label}</span>'
-            '<span aria-hidden="true" style="flex:1;border-bottom:1px dotted #777;min-width:12px"></span>'
-            f'<span class="tp-toc-page">{safe_page}</span></div>'
-        )
-    return '<h1 style="text-align:center;font-weight:800">TABLE OF CONTENTS</h1>' + "".join(body)
-
-
-def _split_preliminary_pages(rich_html):
-    """Expose preliminary page boundaries as virtual page records without changing source text."""
-    parts = re.split(r'(?=<h[1-3](?:\s|>))', str(rich_html or ''), flags=re.I)
-    pages = []
-    for part in parts:
-        if not part.strip():
-            continue
-        heading_match = re.match(r'<h[1-3][^>]*>(.*?)</h[1-3]>', part, flags=re.I | re.S)
-        heading = re.sub(r'<[^>]+>', '', heading_match.group(1)).strip() if heading_match else ''
-        kind = 'cover' if not pages else 'preliminary'
-        if heading:
-            lower = heading.lower()
-            if 'table of contents' in lower or lower == 'contents':
-                kind = 'toc'
-            elif 'cover' in lower or 'title page' in lower:
-                kind = 'cover'
-            elif pages:
-                kind = 'preliminary'
-        pages.append({
-            'title': heading or ('Cover Page' if not pages else 'Preliminary Content'),
-            'type': kind,
-            'html': part,
-            'page_break_before': bool(pages),
-            'formatting': {
-                'heading_align': 'center',
-                'body_align': 'justify',
-                'font_weight': 800 if kind == 'cover' else None,
-                'font_size_px': 20 if kind == 'cover' else None,
-                'text_transform': 'uppercase' if kind == 'cover' else None,
-                'page_numbering': 'none' if kind == 'cover' else 'roman-lower',
-            },
-        })
-    return pages
-
-
-def _build_paper_document(rows, toc_text="", version=1):
-    """Build stable structured document JSON and a legacy HTML-compatible string."""
-    sections = []
-    html_chunks = []
-    toc_inserted = False
-    for row in rows:
-        # Supports both legacy (title, content) and enriched row tuples.
-        if len(row) >= 6:
-            section_id, order_no, key, title, content, saved_type = row[:6]
-        else:
-            order_no, title, content = row[:3]
-            section_id, key = None, None
-            saved_type = None
-        section_type, page_break = _classify_paper_section(title, content, order_no)
-        if saved_type and saved_type != "body":
-            section_type = saved_type
-        rich = content_rich_html(content)
-        plain = content_plain_text(content)
-        section = {
-            "id": section_id,
-            "order_no": int(order_no),
-            "key": key or re.sub(r"[^a-z0-9]+", "-", str(title or "").lower()).strip("-")[:90],
-            "title": str(title or ""),
-            "type": section_type,
-            "content": content,
-            "html": rich,
-            "word_count": len(plain.split()),
-            "page_break_before": bool(page_break),
-            "formatting": {
-                "cover": section_type == "cover",
-                "heading_align": "center" if section_type in {"cover", "preliminary", "toc", "chapter", "conclusion", "references", "appendix"} else "left",
-                "body_align": "justify",
-                "page_numbering": "roman-lower" if section_type == "preliminary" else ("arabic" if section_type in {"chapter", "body", "conclusion", "references", "appendix"} else "none"),
-            },
-        }
-        if section_type == "preliminary":
-            section["pages"] = _split_preliminary_pages(rich)
-        sections.append(section)
-        # The browser's legacy renderer expects ordinary top-level content blocks.
-        # Keep this field backwards compatible; the structured manifest is authoritative.
-        if section_type == "preliminary":
-            # Avoid duplicate TOC text accidentally embedded in the preliminary AI response.
-            preliminary_html = rich
-            preliminary_html = re.sub(
-                r"<h[1-3][^>]*>\s*(?:table of contents|contents)\s*</h[1-3]>.*$",
-                "", preliminary_html, flags=re.I | re.S
-            )
-            html_chunks.append(preliminary_html)
-            if not toc_inserted and toc_text:
-                html_chunks.append(_toc_entry_html(toc_text))
-                toc_inserted = True
-        else:
-            if title and not plain.lower().lstrip().startswith(str(title).lower().lstrip()):
-                html_chunks.append("<h1>" + html_escape(str(title)) + "</h1>" + rich)
-            else:
-                html_chunks.append(rich)
-    if not toc_inserted and toc_text:
-        html_chunks.insert(1 if html_chunks else 0, _toc_entry_html(toc_text))
-    document = {
-        "schema_version": 1,
-        "document_version": int(version),
-        "sections": sections,
-        "toc": {"text": str(toc_text or ""), "unified": True},
-        "pagination": {
-            "paper_size": "A4",
-            "preliminary_numbering": "lower-roman",
-            "main_numbering": "arabic",
-            "chapter_one_starts_at": 1,
-            "section_page_breaks": True,
-        },
-    }
-    return document, RICH_HTML_MARKER + "".join(x for x in html_chunks if x and x.strip())
-
-
-def _refresh_merged_document(conn, project_id, user_id, toc_text=None):
-    with conn.cursor() as cur:
-        cur.execute("""SELECT p.document_version, t.toc_text
-                       FROM paper_projects p JOIN paper_tocs t ON t.toc_code=p.toc_code
-                       WHERE p.id=%s AND p.user_id=%s FOR UPDATE OF p""", (int(project_id), int(user_id)))
-        project = cur.fetchone()
-        if not project:
-            return None
-        version = int(project[0] or 0) + 1
-        effective_toc = toc_text if toc_text is not None else (project[1] or "")
-        cur.execute("""SELECT id,order_no,section_key,section_title,content_text,section_type
-                       FROM paper_sections WHERE project_id=%s ORDER BY order_no,id""", (int(project_id),))
-        rows = cur.fetchall()
-        # Backfill metadata for older rows as part of normal document reconstruction.
-        for r in rows:
-            kind, page_break = _classify_paper_section(r[3], r[4], r[1])
-            cur.execute("""UPDATE paper_sections SET section_type=%s, page_break_before=%s,
-                           formatting_json=%s::jsonb WHERE id=%s AND (section_type='body' OR formatting_json='{}'::jsonb)""",
-                        (kind, page_break, json.dumps({"body_align":"justify", "heading_align":"center"}), r[0]))
-        cur.execute("""SELECT id,order_no,section_key,section_title,content_text,section_type
-                       FROM paper_sections WHERE project_id=%s ORDER BY order_no,id""", (int(project_id),))
-        rows = cur.fetchall()
-        document, merged_html = _build_paper_document(rows, effective_toc, version)
-        cur.execute("""UPDATE paper_projects SET merged=TRUE, merged_content=%s,
-                       document_json=%s::jsonb, document_version=%s, merged_version=%s,
-                       updated_at=CURRENT_TIMESTAMP WHERE id=%s AND user_id=%s""",
-                    (merged_html, json.dumps(document), version, version, int(project_id), int(user_id)))
-    return {"document": document, "merged_content": merged_html, "document_version": version}
-
-
 @app.route("/prompt-builder", methods=["POST", "GET"])
 def prompt_builder():
     if request.method == "GET":
@@ -822,20 +643,13 @@ def paper_start():
         conn=get_db(); pr=_owned_prompt(conn,uid,pc); toc=_owned_toc(conn,uid,tc)
         if not pr or not toc or toc[0]!=pc: return jsonify({"error":"These codes do not match a saved prompt and TOC in your account."}),404
         with conn.cursor() as cur:
-            cur.execute("SELECT id,current_index,merged,merged_content,document_json,document_version,merged_version FROM paper_projects WHERE user_id=%s AND prompt_code=%s AND toc_code=%s",(int(uid),pc,tc)); project=cur.fetchone()
+            cur.execute("SELECT id,current_index,merged,merged_content FROM paper_projects WHERE user_id=%s AND prompt_code=%s AND toc_code=%s",(int(uid),pc,tc)); project=cur.fetchone()
         if project:
             with conn.cursor() as cur:
-                cur.execute("SELECT id,order_no,section_key,section_title,content_text,section_type,formatting_json,page_break_before FROM paper_sections WHERE project_id=%s ORDER BY order_no,id",(project[0],)); rows=cur.fetchall()
-            # Upgrade older merged projects that predate the structured document manifest.
-            if bool(project[2]) and (not project[4] or not isinstance(project[4], dict) or not project[4].get("sections")):
-                upgraded = _refresh_merged_document(conn, project[0], int(uid))
-                if upgraded:
-                    conn.commit()
-                    project = (project[0], project[1], True, upgraded["merged_content"], upgraded["document"], upgraded["document_version"], upgraded["document_version"])
+                cur.execute("SELECT order_no,section_title,content_text FROM paper_sections WHERE project_id=%s ORDER BY order_no",(project[0],)); rows=cur.fetchall()
             return jsonify({"message":"Resumed your saved paper.","project_id":project[0],"current_index":project[1],
                             "merged":bool(project[2]),"merged_content":project[3] or "",
-                            "document":project[4] or {},"document_version":project[5] or 1,"merged_version":project[6] or 0,
-                            "sections":[{"id":r[0],"order_no":r[1],"key":r[2],"title":r[3],"content":r[4],"type":r[5],"formatting":r[6] or {},"page_break_before":bool(r[7])} for r in rows]}),200
+                            "sections":[{"order_no":r[0],"title":r[1],"content":r[2]} for r in rows]}),200
         _,title,config,prompt_text=pr; _,_,toc_text,sections,_=toc
         research,sources=search_tavily(prompt_text)
         prompt=("Write ONLY the cover/title page and required preliminary pages. Do NOT generate, include, or preview the Table of Contents. Do NOT write Chapter One or any chapter content. The TOC is a separate stage and will appear only when the user clicks Pull Next after these preliminary pages. Follow every automatic formatting rule in the saved prompt. COVER PAGE: center the full topic in bold; include institution, faculty, department, course title/code, student name, registration number, lecturer/supervisor, academic session, and submission date. For each missing value, leave a visible blank line (____________________); do not invent details. Each preliminary-page heading must be centered and bold; body paragraphs must be justified. Put the cover first with no visible page number; use lower-case Roman numeral pagination for following preliminary pages. Do not include TOC entries or fabricated page numbers.\n\n"
@@ -843,7 +657,7 @@ def paper_start():
         prelim=remove_duplicate_sections(generate_with_groq(prompt))
         with conn.cursor() as cur:
             cur.execute("INSERT INTO paper_projects (user_id,prompt_code,toc_code,current_index) VALUES (%s,%s,%s,0) RETURNING id",(int(uid),pc,tc)); pid=cur.fetchone()[0]
-            cur.execute("INSERT INTO paper_sections (project_id,order_no,section_key,section_title,content_text,word_count,section_type,formatting_json,page_break_before) VALUES (%s,0,'preliminary','Preliminary Pages and Table of Contents',%s,%s,'preliminary',%s::jsonb,TRUE)",(pid,prelim,len(content_plain_text(prelim).split()),json.dumps({"heading_align":"center","body_align":"justify","page_numbering":"lower-roman"})))
+            cur.execute("INSERT INTO paper_sections (project_id,order_no,section_key,section_title,content_text,word_count) VALUES (%s,0,'preliminary','Preliminary Pages and Table of Contents',%s,%s)",(pid,prelim,len(prelim.split())))
         conn.commit()
         return jsonify({"message":"Preliminary pages created. Chapter One has not been generated yet.","project_id":pid,"current_index":0,
                         "result":prelim,"toc":toc_text,"toc_code":tc,"sources":sources,"word_count":len(prelim.split()),
@@ -887,7 +701,6 @@ def pull_next():
             with conn.cursor() as cur:
                 cur.execute("UPDATE paper_tocs SET toc_text=%s,sections_json=%s::jsonb,updated_at=CURRENT_TIMESTAMP WHERE user_id=%s AND toc_code=%s",
                             (edited_toc,json.dumps(_section_items(edited_toc,config)),int(uid),tc))
-                cur.execute("UPDATE paper_projects SET document_version=document_version+1,merged=FALSE,merged_content=NULL,document_json='{}'::jsonb,merged_version=0,updated_at=CURRENT_TIMESTAMP WHERE user_id=%s AND toc_code=%s",(int(uid),tc))
             conn.commit()
             return jsonify({"message":"Table of contents updated.","title":"Table of Contents","result":edited_toc,"inline_applied":inline_enabled,"kind":"toc"}),200
 
@@ -898,20 +711,14 @@ def pull_next():
 
             if action == "edit_merged":
                 with conn.cursor() as cur:
-                    cur.execute("SELECT merged,document_json,document_version FROM paper_projects WHERE id=%s AND user_id=%s FOR UPDATE",(int(pid),int(uid)))
+                    cur.execute("SELECT merged FROM paper_projects WHERE id=%s AND user_id=%s",(int(pid),int(uid)))
                     merged_row=cur.fetchone()
                     if not merged_row or not merged_row[0]:
                         return jsonify({"error":"This paper has not been merged yet."}),409
                     saved = sanitize_rich_html(incoming[len(RICH_HTML_MARKER):]) if incoming.startswith(RICH_HTML_MARKER) else incoming.strip()
-                    next_version = int(merged_row[2] or 0) + 1
-                    manifest = merged_row[1] or {}
-                    if not isinstance(manifest, dict): manifest = {}
-                    manifest.update({"document_version": next_version, "manual_override": True,
-                                     "manual_override_html": saved[len(RICH_HTML_MARKER):] if saved.startswith(RICH_HTML_MARKER) else saved})
-                    cur.execute("UPDATE paper_projects SET merged_content=%s,document_json=%s::jsonb,document_version=%s,merged_version=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s AND user_id=%s",
-                                (saved,json.dumps(manifest),next_version,next_version,int(pid),int(uid)))
+                    cur.execute("UPDATE paper_projects SET merged_content=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s AND user_id=%s",(saved,int(pid),int(uid)))
                 conn.commit()
-                return jsonify({"message":"Merged document changes saved directly.","title":"Complete Term Paper","result":saved,"merged":True,"document_version":next_version}),200
+                return jsonify({"message":"Merged document changes saved directly.","title":"Complete Term Paper","result":saved,"merged":True}),200
 
             edited_plain=content_plain_text(incoming).strip()
             order_no=int(data.get("order_no",current_index))
@@ -952,10 +759,10 @@ def pull_next():
                 cur.execute("UPDATE paper_tocs SET updated_at=CURRENT_TIMESTAMP WHERE toc_code=%s",(tc,))
                 # Keep the merged export synchronized if a project was merged before a direct edit.
                 if merged:
-                    # Rebuild from canonical saved sections; never flatten edits to plain text.
-                    refreshed = _refresh_merged_document(conn, int(pid), int(uid), toc_text)
-                else:
-                    cur.execute("UPDATE paper_projects SET document_version=document_version+1,updated_at=CURRENT_TIMESTAMP WHERE id=%s AND user_id=%s",(int(pid),int(uid)))
+                    cur.execute("SELECT section_title,content_text FROM paper_sections WHERE project_id=%s ORDER BY order_no",(int(pid),))
+                    all_rows=cur.fetchall()
+                    merged_text="\n\n".join((f"# {r[0]}\n\n{content_plain_text(r[1])}" if r[0] else content_plain_text(r[1])) for r in all_rows)
+                    cur.execute("UPDATE paper_projects SET merged_content=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s",(merged_text,int(pid)))
             conn.commit()
             return jsonify({"message":"Section refined with Groq." if inline_enabled else "Section updated and saved directly.",
                             "title":row[0],"result":saved,"order_no":order_no,"inline_applied":inline_enabled,"merged":merged}),200
@@ -967,19 +774,9 @@ def pull_next():
             title=row[0]; page_budget = _chapter_page_budget(config, title, sections); budget_note = (f"\nTHIS CHAPTER'S SHARE OF THE MAIN-BODY PAGE TARGET: approximately {page_budget['pages']} A4 pages and about {page_budget['words']} words. This is chapter {page_budget['chapter_index']} of {page_budget['chapter_count']}; the complete main body target is {page_budget['total_pages']} pages total. Preliminary pages and references are excluded.\n" if page_budget else ""); prompt=(f"Regenerate ONLY this existing section titled {title}. Do not repeat other chapters or preliminary pages. Apply every automatic Tempaper rule in the saved instructions, including chapter role, topic-weight page-depth target, varied heading/list pattern, and numbering. Preserve the section's position in the saved TOC.{budget_note}\n\n{prompt_text}\n\nTOC:\n{toc_text}\n\nSection: {title}")
             content=remove_duplicate_sections(generate_with_groq(prompt))
             with conn.cursor() as cur:
-                cur.execute("SELECT merged FROM paper_projects WHERE id=%s AND user_id=%s",(int(pid),int(uid)))
-                merged_state=cur.fetchone()
-                was_merged=bool(merged_state and merged_state[0])
-                kind, page_break = _classify_paper_section(title, content, order_no)
-                formatting={"heading_align":"center","body_align":"justify","page_numbering":"arabic" if kind in {"chapter","body","conclusion","references","appendix"} else "lower-roman"}
-                cur.execute("UPDATE paper_sections SET content_text=%s,word_count=%s,section_type=%s,formatting_json=%s::jsonb,page_break_before=%s,updated_at=CURRENT_TIMESTAMP WHERE project_id=%s AND order_no=%s",
-                            (content,len(content_plain_text(content).split()),kind,json.dumps(formatting),page_break,int(pid),order_no))
+                cur.execute("UPDATE paper_sections SET content_text=%s,word_count=%s,updated_at=CURRENT_TIMESTAMP WHERE project_id=%s AND order_no=%s",(content,len(content.split()),int(pid),order_no))
                 cur.execute("UPDATE paper_tocs SET updated_at=CURRENT_TIMESTAMP WHERE toc_code=%s",(tc,))
-                if not was_merged:
-                    cur.execute("UPDATE paper_projects SET document_version=document_version+1,updated_at=CURRENT_TIMESTAMP WHERE id=%s AND user_id=%s",(int(pid),int(uid)))
-            if was_merged:
-                refreshed=_refresh_merged_document(conn,int(pid),int(uid),toc_text)
-            conn.commit(); return jsonify({"message":"Section regenerated and saved without adding a duplicate.","title":title,"result":content,"order_no":order_no,"merged":was_merged,"document_version":refreshed["document_version"] if was_merged else None}),200
+            conn.commit(); return jsonify({"message":"Section regenerated without adding a duplicate.","title":title,"result":content,"order_no":order_no}),200
         next_index=int(current_index)+1
         if next_index>len(sections): return jsonify({"message":"All sections in the saved table of contents have been generated.","done":True}),200
         item=sections[next_index-1]; title=str(item.get("title") or f"Section {next_index}"); key=str(item.get("key") or f"section-{next_index}")
@@ -1012,15 +809,12 @@ def pull_next():
             if quality_issues:
                 logger.info("Chapter quality repair for %s: %s", title, "; ".join(quality_issues))
         with conn.cursor() as cur:
-            section_type, page_break = _classify_paper_section(title, content, next_index)
-            formatting = {"heading_align":"center","body_align":"justify","page_numbering":"arabic" if section_type in {"chapter","body","conclusion","references","appendix"} else "lower-roman"}
-            cur.execute("INSERT INTO paper_sections (project_id,order_no,section_key,section_title,content_text,word_count,section_type,formatting_json,page_break_before) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s)",(int(pid),next_index,key,title,content,len(content_plain_text(content).split()),section_type,json.dumps(formatting),page_break))
-            cur.execute("UPDATE paper_projects SET current_index=%s,document_version=document_version+1,updated_at=CURRENT_TIMESTAMP WHERE id=%s",(next_index,int(pid)))
+            cur.execute("INSERT INTO paper_sections (project_id,order_no,section_key,section_title,content_text,word_count) VALUES (%s,%s,%s,%s,%s,%s)",(int(pid),next_index,key,title,content,len(content.split())))
+            cur.execute("UPDATE paper_projects SET current_index=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s",(next_index,int(pid)))
             cur.execute("UPDATE paper_tocs SET updated_at=CURRENT_TIMESTAMP WHERE toc_code=%s",(tc,))
         conn.commit()
         return jsonify({"message":f"{title} generated.","title":title,"result":content,"order_no":next_index,"current_index":next_index,
-                        "section_type":section_type,"page_break_before":page_break,"formatting":formatting,
-                        "sources":sources,"word_count":len(content_plain_text(content).split()),"page_count":max(1,(len(content_plain_text(content).split())+249)//250),"toc_code":tc,"toc":toc_text}),201
+                        "sources":sources,"word_count":len(content.split()),"page_count":max(1,(len(content.split())+249)//250),"toc_code":tc,"toc":toc_text}),201
     except Exception as e:
         if conn: conn.rollback()
         logger.exception("Pull next failed")
@@ -1030,87 +824,62 @@ def pull_next():
 
 
 
-@app.route("/paper-project/<int:project_id>", methods=["GET"])
-def get_paper_project(project_id):
-    uid = request.args.get("user_id", "")
-    if not str(uid).isdigit():
-        return jsonify({"error": "Valid signed-in account required."}), 400
-    conn = None
-    try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute("""SELECT p.id,p.prompt_code,p.toc_code,p.current_index,p.merged,p.merged_content,
-                                  p.document_json,p.document_version,p.merged_version,t.toc_text
-                           FROM paper_projects p JOIN paper_tocs t ON t.toc_code=p.toc_code
-                           WHERE p.id=%s AND p.user_id=%s""", (int(project_id), int(uid)))
-            project = cur.fetchone()
-            if not project:
-                return jsonify({"error": "Saved paper not found in your account."}), 404
-            cur.execute("""SELECT id,order_no,section_key,section_title,content_text,section_type,
-                                  formatting_json,page_break_before,word_count,updated_at
-                           FROM paper_sections WHERE project_id=%s ORDER BY order_no,id""", (int(project_id),))
-            rows = cur.fetchall()
-        return jsonify({
-            "project_id": project[0], "prompt_code": project[1], "toc_code": project[2],
-            "current_index": project[3], "merged": bool(project[4]), "merged_content": project[5] or "",
-            "document": project[6] or {}, "document_version": project[7] or 1,
-            "merged_version": project[8] or 0, "toc": project[9] or "",
-            "sections": [{"id": r[0], "order_no": r[1], "key": r[2], "title": r[3], "content": r[4],
-                          "type": r[5], "formatting": r[6] or {}, "page_break_before": bool(r[7]),
-                          "word_count": r[8], "updated_at": r[9].isoformat() if r[9] else None} for r in rows]
-        }), 200
-    except Exception as e:
-        logger.exception("Paper project fetch failed")
-        return jsonify({"error": "Could not retrieve the saved paper.", "details": str(e)[:200]}), 500
-    finally:
-        if conn:
-            release_db(conn)
-
-
 @app.route("/merge-paper", methods=["POST"])
 def merge_paper():
-    data = request.get_json(silent=True) or {}
-    uid, pid = str(data.get("user_id", "")), data.get("project_id")
+    data=request.get_json(silent=True) or {}
+    uid=str(data.get("user_id","")); pid=data.get("project_id")
     if not uid.isdigit() or not str(pid or "").isdigit():
-        return jsonify({"error": "Sign in and open a saved paper first."}), 400
-    conn = None
+        return jsonify({"error":"Sign in and open a saved paper first."}),400
+    conn=None
     try:
-        conn = get_db()
+        conn=get_db()
         with conn.cursor() as cur:
-            cur.execute("""SELECT p.current_index,p.document_version,t.sections_json,t.toc_text
+            cur.execute("""SELECT p.current_index,p.merged_content,t.sections_json,t.toc_text
                            FROM paper_projects p JOIN paper_tocs t ON t.toc_code=p.toc_code
-                           WHERE p.id=%s AND p.user_id=%s FOR UPDATE OF p""", (int(pid), int(uid)))
-            project = cur.fetchone()
+                           WHERE p.id=%s AND p.user_id=%s""",(int(pid),int(uid)))
+            project=cur.fetchone()
             if not project:
-                return jsonify({"error": "Saved paper not found in your account."}), 404
-            current_index, current_version, toc_sections, toc_text = project
-            toc_sections = toc_sections or []
-            if int(current_index or 0) < len(toc_sections):
-                return jsonify({"error": "Generate every section in the saved TOC before merging the complete paper."}), 409
-            cur.execute("SELECT COUNT(*) FROM paper_sections WHERE project_id=%s", (int(pid),))
-            if not cur.fetchone()[0]:
-                return jsonify({"error": "There is no generated content to merge."}), 400
-        result = _refresh_merged_document(conn, int(pid), int(uid), toc_text)
-        if not result:
-            conn.rollback()
-            return jsonify({"error": "Saved paper not found in your account."}), 404
+                return jsonify({"error":"Saved paper not found in your account."}),404
+            current_index,old_content,sections,toc_text=project
+            sections=sections or []
+            if int(current_index or 0) < len(sections):
+                return jsonify({"error":"Generate every section in the saved TOC before merging the complete paper."}),409
+            cur.execute("SELECT section_title,content_text FROM paper_sections WHERE project_id=%s ORDER BY order_no",(int(pid),))
+            rows=cur.fetchall()
+            if not rows:
+                return jsonify({"error":"There is no generated content to merge."}),400
+            chunks=[]
+            toc_inserted=False
+            for row_index,(title,content) in enumerate(rows):
+                rich=content_rich_html(content)
+                plain=content_plain_text(content)
+                is_preliminary = (title or "").lower() in {"preliminary pages and table of contents","preliminary pages"}
+                if is_preliminary:
+                    chunks.append(rich)
+                    if not toc_inserted and toc_text:
+                        toc_html="<h2>TABLE OF CONTENTS</h2>"+"".join("<p>"+_inline_markdown_html(line.strip())+"</p>" for line in str(toc_text).splitlines() if line.strip())
+                        chunks.append(toc_html)
+                        toc_inserted=True
+                else:
+                    if title and not plain.lower().lstrip().startswith(title.lower().lstrip()):
+                        chunks.append("<h1>"+html_escape(str(title))+"</h1>"+rich)
+                    else:
+                        chunks.append(rich)
+            if not toc_inserted and toc_text:
+                toc_html="<h2>TABLE OF CONTENTS</h2>"+"".join("<p>"+_inline_markdown_html(line.strip())+"</p>" for line in str(toc_text).splitlines() if line.strip())
+                chunks.insert(1 if chunks else 0, toc_html)
+            merged_content=RICH_HTML_MARKER+"".join(x for x in chunks if x.strip())
+            cur.execute("UPDATE paper_projects SET merged=TRUE,merged_content=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s AND user_id=%s",
+                        (merged_content,int(pid),int(uid)))
         conn.commit()
-        return jsonify({
-            "message": "Paper merged. Structured sections, page-break metadata and document version were saved.",
-            "merged": True,
-            "merged_content": result["merged_content"],
-            "document": result["document"],
-            "document_version": result["document_version"],
-            "title": "Complete Term Paper",
-        }), 200
+        return jsonify({"message":"Paper merged into one document. Inline Edit is now disabled for this merged file.",
+                        "merged":True,"merged_content":merged_content,"title":"Complete Term Paper"}),200
     except Exception as e:
-        if conn:
-            conn.rollback()
+        if conn: conn.rollback()
         logger.exception("Paper merge failed")
-        return jsonify({"error": "Could not merge the paper.", "details": str(e)[:200]}), 500
+        return jsonify({"error":"Could not merge the paper.","details":str(e)[:200]}),500
     finally:
-        if conn:
-            release_db(conn)
+        if conn: release_db(conn)
 
 
 @app.route("/sync-toc-pages", methods=["POST"])
@@ -1146,6 +915,69 @@ def sync_toc_pages():
         conn.commit(); return jsonify({"message":"TOC page numbers updated; TOC code unchanged.","toc_code":code,"toc":new_toc}),200
     finally:
         if conn:release_db(conn)
+
+
+
+@app.route("/upload-image", methods=["POST"])
+def upload_image():
+    """Proxy image upload to ImgBB. API key stays on the server (IMGBB_API_KEY)."""
+    if not IMGBB_API_KEY:
+        return jsonify({"error": "Image upload is not configured. Set IMGBB_API_KEY on the server."}), 503
+
+    file = request.files.get("image")
+    if not file or not file.filename:
+        return jsonify({"error": "No image file provided."}), 400
+
+    # Basic validation
+    filename = (file.filename or "").lower()
+    if not any(filename.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")):
+        return jsonify({"error": "Unsupported image type. Use JPG, PNG, GIF or WebP."}), 400
+
+    # Size limit ~8 MB
+    file.seek(0, 2)
+    size = file.tell()
+    file.seek(0)
+    if size > 8 * 1024 * 1024:
+        return jsonify({"error": "Image must be under 8 MB."}), 400
+
+    try:
+        import base64
+        raw = file.read()
+        b64 = base64.b64encode(raw).decode("ascii")
+
+        resp = requests.post(
+            "https://api.imgbb.com/1/upload",
+            data={
+                "key": IMGBB_API_KEY,
+                "image": b64,
+                "name": (file.filename or "tempaper-figure")[:80],
+            },
+            timeout=30,
+        )
+        payload = resp.json() if resp.content else {}
+        if resp.status_code != 200 or not payload.get("success"):
+            err = (payload.get("error") or {}).get("message") if isinstance(payload.get("error"), dict) else payload.get("error")
+            logger.warning("ImgBB upload failed: %s %s", resp.status_code, err)
+            return jsonify({"error": str(err) if err else "ImgBB upload failed."}), 502
+
+        data = payload.get("data") or {}
+        url = data.get("url") or data.get("display_url")
+        if not url:
+            return jsonify({"error": "ImgBB did not return an image URL."}), 502
+
+        return jsonify({
+            "url": url,
+            "display_url": data.get("display_url") or url,
+            "delete_url": data.get("delete_url") or "",
+            "width": data.get("width"),
+            "height": data.get("height"),
+            "size": data.get("size"),
+        }), 200
+    except requests.Timeout:
+        return jsonify({"error": "Image upload timed out. Try a smaller file."}), 504
+    except Exception as e:
+        logger.exception("upload-image failed")
+        return jsonify({"error": "Could not upload image.", "details": str(e)[:200]}), 500
 
 
 def generate_otp(prefix):
