@@ -839,6 +839,17 @@ def pull_next():
                 return out
 
             for block in _extract_tp_figures(raw_html):
+                # Keep resized width across Resend via data-fig-width
+                wm = re.search(r'data-fig-width="(\d+)"', block)
+                if wm:
+                    w = wm.group(1)
+                    if re.search(r'style="', block, flags=re.I):
+                        if re.search(r'width\s*:', block, flags=re.I):
+                            block = re.sub(r'width\s*:\s*[^;"]+', f'width: {w}%', block, count=1, flags=re.I)
+                        else:
+                            block = re.sub(r'style="', f'style="width: {w}%; ', block, count=1, flags=re.I)
+                    else:
+                        block = block.replace('class="tp-figure"', f'class="tp-figure" style="width: {w}%; max-width: 100%; margin-left: auto; margin-right: auto"', 1)
                 figure_blocks.append(block)
                 label_m = re.search(r'data-fig-label="([^"]+)"', block)
                 cap_m = re.search(r'class="fig-caption"[^>]*>(.*?)</span>', block, flags=re.I|re.S)
