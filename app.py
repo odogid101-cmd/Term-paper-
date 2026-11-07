@@ -47,11 +47,15 @@ except Exception:
 CORS(
     app,
     supports_credentials=True,
-    origins=[
+    resources={r"/*": {"origins": [
         "https://odogid101-cmd.github.io",
         "http://localhost:3000",
         "http://localhost:5000",
-    ],
+        "https://localhost:3000",
+    ]}},
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    expose_headers=["Content-Type"],
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -242,11 +246,14 @@ _ALLOWED_RICH_TAGS = {
     "u", "s", "del", "ul", "ol", "li", "blockquote", "br", "sub", "sup", "font",
     "img", "figure", "figcaption"
 }
+# Extra attrs kept for Monkey Scout figures (move/resize/caption persistence)
+_FIGURE_DATA_ATTRS = {"data-fig-label", "data-fig-url", "data-fig-caption", "data-bound"}
 _VOID_RICH_TAGS = {"br", "img"}
 _ALLOWED_STYLE_PROPS = {
     "font-family", "font-size", "color", "background-color", "text-align",
-    "margin-left", "margin-right", "text-indent", "width", "max-width",
-    "height", "max-height", "object-fit", "display"
+    "margin-left", "margin-right", "margin-top", "margin-bottom", "text-indent",
+    "width", "max-width", "height", "max-height", "object-fit", "display",
+    "float", "clear"
 }
 
 class _RichHTMLSanitizer(HTMLParser):
@@ -275,21 +282,31 @@ class _RichHTMLSanitizer(HTMLParser):
                     legacy_style.append("font-size: " + str(8 + int(value) * 2) + "pt")
                 continue
             # Allow safe attributes for images and figures
-            if tag == "img" and key in {"src", "alt", "class", "loading"}:
+                        # Allow safe attributes for images and figures
+            if tag == "img" and key in {"src", "alt", "class", "loading", "draggable", "width", "height"}:
                 if key == "src" and re.match(r"^https?://[A-Za-z0-9._~:/?#\[\]@!$&\'()*+,;=%-]+$", value):
                     safe_attrs.append((key, value))
-                elif key == "alt" and re.fullmatch(r"[A-Za-z0-9 .,_\\-()/:;]{0,200}", value):
-                    safe_attrs.append((key, value))
-                elif key == "class" and re.fullmatch(r"[A-Za-z0-9 _\\-]{1,80}", value):
+                elif key == "alt" and len(value) <= 300:
+                    safe_attrs.append((key, value[:300]))
+                elif key == "class" and re.fullmatch(r"[A-Za-z0-9 _\-]{1,80}", value):
                     safe_attrs.append((key, value))
                 elif key == "loading" and value in {"lazy", "eager"}:
                     safe_attrs.append((key, value))
+                elif key == "draggable" and value in {"true", "false"}:
+                    safe_attrs.append((key, value))
+                elif key in {"width", "height"} and re.fullmatch(r"\d{1,4}%?", value):
+                    safe_attrs.append((key, value))
                 continue
-            if tag in {"div", "figure", "span", "figcaption"} and key in {"class", "data-fig-label", "data-fig-url"}:
-                if key == "class" and re.fullmatch(r"[A-Za-z0-9 _\\-]{1,80}", value):
+            if tag in {"div", "figure", "span", "figcaption"} and (
+                key in {"class", "data-fig-label", "data-fig-url", "data-fig-caption", "title"} or key.startswith("data-")
+            ):
+                if key == "class" and re.fullmatch(r"[A-Za-z0-9 _\-]{1,120}", value):
                     safe_attrs.append((key, value))
-                elif key.startswith("data-") and re.fullmatch(r"[A-Za-z0-9 ._\\-:/?#%]{1,500}", value):
-                    safe_attrs.append((key, value))
+                elif key == "title" and len(value) <= 200:
+                    safe_attrs.append((key, value[:200]))
+                elif key.startswith("data-") and len(value) <= 800:
+                    # Keep figure metadata (label, imgbb url, caption)
+                    safe_attrs.append((key, value[:800]))
                 continue
             if key != "style":
                 continue
@@ -706,7 +723,9 @@ def pull_next():
 
         if action in {"edit", "edit_merged"}:
             incoming=str(data.get("content",""))
-            if not content_plain_text(incoming).strip():
+            plain_check=content_plain_text(incoming).strip()
+            has_figure = bool(re.search(r"<img\b|<figure\b", incoming, re.I))
+            if not plain_check and not has_figure:
                 return jsonify({"error":"Edited content cannot be empty."}),400
 
             if action == "edit_merged":
@@ -782,15 +801,50 @@ def pull_next():
             raw_html = source_content
             if source_content.startswith(RICH_HTML_MARKER):
                 raw_html = source_content[len(RICH_HTML_MARKER):]
-            # Pull out each .tp-figure block
-            for m in re.finditer(r'<div class="tp-figure"[^>]*>.*?</div>\s*</div>', raw_html, flags=re.I|re.S):
-                block = m.group(0)
+                        # Pull out each .tp-figure block (balanced div match; nested handles OK)
+            def _extract_tp_figures(html):
+                out = []
+                lower = html.lower()
+                start_token = 'class="tp-figure"'
+                pos = 0
+                while True:
+                    i = lower.find(start_token, pos)
+                    if i < 0:
+                        break
+                    open_div = html.rfind("<div", 0, i)
+                    if open_div < 0:
+                        pos = i + len(start_token)
+                        continue
+                    depth = 0
+                    j = open_div
+                    end_pos = None
+                    while j < len(html):
+                        if html[j:j+4].lower() == "<div" and (j+4 >= len(html) or html[j+4] in " \t\n>/"):
+                            depth += 1
+                            j += 4
+                            continue
+                        if html[j:j+6].lower() == "</div>":
+                            depth -= 1
+                            j += 6
+                            if depth == 0:
+                                end_pos = j
+                                break
+                            continue
+                        j += 1
+                    if end_pos is None:
+                        pos = i + len(start_token)
+                        continue
+                    out.append(html[open_div:end_pos])
+                    pos = end_pos
+                return out
+
+            for block in _extract_tp_figures(raw_html):
                 figure_blocks.append(block)
                 label_m = re.search(r'data-fig-label="([^"]+)"', block)
                 cap_m = re.search(r'class="fig-caption"[^>]*>(.*?)</span>', block, flags=re.I|re.S)
                 label = label_m.group(1) if label_m else "Figure"
                 caption = re.sub(r'<[^>]+>', '', cap_m.group(1)).strip() if cap_m else ""
-                caption = re.sub(r'^Fig\.?\s*\d+\.\d+\s*:?\s*', '', caption, flags=re.I).strip()
+                caption = re.sub(r'^Fig\.\s*\d+\.\d+\s*:?\s*', '', caption, flags=re.I).strip()
                 figure_notes.append(f"- {label}" + (f": {caption}" if caption else ""))
 
             page_budget = _chapter_page_budget(config, title, sections)
@@ -982,10 +1036,13 @@ def sync_toc_pages():
 
 
 
-@app.route("/upload-image", methods=["POST"])
+@app.route("/upload-image", methods=["POST", "OPTIONS"])
 def upload_image():
     """Proxy image upload to ImgBB. API key stays on the server (IMGBB_API_KEY)."""
+    if request.method == "OPTIONS":
+        return ("", 204)
     if not IMGBB_API_KEY:
+        logger.error("IMGBB_API_KEY is not set on the server")
         return jsonify({"error": "Image upload is not configured. Set IMGBB_API_KEY on the server."}), 503
 
     file = request.files.get("image")
@@ -1250,7 +1307,7 @@ def _repair_incomplete_chapter(content: str, title: str, prompt_text: str, toc_t
 # --- ROUTES (original term-paper logic preserved) ---
 @app.route("/", methods=["GET", "HEAD"])
 def health_check():
-    return jsonify({"status": "ok", "message": f"Tempaper API running - Groq {GROQ_MODEL}"}), 200
+    return jsonify({"status": "ok", "message": f"Monkey Scout API running - Groq {GROQ_MODEL}"}), 200
 
 
 @app.route("/register", methods=["POST"])
@@ -1274,7 +1331,7 @@ def register():
             )
             uid = cur.fetchone()[0]
             conn.commit()
-        if not send_email(email, "Verify Your Tempaper Account", f"<p>Your code: <strong>{otp}</strong></p>"):
+        if not send_email(email, "Verify Your Monkey Scout Account", f"<p>Your code: <strong>{otp}</strong></p>"):
             return jsonify({"error": "Email could not be sent"}), 502
         return jsonify({"message": "Registered", "user_id": uid}), 201
     except psycopg2.IntegrityError:
@@ -1434,7 +1491,7 @@ def reset_pwd():
 def get_me():
     uid = request.args.get("user_id")
     if not uid or not str(uid).isdigit():
-        return jsonify({"user": {"id": 0, "username": "Guest", "email": "guest@tempaper.com"}}), 200
+        return jsonify({"user": {"id": 0, "username": "Guest", "email": "guest@monkeyscout.com"}}), 200
 
     conn = None
     try:
