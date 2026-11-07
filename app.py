@@ -769,14 +769,78 @@ def pull_next():
         if action=="resend":
             order_no=int(data.get("order_no",current_index))
             with conn.cursor() as cur:
-                cur.execute("SELECT section_title FROM paper_sections WHERE project_id=%s AND order_no=%s",(int(pid),order_no)); row=cur.fetchone()
+                cur.execute("SELECT section_title,content_text FROM paper_sections WHERE project_id=%s AND order_no=%s",(int(pid),order_no)); row=cur.fetchone()
             if not row:return jsonify({"error":"There is no saved section to regenerate."}),404
-            title=row[0]; page_budget = _chapter_page_budget(config, title, sections); budget_note = (f"\nTHIS CHAPTER'S SHARE OF THE MAIN-BODY PAGE TARGET: approximately {page_budget['pages']} A4 pages and about {page_budget['words']} words. This is chapter {page_budget['chapter_index']} of {page_budget['chapter_count']}; the complete main body target is {page_budget['total_pages']} pages total. Preliminary pages and references are excluded.\n" if page_budget else ""); prompt=(f"Regenerate ONLY this existing section titled {title}. Do not repeat other chapters or preliminary pages. Apply every automatic Tempaper rule in the saved instructions, including chapter role, topic-weight page-depth target, varied heading/list pattern, and numbering. Preserve the section's position in the saved TOC.{budget_note}\n\n{prompt_text}\n\nTOC:\n{toc_text}\n\nSection: {title}")
-            content=remove_duplicate_sections(generate_with_groq(prompt))
+            title=row[0]
+            # Prefer client-sent content (includes figures the user just placed)
+            incoming = str(data.get("content") or "").strip()
+            source_content = incoming if incoming else (row[1] or "")
+
+            # Extract figure blocks so we can re-attach them after regeneration
+            figure_blocks = []
+            figure_notes = []
+            raw_html = source_content
+            if source_content.startswith(RICH_HTML_MARKER):
+                raw_html = source_content[len(RICH_HTML_MARKER):]
+            # Pull out each .tp-figure block
+            for m in re.finditer(r'<div class="tp-figure"[^>]*>.*?</div>\s*</div>', raw_html, flags=re.I|re.S):
+                block = m.group(0)
+                figure_blocks.append(block)
+                label_m = re.search(r'data-fig-label="([^"]+)"', block)
+                cap_m = re.search(r'class="fig-caption"[^>]*>(.*?)</span>', block, flags=re.I|re.S)
+                label = label_m.group(1) if label_m else "Figure"
+                caption = re.sub(r'<[^>]+>', '', cap_m.group(1)).strip() if cap_m else ""
+                caption = re.sub(r'^Fig\.?\s*\d+\.\d+\s*:?\s*', '', caption, flags=re.I).strip()
+                figure_notes.append(f"- {label}" + (f": {caption}" if caption else ""))
+
+            page_budget = _chapter_page_budget(config, title, sections)
+            budget_note = (f"\nTHIS CHAPTER'S SHARE OF THE MAIN-BODY PAGE TARGET: approximately {page_budget['pages']} A4 pages and about {page_budget['words']} words. This is chapter {page_budget['chapter_index']} of {page_budget['chapter_count']}; the complete main body target is {page_budget['total_pages']} pages total. Preliminary pages and references are excluded.\n" if page_budget else "")
+
+            fig_instruction = ""
+            if figure_notes:
+                fig_instruction = (
+                    "\n\nTHIS SECTION ALREADY CONTAINS THE FOLLOWING FIGURES (do not invent others):\n"
+                    + "\n".join(figure_notes)
+                    + "\nIn the regenerated text you MUST refer to each figure at least once in a natural academic way "
+                    "(e.g. 'As illustrated in Fig. 3.1 …', 'Fig. 3.1 shows …'). "
+                    "Place the reference near the subsection the figure illustrates. "
+                    "Do NOT output HTML or image tags — only the academic text. "
+                    "The figures will be re-attached after generation.\n"
+                )
+
+            prompt=(
+                f"Regenerate ONLY this existing section titled {title}. Do not repeat other chapters or preliminary pages. "
+                "Apply every automatic Tempaper rule in the saved instructions, including chapter role, topic-weight page-depth target, "
+                f"varied heading/list pattern, and numbering. Preserve the section's position in the saved TOC.{budget_note}{fig_instruction}\n\n"
+                f"{prompt_text}\n\nTOC:\n{toc_text}\n\nSection: {title}"
+            )
+            text_body = remove_duplicate_sections(generate_with_groq(prompt))
+
+            # Re-attach figures as rich HTML so they persist
+            if figure_blocks:
+                body_html = content_rich_html(text_body)
+                # Append figures (user can still move them after re-render)
+                combined = RICH_HTML_MARKER + body_html + "".join(figure_blocks)
+                saved = combined
+            else:
+                saved = text_body
+
+            plain = content_plain_text(saved)
             with conn.cursor() as cur:
-                cur.execute("UPDATE paper_sections SET content_text=%s,word_count=%s,updated_at=CURRENT_TIMESTAMP WHERE project_id=%s AND order_no=%s",(content,len(content.split()),int(pid),order_no))
-                cur.execute("UPDATE paper_tocs SET updated_at=CURRENT_TIMESTAMP WHERE toc_code=%s",(tc,))
-            conn.commit(); return jsonify({"message":"Section regenerated without adding a duplicate.","title":title,"result":content,"order_no":order_no}),200
+                cur.execute(
+                    "UPDATE paper_sections SET content_text=%s,word_count=%s,updated_at=CURRENT_TIMESTAMP WHERE project_id=%s AND order_no=%s",
+                    (saved, len(plain.split()), int(pid), order_no),
+                )
+                cur.execute("UPDATE paper_tocs SET updated_at=CURRENT_TIMESTAMP WHERE toc_code=%s", (tc,))
+            conn.commit()
+            return jsonify({
+                "message": "Section regenerated. Existing figures were kept and the text now refers to them." if figure_blocks
+                           else "Section regenerated without adding a duplicate.",
+                "title": title,
+                "result": saved,
+                "order_no": order_no,
+            }), 200
+
         next_index=int(current_index)+1
         if next_index>len(sections): return jsonify({"message":"All sections in the saved table of contents have been generated.","done":True}),200
         item=sections[next_index-1]; title=str(item.get("title") or f"Section {next_index}"); key=str(item.get("key") or f"section-{next_index}")
