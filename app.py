@@ -595,7 +595,18 @@ Simple lists use plain 1, 2, 3 numbering, not bold. Nested lists use bold A. and
 COVER PAGE: include the topic in a prominent centered bold heading and all available metadata below. For every missing item, print a clear blank line such as ____________________, never invent personal/institution/course details.
 PRELIMINARY PAGES: arrange each page heading centered and bold; body paragraphs justified. Use conventional academic order where appropriate: cover/title page, certification/approval, declaration, dedication, acknowledgements, abstract, table of contents, list of tables/figures/abbreviations if relevant. Cover page has no visible page number; preliminary pages use lower-case Roman numerals; main chapters use Arabic numerals. Keep preliminary headings centered and bold, and body paragraphs justified.
 TABLE OF CONTENTS: include preliminary items, every chapter and its subheadings, conclusion/recommendations, references and appendices when relevant. Do not invent page numbers in generated prose. The app will recalculate TOC page numbers from the current rendered/paginated document after each Pull Next or edit/regeneration; preserve TOC entry wording and update matching page values rather than creating a new TOC code.
-ACADEMIC QUALITY: formal clear language, meaningful transitions, topic-specific discussion, credible sources and consistent citations. Do not fabricate sources, quotations, data, or claims. Each next pull must follow this full rule set plus the saved TOC and current chapter's role.'''
+ACADEMIC QUALITY: formal clear language, meaningful transitions, topic-specific discussion, credible sources and consistent citations. Do not fabricate sources, quotations, data, or claims. Each next pull must follow this full rule set plus the saved TOC and current chapter's role.
+
+DOCUMENT QUALITY (ALWAYS):
+Write like a professional Word term-paper, not a chatbot.
+- Only section body. No AI voice, prefaces, or meta instructions.
+- Zero repetition of ideas, sentences, paragraphs, or figure labels.
+- Numbered lists under a heading must be 1, 2, 3… in order (never every item as 1.).
+- Headings use ## / ### with exact TOC numbers; do not echo the heading in the first body sentence.
+- Bold key terms on first use with **term**. Sparse italics only when needed.
+- Equations as plain readable lines (K = 1/2 m v^2). Never LaTeX (frac, text, math delimiters, etc.).
+- Figure references once, natural: "As shown in Fig. 2.1, …" — never "Fig. 2.1 Fig. 2.1".
+- No invented citations, HTML, or code fences.'''
     prompt_text=(f"Term-paper topic: {title}\nTarget main-body length: {config['pages']} A4 pages from Chapter One through the final chapter; preliminary pages and references are additional.\nRequired chapters: {config['chapters']}.\n"
         f"Cover-page details (leave a blank line for any missing value):\n{cover_lines}\n"
         f"Body font: {config['body_font_size']} pt; Heading 1: {config['heading1_size']} pt ({'bold' if config.get('heading1_bold',True) else 'regular'}); "
@@ -911,6 +922,10 @@ def pull_next():
                         "Do NOT output HTML or image tags — only academic text. Figures are re-attached by the system after generation.\n"
                     )
                 prompt=(
+                    "DOCUMENT QUALITY CONTRACT (mandatory): Output only formal section text. "
+                    "No AI voice. No repetition of any kind. Sequential list numbering (1, 2, 3...). "
+                    "Plain readable equations only (never LaTeX). Headings as ## / ### with TOC numbers. "
+                    "Bold key terms with **...**. Write like a professional Word document for academic submission.\n\n"
                     f"Regenerate ONLY this existing section titled {title}. Do not repeat other chapters or preliminary pages. "
                     "Apply every automatic Tempaper rule in the saved instructions, including chapter role, topic-weight page-depth target, "
                     f"varied heading/list pattern, and numbering. Preserve the section's position in the saved TOC.{budget_note}{fig_instruction}\n\n"
@@ -966,8 +981,21 @@ def pull_next():
             chapter_role = "middle chapter"
         page_budget = _chapter_page_budget(config, title, sections)
         budget_note = (f"THIS CHAPTER'S SHARE OF THE MAIN-BODY PAGE TARGET: approximately {page_budget['pages']} A4 pages and about {page_budget['words']} words. This is chapter {page_budget['chapter_index']} of {page_budget['chapter_count']}; across all chapters, aim for {page_budget['total_pages']} A4 pages total from Chapter One to the final chapter. Cover and preliminary pages, references, and appendices are additional and do not count toward that total. Aim for roughly 280–320 words per rendered body page; use the supplied word target as a guide, not filler.\n" if page_budget else "This is supplementary material and does not count toward the requested main-body page total.\n")
-        prompt=(f"Write ONLY the next section titled exactly: {title}. Do not write any other chapter or repeat content already generated. Apply ALL automatic Tempaper rules in the saved prompt. Current role: {chapter_role}. {budget_note}Use the saved TOC as the authoritative heading checklist: include every relevant subsection for this chapter in the exact order and preserve its wording. Finish each subsection before starting the next. Identify whether each subsection needs explanation, list, example, comparison, calculation/solution, or a combination. When a list is introduced as types, factors, causes, reasons, characteristics, elements, functions, advantages/disadvantages, stages, or methods that need discussion, explain EACH item under that same subsection; do not leave label-only items. Do not force extra prose into direct-answer/calculation sections or simple objective lists. Use numbered bold subheadings, appropriate plain numbered lists and at most one nested A/B list when required by the chapter pattern. Keep the chapter substantive; do not pad with repetition. Use academic tone and credible citations. Do not add a new TOC or fabricate page numbers.\n\n"
-                f"Original saved instructions (mandatory on every pull):\n{prompt_text}\n\nSaved table of contents:\n{toc_text}\n\nSection {next_index} of {len(sections)}. Write this section only.")
+        prompt=(
+            "DOCUMENT QUALITY CONTRACT (mandatory): Output only formal section text. "
+            "No AI voice. No repetition of any kind. Sequential list numbering (1, 2, 3...). "
+            "Plain readable equations only (never LaTeX). Headings as ## / ### with TOC numbers. "
+            "Bold key terms with **...**. Write like a professional Word document for academic submission.\n\n"
+            f"Write ONLY the next section titled exactly: {title}. Do not write any other chapter or repeat content already generated. "
+            f"Apply ALL automatic Tempaper rules in the saved prompt. Current role: {chapter_role}. {budget_note}"
+            "Use the saved TOC as the authoritative heading checklist: include every relevant subsection for this chapter in the exact order and preserve its wording. "
+            "Finish each subsection before starting the next. Identify whether each subsection needs explanation, list, example, comparison, calculation/solution, or a combination. "
+            "When a list is introduced as types, factors, causes, reasons, characteristics, elements, functions, advantages/disadvantages, stages, or methods that need discussion, explain EACH item under that same subsection; do not leave label-only items. "
+            "Do not force extra prose into direct-answer/calculation sections or simple objective lists. "
+            "Use numbered bold subheadings, appropriate plain numbered lists and at most one nested A/B list when required by the chapter pattern. "
+            "Keep the chapter substantive; do not pad with repetition. Use academic tone and credible citations. Do not add a new TOC or fabricate page numbers.\n\n"
+            f"Original saved instructions (mandatory on every pull):\n{prompt_text}\n\nSaved table of contents:\n{toc_text}\n\nSection {next_index} of {len(sections)}. Write this section only."
+        )
         research,sources=search_tavily(f"{prompt_text}\nSection: {title}")
         content=remove_duplicate_sections(generate_with_groq(prompt,research))
         # Only pay for a second model call when local checks identify likely omissions.
@@ -1301,23 +1329,38 @@ def generate_with_groq(prompt, context_text=""):
             {
                 "role": "system",
                 "content": (
-                    "You are Tempaper, an expert academic writing assistant. "
-                    "Write a clear, well-structured academic paper based on the user's request. "
-                    "Use a professional academic tone, strong thesis development, coherent structure, "
-                    "and grounded reasoning. Avoid repeating headings, paragraphs, sections, or references. "
-                    "Keep each section unique and concise, with smooth transitions."
+                    "You are Tempaper, a professional academic document writer. "
+                    "Every output must look like a formal Microsoft Word term paper chapter — not a chatbot reply.\n\n"
+                    "ABSOLUTE OUTPUT RULES:\n"
+                    "1. Return ONLY the section body. Zero prefaces, zero meta text, zero AI voice "
+                    "(ban: As an AI, Here is, Certainly, Hope this helps, In this response, I will now, Below is).\n"
+                    "2. ZERO repetition of any kind: no repeated ideas, sentences, paragraphs, conclusions, or figure labels.\n"
+                    "3. Human formal academic English. Concrete claims. Varied sentence length. Not robotic.\n"
+                    "4. NUMBERING: under any heading, numbered items must run 1, 2, 3… in order. "
+                    "Never label every item as 1. Objectives and research questions must be sequential.\n"
+                    "5. Headings: markdown ## / ### with exact TOC numbers (example: ## 2.3 Energy and Momentum). "
+                    "Do not repeat the heading wording in the first sentence of the body.\n"
+                    "6. Bold key terms on first use only with **term**. Sparse *italics* only when needed.\n"
+                    "7. Equations on their own line in plain readable form (K = 1/2 m v^2 or KE = ½mv²). "
+                    "NEVER LaTeX: no \\frac \\text \\( \\) \\[ \\] \\omega \\tfrac \\cdot etc.\n"
+                    "8. Figures: at most one or two natural references using the exact label once "
+                    "(As shown in Fig. 2.1, …). Never 'Fig. 2.1 Fig. 2.1'.\n"
+                    "9. Do not invent citations, data, authors, or years. No HTML. No code fences.\n"
+                    "10. Write as a careful student or supervisor preparing a formal dissertation — "
+                    "professional, print-ready, Word-document quality."
                 ),
             },
             {"role": "user", "content": final_prompt},
         ],
-        temperature=0.7,
+        temperature=0.55,
         max_tokens=8192,
         top_p=0.9,
     )
     text = response.choices[0].message.content
     if not text or not text.strip():
         raise RuntimeError("Empty Groq response")
-    return text.strip()
+    # Always post-process: strip LaTeX, fix 1./1./1. lists, collapse duplicate Fig labels
+    return normalize_server_text(text.strip())
 
 
 def normalize_server_text(text: str) -> str:
@@ -1325,6 +1368,19 @@ def normalize_server_text(text: str) -> str:
         return text
     text = text.replace("\u200b", "").replace("\ufeff", "")
     text = re.sub(r"(\w+)-\s*\n\s*(\w+)", r"\1\2", text)
+    # Strip common LaTeX math delimiters / commands so the paper stays Word-like
+    text = re.sub(r"\\\[|\\\]|\\\(|\\\)", "", text)
+    text = re.sub(r"\\(?:frac|tfrac|dfrac)\{([^}]*)\}\{([^}]*)\}", r"(\1)/(\2)", text)
+    text = re.sub(r"\\(?:text|mathrm|mathbf|textit|textbf)\{([^}]*)\}", r"\1", text)
+    text = re.sub(r"\\(?:omega|alpha|beta|gamma|theta|phi|pi|mu|sigma|Delta|delta)\b", lambda m: {
+        "omega": "ω", "alpha": "α", "beta": "β", "gamma": "γ", "theta": "θ",
+        "phi": "φ", "pi": "π", "mu": "μ", "sigma": "σ", "Delta": "Δ", "delta": "δ",
+    }.get(m.group(0)[1:], m.group(0)), text)
+    text = text.replace("\\cdot", "·").replace("\\times", "×").replace("\\pm", "±")
+    text = re.sub(r"\^{([^{}]+)}", r"^\1", text)
+    text = re.sub(r"_{([^{}]+)}", r"_\1", text)
+    text = re.sub(r"\\+", "", text)  # leftover backslash commands
+    # Headings that were bold-only lines → markdown h3
     text = re.sub(
         r"^\s*\*\*\s*(\d+(?:\.\d+)*\s*[^\*]+?)\s*\*\*\s*$",
         r"### \1",
@@ -1332,6 +1388,38 @@ def normalize_server_text(text: str) -> str:
         flags=re.MULTILINE,
     )
     text = re.sub(r"^\s*\*\*\s*(.+?)\s*\*\*\s*$", r"### \1", text, flags=re.MULTILINE)
+    # Collapse repeated figure labels: "Fig. 2.1 Fig. 2.1" → "Fig. 2.1"
+    text = re.sub(
+        r"\b((?:Fig\.?|Figure)\s*\d+(?:\.\d+)*)\s+\1\b",
+        r"\1",
+        text,
+        flags=re.I,
+    )
+    # Fix lists where every item was wrongly numbered "1." → sequential 1,2,3…
+    lines = text.splitlines()
+    fixed_lines = []
+    idx = 0
+    while idx < len(lines):
+        m = re.match(r"^(\s*)1[.)]\s+(.+)$", lines[idx])
+        if m:
+            indent, body = m.group(1), m.group(2)
+            block = [(indent, body)]
+            jdx = idx + 1
+            while jdx < len(lines):
+                m2 = re.match(r"^(\s*)1[.)]\s+(.+)$", lines[jdx])
+                if m2 and m2.group(1) == indent:
+                    block.append((m2.group(1), m2.group(2)))
+                    jdx += 1
+                else:
+                    break
+            if len(block) >= 2:
+                for n, (ind, b) in enumerate(block, 1):
+                    fixed_lines.append(f"{ind}{n}. {b}")
+                idx = jdx
+                continue
+        fixed_lines.append(lines[idx])
+        idx += 1
+    text = "\n".join(fixed_lines)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
