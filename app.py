@@ -790,6 +790,9 @@ def pull_next():
                             "title":row[0],"result":saved,"order_no":order_no,"inline_applied":inline_enabled,"merged":merged}),200
         if action=="resend":
             order_no=int(data.get("order_no",current_index))
+            resend_mode=str(data.get("mode") or data.get("resend_mode") or "full").strip().lower()
+            if resend_mode not in {"full", "local"}:
+                resend_mode = "full"
             with conn.cursor() as cur:
                 cur.execute("SELECT section_title,content_text FROM paper_sections WHERE project_id=%s AND order_no=%s",(int(pid),order_no)); row=cur.fetchone()
             if not row:return jsonify({"error":"There is no saved section to regenerate."}),404
