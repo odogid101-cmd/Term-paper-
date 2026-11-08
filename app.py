@@ -894,7 +894,7 @@ def pull_next():
                 # Prefer keeping figures near user placement anchors when possible
                 combined_html = _place_figures_in_html(body_html, figure_blocks)
                 saved = RICH_HTML_MARKER + combined_html
-                msg_ok = "Updated text near matching figures only. Unrelated parts of the chapter were left unchanged."
+                msg_ok = "Updated only text near figures whose captions match a heading or paragraph. Unrelated parts were left unchanged."
             else:
                 # Full chapter regeneration (original behaviour)
                 fig_instruction = ""
@@ -924,8 +924,9 @@ def pull_next():
                 else:
                     saved = text_body
                 msg_ok = (
-                    "Section regenerated. Existing figures were kept and the text now refers to them."
-                    if figure_blocks else "Section regenerated without adding a duplicate."
+                    "Full chapter rewritten. Figures were kept and referenced where the text matched."
+                    if figure_blocks
+                    else "Full chapter rewritten. No figures were in this section, so none were re-attached."
                 )
             plain = content_plain_text(saved)
             with conn.cursor() as cur:
