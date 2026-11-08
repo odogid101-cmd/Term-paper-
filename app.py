@@ -666,6 +666,8 @@ def paper_start():
                 cur.execute("SELECT order_no,section_title,content_text FROM paper_sections WHERE project_id=%s ORDER BY order_no",(project[0],)); rows=cur.fetchall()
             return jsonify({"message":"Resumed your saved paper.","project_id":project[0],"current_index":project[1],
                             "merged":bool(project[2]),"merged_content":project[3] or "",
+                            "title": pr[1] if pr else "",
+                            "prompt_code": pc, "toc_code": tc,
                             "sections":[{"order_no":r[0],"title":r[1],"content":r[2]} for r in rows]}),200
         _,title,config,prompt_text=pr; _,_,toc_text,sections,_=toc
         research,sources=search_tavily(prompt_text)
@@ -677,7 +679,8 @@ def paper_start():
             cur.execute("INSERT INTO paper_sections (project_id,order_no,section_key,section_title,content_text,word_count) VALUES (%s,0,'preliminary','Preliminary Pages and Table of Contents',%s,%s)",(pid,prelim,len(prelim.split())))
         conn.commit()
         return jsonify({"message":"Preliminary pages created. Chapter One has not been generated yet.","project_id":pid,"current_index":0,
-                        "result":prelim,"toc":toc_text,"toc_code":tc,"sources":sources,"word_count":len(prelim.split()),
+                        "result":prelim,"toc":toc_text,"toc_code":tc,"title":title,"prompt_code":pc,
+                        "sources":sources,"word_count":len(prelim.split()),
                         "page_count":max(1,(len(prelim.split())+249)//250)}),201
     except Exception as e:
         if conn: conn.rollback()
@@ -866,11 +869,13 @@ def pull_next():
                 fig_instruction = (
                     "\n\nTHIS SECTION ALREADY CONTAINS THE FOLLOWING FIGURES (do not invent others):\n"
                     + "\n".join(figure_notes)
-                    + "\nIn the regenerated text you MUST refer to each figure at least once in a natural academic way "
-                    "(e.g. 'As illustrated in Fig. 3.1 …', 'Fig. 3.1 shows …'). "
-                    "Place the reference near the subsection the figure illustrates. "
-                    "Do NOT output HTML or image tags — only the academic text. "
-                    "The figures will be re-attached after generation.\n"
+                    + "\nFor EACH figure above you MUST:\n"
+                    "1. Discuss the idea named in its caption in the most relevant subsection.\n"
+                    "2. Refer to the figure by its exact label at least once in a natural academic sentence "
+                    "(e.g. 'As illustrated in Fig. 2.1, …' or 'Fig. 2.1 shows …').\n"
+                    "3. Put that reference in the same subsection the caption relates to — not only in a summary at the end.\n"
+                    "Write 1–2 clear sentences around each reference so the figure is explained in context.\n"
+                    "Do NOT output HTML or image tags — only academic text. Figures are re-attached by the system after generation.\n"
                 )
 
             prompt=(
@@ -881,12 +886,11 @@ def pull_next():
             )
             text_body = remove_duplicate_sections(generate_with_groq(prompt))
 
-            # Re-attach figures as rich HTML so they persist
+            # Re-attach figures near their textual references (not always at the end)
             if figure_blocks:
                 body_html = content_rich_html(text_body)
-                # Append figures (user can still move them after re-render)
-                combined = RICH_HTML_MARKER + body_html + "".join(figure_blocks)
-                saved = combined
+                combined_html = _place_figures_in_html(body_html, figure_blocks)
+                saved = RICH_HTML_MARKER + combined_html
             else:
                 saved = text_body
 
@@ -1160,6 +1164,98 @@ def search_tavily(query):
     return "", []
 
 
+
+def _figure_meta(block):
+    """Extract label, caption, width from a tp-figure HTML block."""
+    label_m = re.search(r'data-fig-label="([^"]+)"', block, flags=re.I)
+    cap_m = re.search(r'class="fig-caption"[^>]*>(.*?)</(?:span|div)>', block, flags=re.I|re.S)
+    width_m = re.search(r'data-fig-width="(\d+)"', block, flags=re.I)
+    label = (label_m.group(1) if label_m else "Figure").strip()
+    caption = ""
+    if cap_m:
+        caption = re.sub(r"<[^>]+>", "", cap_m.group(1)).strip()
+        caption = re.sub(r"^Fig\.?\s*[\d.]+\s*:?\s*", "", caption, flags=re.I).strip()
+    # Ensure width style from data-fig-width
+    if width_m:
+        w = width_m.group(1)
+        if re.search(r'style="', block, flags=re.I):
+            if re.search(r'width\s*:', block, flags=re.I):
+                block = re.sub(r'width\s*:\s*[^;"]+', f'width: {w}%', block, count=1, flags=re.I)
+            else:
+                block = re.sub(r'style="', f'style="width: {w}%; ', block, count=1, flags=re.I)
+        else:
+            block = block.replace('class="tp-figure"', f'class="tp-figure" style="width: {w}%; max-width: 100%; margin-left: auto; margin-right: auto"', 1)
+    return label, caption, block
+
+
+def _place_figures_in_html(body_html, figure_blocks):
+    """Insert each figure after the paragraph that first refers to it (by label or caption keywords).
+
+    Falls back to appending at the end only when no sensible anchor is found.
+    User can still move/resize/delete afterward.
+    """
+    if not figure_blocks:
+        return body_html
+    html = body_html or ""
+    placed = []
+    remaining = []
+
+    # Split into coarse blocks ending with closing tags that form natural insert points
+    # Work on the full HTML string with search for reference patterns.
+    for raw_block in figure_blocks:
+        label, caption, block = _figure_meta(raw_block)
+        # Build search patterns for this figure
+        patterns = []
+        # Fig. 2.1 / Figure 2.1 / Fig 2.1
+        lab = re.escape(label)
+        patterns.append(re.compile(rf"(?:{lab}|{lab.replace(r'\.', r'\\.?')})", re.I))
+        # bare number form e.g. 2.1 from "Fig. 2.1"
+        num_m = re.search(r"(\d+\.\d+)", label)
+        if num_m:
+            n = re.escape(num_m.group(1))
+            patterns.append(re.compile(rf"(?:Fig\.?|Figure)\s*{n}", re.I))
+        # caption keywords (significant words)
+        if caption:
+            words = [w for w in re.findall(r"[A-Za-z][A-Za-z\-]{3,}", caption) if w.lower() not in {
+                "that", "this", "with", "from", "into", "using", "based", "show", "shows", "figure", "image"
+            }]
+            if words:
+                # prefer longer distinctive tokens
+                words = sorted(set(words), key=len, reverse=True)[:4]
+                for w in words:
+                    patterns.append(re.compile(re.escape(w), re.I))
+
+        insert_at = None
+        for pat in patterns:
+            m = pat.search(html)
+            if not m:
+                continue
+            # Find end of the containing block element after the match
+            tail = html[m.end():]
+            # Prefer closing </p>, </li>, or next heading
+            close_m = re.search(r"</(?:p|li|blockquote)>", tail, flags=re.I)
+            if close_m:
+                insert_at = m.end() + close_m.end()
+                break
+            # Otherwise insert right after the match sentence (next period + space or tag)
+            sent = re.search(r"[\.\!\?](?:\s|<)", tail)
+            if sent:
+                insert_at = m.end() + sent.end() - (1 if sent.group(0).endswith("<") else 0)
+                break
+            insert_at = m.end()
+            break
+
+        if insert_at is None:
+            remaining.append(block)
+        else:
+            html = html[:insert_at] + block + html[insert_at:]
+            placed.append(label)
+
+    if remaining:
+        html = html + "".join(remaining)
+    return html
+
+
 def generate_with_groq(prompt, context_text=""):
     if not groq_client:
         raise RuntimeError("GROQ_API_KEY missing - get free key at console.groq.com")
@@ -1316,6 +1412,57 @@ def _repair_incomplete_chapter(content: str, title: str, prompt_text: str, toc_t
 
 
 # --- ROUTES (original term-paper logic preserved) ---
+
+@app.route("/workflow-projects", methods=["GET"])
+def workflow_projects():
+    """List staged term-paper projects for Recent Papers. Display title is the topic."""
+    uid = request.args.get("user_id")
+    if not uid or not str(uid).isdigit():
+        return jsonify({"projects": []}), 200
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT p.id, p.prompt_code, p.toc_code, p.current_index, p.merged, p.updated_at,
+                       pr.title, t.sections_json
+                FROM paper_projects p
+                JOIN paper_prompts pr ON pr.prompt_code = p.prompt_code
+                JOIN paper_tocs t ON t.toc_code = p.toc_code
+                WHERE p.user_id = %s
+                ORDER BY p.updated_at DESC NULLS LAST, p.id DESC
+                LIMIT 40
+                """,
+                (int(uid),),
+            )
+            rows = cur.fetchall()
+        projects = []
+        for r in rows:
+            sections = r[7] or []
+            try:
+                n_sections = len(sections) if isinstance(sections, list) else 0
+            except Exception:
+                n_sections = 0
+            projects.append({
+                "project_id": r[0],
+                "prompt_code": r[1],
+                "toc_code": r[2],
+                "current_index": r[3],
+                "merged": bool(r[4]),
+                "updated_at": r[5].isoformat() if r[5] else None,
+                "title": r[6] or "Untitled paper",
+                "section_count": n_sections,
+            })
+        return jsonify({"projects": projects}), 200
+    except Exception as e:
+        logger.exception("workflow-projects failed")
+        return jsonify({"projects": [], "error": str(e)[:200]}), 200
+    finally:
+        if conn:
+            release_db(conn)
+
+
 @app.route("/", methods=["GET", "HEAD"])
 def health_check():
     return jsonify({"status": "ok", "message": f"Monkey Scout API running - Groq {GROQ_MODEL}"}), 200
