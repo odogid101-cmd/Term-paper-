@@ -864,36 +864,66 @@ def pull_next():
             page_budget = _chapter_page_budget(config, title, sections)
             budget_note = (f"\nTHIS CHAPTER'S SHARE OF THE MAIN-BODY PAGE TARGET: approximately {page_budget['pages']} A4 pages and about {page_budget['words']} words. This is chapter {page_budget['chapter_index']} of {page_budget['chapter_count']}; the complete main body target is {page_budget['total_pages']} pages total. Preliminary pages and references are excluded.\n" if page_budget else "")
 
-            fig_instruction = ""
-            if figure_notes:
-                fig_instruction = (
-                    "\n\nTHIS SECTION ALREADY CONTAINS THE FOLLOWING FIGURES (do not invent others):\n"
-                    + "\n".join(figure_notes)
-                    + "\nFor EACH figure above you MUST:\n"
-                    "1. Discuss the idea named in its caption in the most relevant subsection.\n"
-                    "2. Refer to the figure by its exact label at least once in a natural academic sentence "
-                    "(e.g. 'As illustrated in Fig. 2.1, …' or 'Fig. 2.1 shows …').\n"
-                    "3. Put that reference in the same subsection the caption relates to — not only in a summary at the end.\n"
-                    "Write 1–2 clear sentences around each reference so the figure is explained in context.\n"
-                    "Do NOT output HTML or image tags — only academic text. Figures are re-attached by the system after generation.\n"
+            if resend_mode == "local":
+                # Surgical update: only touch text near figures when caption matches context
+                if not figure_blocks:
+                    return jsonify({"error": "Add at least one image before using Update near image."}), 400
+                existing_plain = content_plain_text(source_content)
+                local_prompt = (
+                    "You are editing ONE academic chapter. Your job is SURGICAL — do not rewrite the whole chapter.\n"
+                    f"Section title: {title}\n\n"
+                    "FIGURES THE USER PLACED (do not invent others):\n"
+                    + "\n".join(figure_notes) + "\n\n"
+                    "RULES:\n"
+                    "1. Read each figure caption. Find the heading or paragraph that already discusses that topic.\n"
+                    "2. If a matching heading/paragraph exists, add at most 1–2 natural academic sentences that refer to the figure "
+                    "by its exact label (e.g. 'As shown in Fig. 4.3, …'). Keep the rest of that subsection unchanged.\n"
+                    "3. If NO heading or paragraph relates to the caption, leave that part of the chapter untouched — "
+                    "do not invent a forced discussion just to mention the figure.\n"
+                    "4. Do not renumber headings, do not move sections, do not expand unrelated subsections, "
+                    "and do not remove existing correct content.\n"
+                    "5. Return the COMPLETE section text (all headings and paragraphs), with only the allowed local edits.\n"
+                    "6. Do NOT output HTML or image tags.\n\n"
+                    f"Current section text:\n{existing_plain}"
                 )
-
-            prompt=(
-                f"Regenerate ONLY this existing section titled {title}. Do not repeat other chapters or preliminary pages. "
-                "Apply every automatic Tempaper rule in the saved instructions, including chapter role, topic-weight page-depth target, "
-                f"varied heading/list pattern, and numbering. Preserve the section's position in the saved TOC.{budget_note}{fig_instruction}\n\n"
-                f"{prompt_text}\n\nTOC:\n{toc_text}\n\nSection: {title}"
-            )
-            text_body = remove_duplicate_sections(generate_with_groq(prompt))
-
-            # Re-attach figures near their textual references (not always at the end)
-            if figure_blocks:
+                text_body = remove_duplicate_sections(generate_with_groq(local_prompt))
                 body_html = content_rich_html(text_body)
+                # Prefer keeping figures near user placement anchors when possible
                 combined_html = _place_figures_in_html(body_html, figure_blocks)
                 saved = RICH_HTML_MARKER + combined_html
+                msg_ok = "Updated text near matching figures only. Unrelated parts of the chapter were left unchanged."
             else:
-                saved = text_body
-
+                # Full chapter regeneration (original behaviour)
+                fig_instruction = ""
+                if figure_notes:
+                    fig_instruction = (
+                        "\n\nTHIS SECTION ALREADY CONTAINS THE FOLLOWING FIGURES (do not invent others):\n"
+                        + "\n".join(figure_notes)
+                        + "\nFor EACH figure above you MUST:\n"
+                        "1. Discuss the idea named in its caption in the most relevant subsection.\n"
+                        "2. Refer to the figure by its exact label at least once in a natural academic sentence "
+                        "(e.g. 'As illustrated in Fig. 2.1, …' or 'Fig. 2.1 shows …').\n"
+                        "3. Put that reference in the same subsection the caption relates to — not only in a summary at the end.\n"
+                        "Write 1–2 clear sentences around each reference so the figure is explained in context.\n"
+                        "Do NOT output HTML or image tags — only academic text. Figures are re-attached by the system after generation.\n"
+                    )
+                prompt=(
+                    f"Regenerate ONLY this existing section titled {title}. Do not repeat other chapters or preliminary pages. "
+                    "Apply every automatic Tempaper rule in the saved instructions, including chapter role, topic-weight page-depth target, "
+                    f"varied heading/list pattern, and numbering. Preserve the section's position in the saved TOC.{budget_note}{fig_instruction}\n\n"
+                    f"{prompt_text}\n\nTOC:\n{toc_text}\n\nSection: {title}"
+                )
+                text_body = remove_duplicate_sections(generate_with_groq(prompt))
+                if figure_blocks:
+                    body_html = content_rich_html(text_body)
+                    combined_html = _place_figures_in_html(body_html, figure_blocks)
+                    saved = RICH_HTML_MARKER + combined_html
+                else:
+                    saved = text_body
+                msg_ok = (
+                    "Section regenerated. Existing figures were kept and the text now refers to them."
+                    if figure_blocks else "Section regenerated without adding a duplicate."
+                )
             plain = content_plain_text(saved)
             with conn.cursor() as cur:
                 cur.execute(
@@ -903,11 +933,11 @@ def pull_next():
                 cur.execute("UPDATE paper_tocs SET updated_at=CURRENT_TIMESTAMP WHERE toc_code=%s", (tc,))
             conn.commit()
             return jsonify({
-                "message": "Section regenerated. Existing figures were kept and the text now refers to them." if figure_blocks
-                           else "Section regenerated without adding a duplicate.",
+                "message": msg_ok,
                 "title": title,
                 "result": saved,
                 "order_no": order_no,
+                "mode": resend_mode,
             }), 200
 
         next_index=int(current_index)+1
