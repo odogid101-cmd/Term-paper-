@@ -8,7 +8,7 @@ import functools
 import difflib
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
-from html import escape as html_escape
+from html import escape as html_escape, unescape as html_unescape
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -247,7 +247,7 @@ _ALLOWED_RICH_TAGS = {
     "img", "figure", "figcaption"
 }
 # Extra attrs kept for Monkey Scout figures (move/resize/caption persistence)
-_FIGURE_DATA_ATTRS = {"data-fig-label", "data-fig-url", "data-fig-caption", "data-bound"}
+_FIGURE_DATA_ATTRS = {"data-fig-id", "data-fig-label", "data-fig-url", "data-fig-caption", "data-bound"}
 _VOID_RICH_TAGS = {"br", "img"}
 _ALLOWED_STYLE_PROPS = {
     "font-family", "font-size", "color", "background-color", "text-align",
@@ -522,27 +522,179 @@ def _chapter_page_budget(config, title, sections):
     return {"pages": max(1, round(budget, 1)), "words": max(300, round(budget * 300)), "chapter_index": index + 1, "chapter_count": count, "total_pages": target_pages}
 
 
-def _section_items(toc_text, config):
-    headings = []
-    for line in (toc_text or "").splitlines():
-        line = re.sub(r"[*#`]", "", line).strip()
-        line = re.sub(r"\s+\.{2,}\s*[ivxlcdm\d]+\s*$", "", line, flags=re.I)
-        if not line or len(line) > 240: continue
-        low = line.lower()
-        if low in {"table of contents", "contents"}: continue
-        if re.match(r"^(chapter\s+[ivxlcdm\d]+|chapter\s+\w+|(?:\d+|[ivxlcdm]+)[.)]?\s+\w)", line, re.I) or any(
-            word in low for word in ("conclusion", "recommendation", "references", "bibliography", "appendix")):
-            if not any(h.lower() == line.lower() for h in headings): headings.append(line)
-    chapters = int(config.get("chapters") or 5)
-    if not any(re.search(r"chapter\s+one|chapter\s+i\b", h, re.I) for h in headings):
-        headings = [f"CHAPTER {n}" for n in range(1, chapters + 1)] + ["Conclusion", "References"]
-    final = []
-    for heading in headings:
-        low = heading.lower()
-        if any(x in low for x in ("certification", "dedication", "acknowledg", "abstract", "title page", "cover page")):
+_TOPIC_STOPWORDS = {"about", "above", "after", "against", "among", "an", "and", "are", "as", "at", "assessment", "based", "between", "by", "case", "comparative", "consideration", "effect", "effects", "for", "from", "impact", "in", "into", "investigation", "is", "of", "on", "study", "the", "through", "to", "towards", "under", "using", "with"}
+
+
+def _topic_alignment_terms(topic):
+    words = re.findall(r"[a-zA-Z][a-zA-Z0-9-]{2,}", str(topic or "").lower())
+    return list(dict.fromkeys(w for w in words if w not in _TOPIC_STOPWORDS))
+
+
+def _topic_alignment_issues(content, topic):
+    """Flag likely subject drift using distinctive words from the saved project topic."""
+    terms = _topic_alignment_terms(topic)
+    if len(terms) < 2:
+        return []
+    body = content_plain_text(content).lower()
+    # Ignore the chapter heading so it cannot satisfy the topic check by itself.
+    body = "\n".join(line for line in body.splitlines() if not re.match(r"^\s*(?:chapter\s+\w+|#{1,3}\s*\d+(?:\.\d+)*)", line, re.I))
+    matched = [term for term in terms if re.search(rf"\b{re.escape(term)}(?:s|es|ed|ing)?\b", body)]
+    required = min(2, len(terms))
+    return [] if len(matched) >= required else [f"Topic continuity check found only {len(matched)} of {required} required distinctive topic terms ({', '.join(terms)})."]
+
+
+def _chapter_number(label):
+    """Return a 1-based chapter number for Roman, word, or Arabic chapter labels."""
+    text = str(label or "").strip()
+    m = re.search(r"\bchapter\s+(xii|xi|x|ix|viii|vii|vi|v|iv|iii|ii|i|1[0-2]|[1-9]|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b", text, re.I)
+    if m:
+        token = m.group(1).lower()
+    else:
+        # Common academic TOC format: 1. Introduction, 2. Literature Review.
+        m = re.match(r"^\s*(1[0-2]|[1-9])[.)]?\s+\S", text)
+        if not m:
+            return None
+        return int(m.group(1))
+    words = {"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,"eight":8,"nine":9,"ten":10,"eleven":11,"twelve":12}
+    romans = {"i":1,"ii":2,"iii":3,"iv":4,"v":5,"vi":6,"vii":7,"viii":8,"ix":9,"x":10,"xi":11,"xii":12}
+    return int(token) if token.isdigit() else words.get(token, romans.get(token))
+
+
+def _normalize_separate_end_matter_toc(toc_text):
+    """Ensure Conclusion/Recommendations are standalone TOC entries, not 5.x subsections."""
+    output = []
+    moved = []
+    for raw in str(toc_text or "").splitlines():
+        line = raw.strip()
+        bare = re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s*", "", line).strip()
+        if re.match(r"^(conclusion|conclusions)\b", bare, re.I):
+            moved.append("Conclusion")
             continue
-        if not any(h.lower() == low for h in final): final.append(heading)
-    return [{"key": re.sub(r"[^a-z0-9]+", "-", h.lower()).strip("-")[:90], "title": h} for h in final]
+        if re.match(r"^recommendations?\b", bare, re.I):
+            moved.append("Recommendations")
+            continue
+        output.append(raw)
+    # Preserve only one standalone entry, in the agreed order, at the end of main matter.
+    if not any(x.lower() == "conclusion" for x in moved): moved.insert(0, "Conclusion")
+    for item in ("Conclusion", "Recommendations"):
+        if item in moved and not any(re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s*", "", x).strip().lower() == item.lower() for x in output):
+            output.append(item)
+    return "\n".join(output).strip()
+
+
+def _strip_separate_end_matter_from_final_chapter(content, chapter_title, config):
+    """Keep standalone Conclusion/Recommendations out of the final numbered chapter."""
+    number = _chapter_number(chapter_title)
+    try:
+        total = max(1, min(12, int((config or {}).get("chapters", 5))))
+    except (TypeError, ValueError):
+        total = 5
+    if number != total:
+        return content
+    lines = str(content or "").splitlines()
+    output = []
+    skipping = False
+    for line in lines:
+        plain = re.sub(r"^\s*#{1,4}\s*", "", line).strip()
+        plain = re.sub(r"^\s*\*\*|\*\*\s*$", "", plain).strip()
+        plain = re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s*", "", plain).strip()
+        is_end_heading = bool(re.fullmatch(r"(?:conclusions?|recommendations?|references?|bibliography|works cited|appendices?)", plain, re.I))
+        is_any_heading = bool(re.match(r"^\s*(?:#{1,4}\s+|\*\*.+\*\*\s*$|\d+(?:\.\d+)+[.)]?\s+)", line))
+        if is_end_heading:
+            skipping = True
+            continue
+        if skipping and is_any_heading:
+            skipping = False
+        if not skipping:
+            output.append(line)
+    return "\n".join(output).strip()
+
+
+def _chapter_toc_block(toc_text, chapter_title):
+    """Return only one chapter's TOC heading/subheadings for its generation prompt."""
+    target = _chapter_number(chapter_title)
+    if target is None:
+        wanted = str(chapter_title or "").strip().lower()
+        matches = []
+        for raw in str(toc_text or "").splitlines():
+            bare = re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s*", "", raw).strip().lower()
+            if bare == wanted or (wanted == "conclusion" and bare.startswith("conclusion")) or (wanted == "references" and re.match(r"^(references?|bibliography|works cited)\b", bare)):
+                matches.append(raw)
+        return "\n".join(matches) or str(chapter_title or "")
+    selected = []
+    active = False
+    for raw in str(toc_text or "").splitlines():
+        line = raw.strip()
+        number = _chapter_number(line)
+        if number is not None:
+            if active:
+                break
+            if number == target:
+                active = True
+                selected.append(raw)
+            continue
+        bare = re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s*", "", line).strip()
+        if active and re.match(r"^(conclusion|conclusions|recommendations?|references?|bibliography|works cited|appendices?)\b", bare, re.I):
+            break
+        if active:
+            selected.append(raw)
+    return "\n".join(selected).strip() or str(toc_text or "")
+
+
+def _section_items(toc_text, config):
+    """Create one generation unit per chapter plus separately generated end matter.
+
+    Decimal headings (1.1, 1.2, 2.1...) remain inside their parent chapter and are
+    supplied to the chapter prompt as its authoritative subsection checklist.
+    """
+    config = config or {}
+    requested = max(1, min(12, int(config.get("chapters", 5) or 5)))
+    raw_lines = [re.sub(r"[*#`]", "", line).strip() for line in (toc_text or "").splitlines()]
+    raw_lines = [re.sub(r"\s+(?:\.{2,}|…+)\s*[ivxlcdm\d]+\s*$", "", x, flags=re.I).strip() for x in raw_lines]
+    chapter_map = {}
+    end_items = []
+    for line in raw_lines:
+        if not line or len(line) > 240 or line.lower() in {"table of contents", "contents"}:
+            continue
+        number = _chapter_number(line)
+        if number and 1 <= number <= 12:
+            # Exclude numbered subsections (decimal notation) from chapter recognition.
+            if re.match(r"^\s*\d+\.\d+", line):
+                continue
+            clean = re.sub(r"^\s*(?:chapter\s+(?:xii|xi|x|ix|viii|vii|vi|v|iv|iii|ii|i|1[0-2]|[1-9]|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*[:.)-]?|(?:1[0-2]|[1-9])[.)]?\s*)", "", line, flags=re.I).strip()
+            # Preserve a useful title while making the numbering canonical.
+            title = f"Chapter {number}" + (f": {clean}" if clean and not re.fullmatch(r"chapter\s*\d+", clean, re.I) else "")
+            chapter_map.setdefault(number, title)
+            continue
+        bare = re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s*", "", line).strip()
+        low = bare.lower()
+        if re.match(r"^(conclusion|conclusions)\b", low):
+            if not any(x["title"].lower() == "conclusion" for x in end_items): end_items.append({"key":"conclusion","title":"Conclusion"})
+        elif re.match(r"^recommendations?\b", low):
+            if not any(x["title"].lower() == "recommendations" for x in end_items): end_items.append({"key":"recommendations","title":"Recommendations"})
+        elif re.match(r"^(references?|bibliography|works cited)\b", low):
+            if not any(x["title"].lower() == "references" for x in end_items): end_items.append({"key":"references","title":"References"})
+        elif re.match(r"^append(?:ix|ices)\b", low):
+            if not any(x["title"].lower() == "appendices" for x in end_items): end_items.append({"key":"appendices","title":"Appendices"})
+
+    if chapter_map:
+        # Keep only the requested count, but require a contiguous, ordered chapter sequence.
+        chapters = []
+        for n in range(1, requested + 1):
+            chapters.append(chapter_map.get(n, f"Chapter {n}"))
+    else:
+        chapters = [f"Chapter {n}" for n in range(1, requested + 1)]
+
+    # The user's selected default is a standalone conclusion after the final chapter.
+    if not any(x["title"].lower() == "conclusion" for x in end_items):
+        end_items.insert(0, {"key":"conclusion","title":"Conclusion"})
+    if not any(x["title"].lower() == "references" for x in end_items):
+        end_items.append({"key":"references","title":"References"})
+    final = [{"key":f"chapter-{i}","title":title} for i,title in enumerate(chapters,1)]
+    # Keep conventional end-matter ordering and prevent chapter conclusion becoming 5.6.
+    order = {"conclusion":0,"recommendations":1,"references":2,"appendices":3}
+    end_items.sort(key=lambda x: order.get(x["key"], 9))
+    return final + end_items
 
 
 @app.route("/prompt-builder", methods=["POST", "GET"])
@@ -568,6 +720,7 @@ def prompt_builder():
         config.update({
             "topic":title, "pages":max(1,min(500,int(config.get("pages",20)))),
             "chapters":max(1,min(12,int(config.get("chapters",5)))),
+            "conclusion_mode":"separate",
             "body_font_size":max(8,min(24,int(config.get("body_font_size",12)))),
             "heading1_size":max(8,min(36,int(config.get("heading1_size",14)))),
             "heading2_size":max(8,min(32,int(config.get("heading2_size",14)))),
@@ -588,7 +741,7 @@ def prompt_builder():
 PAGE-COUNT RULE (IMPORTANT): The requested page count in the prompt builder applies ONLY to the main body, starting at Chapter One and ending at the final chapter. Do NOT count the cover page, certification/approval, declaration, dedication, acknowledgements, abstract, table of contents, lists of tables/figures, references/bibliography, or appendices toward this requested number. Those pages are additional. Across all chapters combined, aim for the requested number of rendered A4 pages. Each chapter prompt will provide its own proportional page and word target; follow that target rather than applying a fixed minimum or an oversized page target to every chapter. As a rough drafting guide, aim for about 280–320 words per body page, adjusted naturally for headings, lists, tables, equations, and topic complexity. Do not claim an exact page count in the prose.
 CHAPTER 1 (opening/introduction/background): use the allocated page target; usually 2–3 numbered subheadings and one simple numbered list for objectives/questions; no nested A/B list unless genuinely required.
 MIDDLE CHAPTERS: allocate depth according to each chapter's supplied target. A literature/conceptual review can receive a larger share than other chapters when the budget allows. Rotate heading and list structures naturally; do not force irrelevant lists or exceed the total requested main-body page budget.
-FINAL CHAPTER: follow its allocated page target; use suitable subheadings such as Summary, Conclusion, and Recommendation/Recommendations when appropriate, with a concise numbered recommendations list where useful. Do not force the final chapter to exceed its allocated share.
+FINAL NUMBERED CHAPTER: follow its allocated page target and cover the final chapter-specific analysis/findings required by its TOC. Do NOT place a standalone Conclusion or Recommendations inside this chapter. The document-level Conclusion is a separate heading generated immediately after the final numbered chapter; Recommendations, when required, follow that separate Conclusion. Do not force the final chapter to exceed its allocated share.
 SUBHEADING STYLE AND COMPLETENESS: use bold numbered subheadings (e.g. 2.1, 2.2) exactly as listed in the saved TOC and in the same order. Each explanatory subheading must contain a developed, topic-specific explanation (normally at least 5–7 substantial displayed lines or equivalent detail, but do not pad with repetition). Classify each subsection by what the topic requires: explanation, list, example, comparison, procedure, calculation/solution, or a combination. Do not force long prose into a subsection whose correct answer is a concise calculation or direct result.
 LIST EXPLANATION RULE: when the prose introduces a list as types, factors, causes, reasons, characteristics, elements, functions, advantages/disadvantages, stages, methods, or similar items that require discussion, explain EACH list item after naming it. A label-only list is incomplete when the context requires explanation. Each item should normally include a clear sentence explaining what it means, why it matters, or how it applies, plus an example when useful. Keep list items under the correct parent subheading; never let list items become accidental numbered headings. Not every list needs expanded explanations: contents pages, objectives, short factual answers, and simple enumerations may remain concise when academically appropriate. Finish the current subheading completely before starting the next one.
 Simple lists use plain 1, 2, 3 numbering, not bold. Nested lists use bold A. and B. labels with explanations only where a parent point has distinct types; at most one nested A/B list in any chapter. Do not add lists merely to satisfy a count if they make the discussion unnatural; preserve the closest applicable pattern and academic relevance.
@@ -612,7 +765,8 @@ Write like a professional Word term-paper, not a chatbot.
         f"Body font: {config['body_font_size']} pt; Heading 1: {config['heading1_size']} pt ({'bold' if config.get('heading1_bold',True) else 'regular'}); "
         f"Heading 2: {config['heading2_size']} pt ({'bold' if config.get('heading2_bold',True) else 'regular'}); "
         f"Heading 3: {config['heading3_size']} pt ({'bold' if config.get('heading3_bold',True) else 'regular'}).\n"
-        f"Structure and preliminary pages: {config.get('structure','Standard academic structure')}.\n"
+        f"Structure and preliminary pages: {config.get('structure','Flexible academic structure (1–12 chapters)')}.\n"
+        f"Chapter count: {config['chapters']} (user-selectable flexible range: 1–12). Conclusion arrangement: separate heading after the final chapter.\n"
         f"Additional instructions: {config.get('instructions','Use formal academic writing, credible sources, and consistent citations.')}\n\n"
         f"{automatic_rules}")
     conn=None
@@ -643,9 +797,10 @@ def build_toc():
             cur.execute("SELECT toc_code,toc_text FROM paper_tocs WHERE user_id=%s AND prompt_code=%s",(int(uid),code)); existing=cur.fetchone()
         if existing: return jsonify({"message":"Retrieved the saved table of contents.","toc_code":existing[0],"toc":existing[1],"updated":True}),200
         _,title,config,prompt_text=row
-        prompt=("Create a complete, logically ordered academic term-paper TABLE OF CONTENTS only. Include required preliminary pages, exactly the requested number of chapters, useful numbered chapter subsections, conclusion/recommendations/references/appendices where appropriate. Reflect the automatic varied chapter-pattern rules in the saved prompt. Do not write the paper. Use clean Markdown, one entry per line, and do not invent page numbers.\n\n"
-                f"Saved instructions:\n{prompt_text}\n\nTopic: {title}\nRequested chapters: {config.get('chapters',5)}")
+        prompt=("Create a complete academic TABLE OF CONTENTS for ONE coherent research project. The approved topic is fixed and must govern every chapter; do not split the document into unrelated topics. Include exactly the requested number of chapters, numbered sequentially from Chapter 1 to Chapter N. Each chapter must have a meaningful title and topic-specific numbered subsections (1.1, 1.2, 2.1...). Do not treat subsections as separate chapters. After the final chapter, include a standalone heading exactly 'Conclusion', then Recommendations if appropriate, References, and Appendices if relevant. Conclusion is separate end matter, never numbered as the final chapter's subsection. Include relevant preliminary pages in conventional order. One entry per line; no page numbers; no duplicate headings. Do not write the paper.\n\n"
+                f"SAVED PROJECT TOPIC (LOCKED): {title}\nEXACT CHAPTER COUNT: {config.get('chapters',5)}\nSaved instructions:\n{prompt_text}")
         toc_text=normalize_server_text(generate_with_groq(prompt))
+        toc_text=_normalize_separate_end_matter_toc(toc_text)
         sections=_section_items(toc_text,config); toc_code=_new_short_code(conn,"paper_tocs","toc_code")
         with conn.cursor() as cur:
             cur.execute("INSERT INTO paper_tocs (user_id,prompt_code,toc_code,toc_text,sections_json) VALUES (%s,%s,%s,%s,%s::jsonb)",
@@ -681,6 +836,13 @@ def paper_start():
                             "prompt_code": pc, "toc_code": tc,
                             "sections":[{"order_no":r[0],"title":r[1],"content":r[2]} for r in rows]}),200
         _,title,config,prompt_text=pr; _,_,toc_text,sections,_=toc
+        # Rebuild generation units from the saved TOC for new projects, including older
+        # TOC codes created before the chapter/subsection parser was hardened.
+        toc_text = _normalize_separate_end_matter_toc(toc_text)
+        sections = _section_items(toc_text, config)
+        with conn.cursor() as cur:
+            cur.execute("UPDATE paper_tocs SET toc_text=%s,sections_json=%s::jsonb,updated_at=CURRENT_TIMESTAMP WHERE user_id=%s AND toc_code=%s",
+                        (toc_text, json.dumps(sections), int(uid), tc))
         research,sources=search_tavily(prompt_text)
         prompt=("Write ONLY the cover/title page and required preliminary pages. Do NOT generate, include, or preview the Table of Contents. Do NOT write Chapter One or any chapter content. The TOC is a separate stage and will appear only when the user clicks Pull Next after these preliminary pages. Follow every automatic formatting rule in the saved prompt. COVER PAGE: center the full topic in bold; include institution, faculty, department, course title/code, student name, registration number, lecturer/supervisor, academic session, and submission date. For each missing value, leave a visible blank line (____________________); do not invent details. Each preliminary-page heading must be centered and bold; body paragraphs must be justified. Put the cover first with no visible page number; use lower-case Roman numeral pagination for following preliminary pages. Do not include TOC entries or fabricated page numbers.\n\n"
                 f"SAVED PROMPT:\n{prompt_text}\n\nResearch notes:\n{research}\n\nWrite the preliminary material only.")
@@ -719,7 +881,7 @@ def pull_next():
         sections=sections or []
         if action == "edit_toc":
             incoming=str(data.get("content",""))
-            edited_toc=content_plain_text(incoming).strip()
+            edited_toc=_normalize_separate_end_matter_toc(content_plain_text(incoming).strip())
             if not edited_toc:
                 return jsonify({"error":"Table of contents cannot be empty."}),400
             inline_enabled=bool(data.get("inline_enabled",False))
@@ -808,6 +970,13 @@ def pull_next():
                 cur.execute("SELECT section_title,content_text FROM paper_sections WHERE project_id=%s AND order_no=%s",(int(pid),order_no)); row=cur.fetchone()
             if not row:return jsonify({"error":"There is no saved section to regenerate."}),404
             title=row[0]
+            resend_topic = str(config.get("topic") or "").strip()
+            resend_toc_block = _chapter_toc_block(toc_text, title)
+            prior_limit = 12 if title.strip().lower() in {"conclusion", "references", "bibliography", "works cited"} else 3
+            with conn.cursor() as cur:
+                cur.execute("SELECT section_title,content_text FROM paper_sections WHERE project_id=%s AND order_no>0 AND order_no<%s ORDER BY order_no DESC LIMIT %s", (int(pid), order_no, prior_limit))
+                resend_previous = cur.fetchall()
+            resend_context = "\n\n".join(f"PREVIOUS SECTION: {r[0]}\n{content_plain_text(r[1])[:1200]}" for r in reversed(resend_previous))
             # Prefer client-sent content (includes figures the user just placed)
             incoming = str(data.get("content") or "").strip()
             source_content = incoming if incoming else (row[1] or "")
@@ -855,7 +1024,8 @@ def pull_next():
                     pos = end_pos
                 return out
 
-            for block in _extract_tp_figures(raw_html):
+            figure_blocks = _dedupe_figure_blocks(_extract_tp_figures(raw_html))
+            for block in figure_blocks:
                 # Keep resized width across Resend via data-fig-width
                 wm = re.search(r'data-fig-width="(\d+)"', block)
                 if wm:
@@ -868,11 +1038,7 @@ def pull_next():
                     else:
                         block = block.replace('class="tp-figure"', f'class="tp-figure" style="width: {w}%; max-width: 100%; margin-left: auto; margin-right: auto"', 1)
                 figure_blocks.append(block)
-                label_m = re.search(r'data-fig-label="([^"]+)"', block)
-                cap_m = re.search(r'class="fig-caption"[^>]*>(.*?)</span>', block, flags=re.I|re.S)
-                label = label_m.group(1) if label_m else "Figure"
-                caption = re.sub(r'<[^>]+>', '', cap_m.group(1)).strip() if cap_m else ""
-                caption = re.sub(r'^Fig\.\s*\d+\.\d+\s*:?\s*', '', caption, flags=re.I).strip()
+                label, caption, block = _figure_meta(block)
                 figure_notes.append(f"- {label}" + (f": {caption}" if caption else ""))
 
             page_budget = _chapter_page_budget(config, title, sections)
@@ -897,10 +1063,12 @@ def pull_next():
                     "4. Do not renumber headings, do not move sections, do not expand unrelated subsections, "
                     "and do not remove existing correct content.\n"
                     "5. Return the COMPLETE section text (all headings and paragraphs), with only the allowed local edits.\n"
-                    "6. Do NOT output HTML or image tags.\n\n"
+                    "6. Do NOT output HTML or image tags.\n"
+                    "7. The preserved image object is the only place where its label and caption should appear; never repeat the caption as a heading or standalone line. Refer to it naturally in prose only.\n\n"
                     f"Current section text:\n{existing_plain}"
                 )
-                text_body = remove_duplicate_sections(generate_with_groq(local_prompt))
+                text_body = _dedupe_repeated_headings(remove_duplicate_sections(generate_with_groq(local_prompt)))
+                text_body = _strip_duplicate_figure_caption_lines(text_body, figure_blocks)
                 body_html = content_rich_html(text_body)
                 # Prefer keeping figures near user placement anchors when possible
                 combined_html = _place_figures_in_html(body_html, figure_blocks)
@@ -920,6 +1088,7 @@ def pull_next():
                         "3. Put that reference in the same subsection the caption relates to — not only in a summary at the end.\n"
                         "Write 1–2 clear sentences around each reference so the figure is explained in context.\n"
                         "Do NOT output HTML or image tags — only academic text. Figures are re-attached by the system after generation.\n"
+                        "The preserved image object owns its label and caption. Do not reproduce either as a heading or standalone caption line; refer to the figure naturally in prose only.\n"
                     )
                 prompt=(
                     "DOCUMENT QUALITY CONTRACT (mandatory): Output only formal section text. "
@@ -927,11 +1096,26 @@ def pull_next():
                     "Plain readable equations only (never LaTeX). Headings as ## / ### with TOC numbers. "
                     "Bold key terms with **...**. Write like a professional Word document for academic submission.\n\n"
                     f"Regenerate ONLY this existing section titled {title}. Do not repeat other chapters or preliminary pages. "
+                    f"LOCKED RESEARCH TOPIC: {resend_topic}. Keep every part of this section directly relevant to this one topic; do not change subjects or drift into another project. "
+                    f"Prior generated context for continuity (do not copy):\n{resend_context}\n\n"
                     "Apply every automatic Tempaper rule in the saved instructions, including chapter role, topic-weight page-depth target, "
                     f"varied heading/list pattern, and numbering. Preserve the section's position in the saved TOC.{budget_note}{fig_instruction}\n\n"
-                    f"{prompt_text}\n\nTOC:\n{toc_text}\n\nSection: {title}"
+                    f"{prompt_text}\n\nTOC block for this section:\n{resend_toc_block}\n\nSection: {title}"
                 )
-                text_body = remove_duplicate_sections(generate_with_groq(prompt))
+                text_body = _dedupe_repeated_headings(remove_duplicate_sections(generate_with_groq(prompt)))
+                if _chapter_number(title) is not None:
+                    topic_issues = _topic_alignment_issues(text_body, resend_topic)
+                    if topic_issues:
+                        retry_prompt = ("SUBJECT-DRIFT REPAIR REQUIRED. Rewrite this one chapter for the locked research topic only. Preserve its saved chapter title and subsection order.\n"
+                                        f"LOCKED TOPIC: {resend_topic}\nDetected issues: {'; '.join(topic_issues)}\nOriginal response:\n{text_body}\n\nInstructions:\n{prompt}")
+                        text_body = _dedupe_repeated_headings(remove_duplicate_sections(generate_with_groq(retry_prompt)))
+                        if _topic_alignment_issues(text_body, resend_topic):
+                            return jsonify({"error":"The regenerated chapter failed the approved-topic check. The saved chapter was left unchanged."}),502
+                    text_body = _repair_incomplete_chapter(text_body, title, prompt_text, resend_toc_block)[0]
+                    if _topic_alignment_issues(text_body, resend_topic):
+                        return jsonify({"error":"The regenerated chapter failed the topic check after quality repair. The saved chapter was left unchanged."}),502
+                    text_body = _strip_separate_end_matter_from_final_chapter(text_body, title, config)
+                text_body = _strip_duplicate_figure_caption_lines(text_body, figure_blocks)
                 if figure_blocks:
                     body_html = content_rich_html(text_body)
                     combined_html = _place_figures_in_html(body_html, figure_blocks)
@@ -969,7 +1153,7 @@ def pull_next():
                 cur.execute("UPDATE paper_projects SET current_index=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s",(next_index,int(pid)))
             conn.commit(); return jsonify({"message":"Resumed the next saved section.","title":existing[0],"result":existing[1],"order_no":next_index,"current_index":next_index}),200
         title_low = title.lower()
-        chapter_titles = [str(x.get("title") or "") for x in sections if re.search(r"chapter\s+(?:[ivxlcdm]+|\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b", str(x.get("title") or ""), re.I)]
+        chapter_titles = [str(x.get("title") or "") for x in sections if _chapter_number(str(x.get("title") or "")) is not None]
         is_last_chapter = bool(chapter_titles and title.strip().lower() == chapter_titles[-1].strip().lower())
         if any(term in title_low for term in ("references", "bibliography", "appendix", "appendices")):
             chapter_role = "supplementary section"
@@ -979,7 +1163,18 @@ def pull_next():
             chapter_role = "closing chapter"
         else:
             chapter_role = "middle chapter"
-        page_budget = _chapter_page_budget(config, title, sections)
+        # Give the model concrete continuity context from already-saved chapters.
+        prior_limit = 12 if title.strip().lower() in {"conclusion", "references", "bibliography", "works cited"} else 3
+        with conn.cursor() as cur:
+            cur.execute("SELECT section_title,content_text FROM paper_sections WHERE project_id=%s AND order_no>0 AND order_no<%s ORDER BY order_no DESC LIMIT %s", (int(pid), next_index, prior_limit))
+            previous_rows = cur.fetchall()
+        context_limit = 1000 if prior_limit > 3 else 1800
+        previous_context = "\n\n".join(
+            f"PREVIOUS SECTION: {r[0]}\n{content_plain_text(r[1])[:context_limit]}" for r in reversed(previous_rows)
+        ) or "No earlier chapter has been generated yet."
+        project_topic = str(config.get("topic") or "").strip()
+        chapter_toc_text = _chapter_toc_block(toc_text, title)
+        page_budget = None if re.match(r"^(conclusion|recommendations?|references?|bibliography|appendices?)$", title.strip(), re.I) else _chapter_page_budget(config, title, sections)
         budget_note = (f"THIS CHAPTER'S SHARE OF THE MAIN-BODY PAGE TARGET: approximately {page_budget['pages']} A4 pages and about {page_budget['words']} words. This is chapter {page_budget['chapter_index']} of {page_budget['chapter_count']}; across all chapters, aim for {page_budget['total_pages']} A4 pages total from Chapter One to the final chapter. Cover and preliminary pages, references, and appendices are additional and do not count toward that total. Aim for roughly 280–320 words per rendered body page; use the supplied word target as a guide, not filler.\n" if page_budget else "This is supplementary material and does not count toward the requested main-body page total.\n")
         prompt=(
             "DOCUMENT QUALITY CONTRACT (mandatory): Output only formal section text. "
@@ -987,6 +1182,9 @@ def pull_next():
             "Plain readable equations only (never LaTeX). Headings as ## / ### with TOC numbers. "
             "Bold key terms with **...**. Write like a professional Word document for academic submission.\n\n"
             f"Write ONLY the next section titled exactly: {title}. Do not write any other chapter or repeat content already generated. "
+            f"LOCKED RESEARCH TOPIC: {project_topic}. Every paragraph, example, method, finding, and recommendation must directly serve this exact topic. "
+            "Do not change the research subject, introduce a second project, or drift into an adjacent topic. Use prior chapter context to maintain continuity, but do not repeat its wording. "
+            f"PRIOR GENERATED CONTEXT (continuity reference only):\n{previous_context}\n\n"
             f"Apply ALL automatic Tempaper rules in the saved prompt. Current role: {chapter_role}. {budget_note}"
             "Use the saved TOC as the authoritative heading checklist: include every relevant subsection for this chapter in the exact order and preserve its wording. "
             "Finish each subsection before starting the next. Identify whether each subsection needs explanation, list, example, comparison, calculation/solution, or a combination. "
@@ -994,15 +1192,46 @@ def pull_next():
             "Do not force extra prose into direct-answer/calculation sections or simple objective lists. "
             "Use numbered bold subheadings, appropriate plain numbered lists and at most one nested A/B list when required by the chapter pattern. "
             "Keep the chapter substantive; do not pad with repetition. Use academic tone and credible citations. Do not add a new TOC or fabricate page numbers.\n\n"
-            f"Original saved instructions (mandatory on every pull):\n{prompt_text}\n\nSaved table of contents:\n{toc_text}\n\nSection {next_index} of {len(sections)}. Write this section only."
+            f"Original saved instructions (mandatory on every pull):\n{prompt_text}\n\nAuthoritative TOC block for THIS section only:\n{chapter_toc_text}\n\nSection {next_index} of {len(sections)}. Write this section only."
         )
-        research,sources=search_tavily(f"{prompt_text}\nSection: {title}")
-        content=remove_duplicate_sections(generate_with_groq(prompt,research))
-        # Only pay for a second model call when local checks identify likely omissions.
-        if re.search(r"chapter\s*(?:[1-9]|i\b|one\b)", title, re.I) or chapter_role in {"opening chapter", "middle chapter", "closing chapter"}:
-            content, quality_issues = _repair_incomplete_chapter(content, title, prompt_text, toc_text, research)
+        if re.match(r"^(references?|bibliography|works cited)$", title.strip(), re.I):
+            prompt += ("\n\nREFERENCE INTEGRITY RULE: Build the reference list from the verifiable research notes and source URLs supplied with this request, plus sources explicitly cited in the saved chapters. "
+                       "Do not invent authors, publication titles, journal names, dates, volume/issue numbers, page ranges, DOIs, or URLs. Use the requested citation style where specified. "
+                       "Return real reference entries; never return only a heading or a blank page.")
+        research,sources=search_tavily(f"{project_topic} scholarly sources references {title}")
+        content=_dedupe_repeated_headings(remove_duplicate_sections(generate_with_groq(prompt,research)))
+        if _chapter_number(title) is not None:
+            topic_issues = _topic_alignment_issues(content, project_topic)
+            if topic_issues:
+                retry = ("SUBJECT-DRIFT REPAIR REQUIRED. Rewrite this one chapter so it is unmistakably and substantively about the locked project topic. "
+                         "Do not switch to another topic. Keep the saved chapter title and TOC subsection order. Return the complete chapter only.\n\n"
+                         f"LOCKED TOPIC: {project_topic}\nDetected issue: {'; '.join(topic_issues)}\n"
+                         f"Original chapter response:\n{content}\n\nChapter instructions:\n{prompt}")
+                content = _dedupe_repeated_headings(remove_duplicate_sections(generate_with_groq(retry, research)))
+                remaining_topic_issues = _topic_alignment_issues(content, project_topic)
+                if remaining_topic_issues:
+                    return jsonify({"error":"The generated chapter did not pass the saved-topic consistency check. Nothing was saved. Please retry generation.", "checks":remaining_topic_issues}),502
+        if re.match(r"^(references?|bibliography|works cited)$", title.strip(), re.I):
+            # A heading-only response must never be committed as a successful blank references page.
+            ref_lines = [ln.strip() for ln in content_plain_text(content).splitlines() if ln.strip()]
+            if len(ref_lines) < 2 or len(content_plain_text(content).split()) < 45:
+                retry_prompt = prompt + "\n\nCRITICAL: Return actual formatted reference entries, not a heading or blank page. Include only sources genuinely cited/used in this paper; never fabricate authors, titles, journals, DOIs, or URLs. If no verifiable sources are available, state that clearly rather than returning an empty page."
+                content = _dedupe_repeated_headings(remove_duplicate_sections(generate_with_groq(retry_prompt, research)))
+            ref_lines = [ln.strip() for ln in content_plain_text(content).splitlines() if ln.strip()]
+            if len(ref_lines) < 2 or len(content_plain_text(content).split()) < 35:
+                return jsonify({"error":"References were not generated with usable entries. Nothing was saved; try Pull Next again after checking the research/source settings."}),502
+        # Only repair numbered chapters; end matter has its own short, focused structure.
+        if _chapter_number(title) is not None:
+            content, quality_issues = _repair_incomplete_chapter(content, title, prompt_text, chapter_toc_text, research)
             if quality_issues:
                 logger.info("Chapter quality repair for %s: %s", title, "; ".join(quality_issues))
+            # A repair pass must not reintroduce subject drift.
+            post_repair_topic_issues = _topic_alignment_issues(content, project_topic)
+            if post_repair_topic_issues:
+                return jsonify({"error":"The repaired chapter no longer matches the approved project topic. Nothing was saved.", "checks":post_repair_topic_issues}),502
+        content = _strip_separate_end_matter_from_final_chapter(content, title, config)
+        if len(content_plain_text(content).split()) < 35:
+            return jsonify({"error":f"{title} returned too little usable content. Nothing was saved; please retry."}),502
         with conn.cursor() as cur:
             cur.execute("INSERT INTO paper_sections (project_id,order_no,section_key,section_title,content_text,word_count) VALUES (%s,%s,%s,%s,%s,%s)",(int(pid),next_index,key,title,content,len(content.split())))
             cur.execute("UPDATE paper_projects SET current_index=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s",(next_index,int(pid)))
@@ -1056,7 +1285,11 @@ def merge_paper():
                         chunks.append(toc_html)
                         toc_inserted=True
                 else:
-                    if title and not plain.lower().lstrip().startswith(title.lower().lstrip()):
+                    plain_start = re.sub(r"^\s*#{1,6}\s*", "", plain).strip()
+                    title_already_present = bool(title and plain_start.lower().startswith(str(title).lower().lstrip()))
+                    if not title_already_present and title and _chapter_number(str(title)) is not None and _chapter_number(plain_start) == _chapter_number(str(title)):
+                        title_already_present = True
+                    if title and not title_already_present:
                         chunks.append("<h1>"+html_escape(str(title))+"</h1>"+rich)
                     else:
                         chunks.append(rich)
@@ -1093,13 +1326,26 @@ def sync_toc_pages():
             refreshed=[]
             for line in toc_text.splitlines():
                 plain=re.sub(r"[*#`]", "", line).strip()
+                # Treat a leading Roman numeral on a preliminary item as its page value,
+                # not as part of the entry title; the final page number belongs in the right column.
+                leading_roman = re.match(r"^([ivxlcdm]+)[.)]\s+(.+)$", plain, re.I)
+                if leading_roman and re.search(r"\b(certification|declaration|dedication|acknowledg|abstract|table of contents|list of (?:tables|figures|abbreviations|symbols))\b", leading_roman.group(2), re.I):
+                    plain = leading_roman.group(2).strip()
                 match=None
                 for title, info in page_map.items():
                     if plain.lower().startswith(str(title).lower()):
                         match=info
                         break
+                if match is None:
+                    line_chapter = _chapter_number(plain)
+                    if line_chapter is not None:
+                        for title, info in page_map.items():
+                            if _chapter_number(str(title)) == line_chapter:
+                                match = info
+                                break
                 if match is not None:
                     page=match.get("page_start","")
+                    line=re.sub(r"^\s*[ivxlcdm]+[.)]\s+", "", line, flags=re.I)
                     line=re.sub(r"\s*(?:\.{2,}|…+)\s*[ivxlcdm\d]+\s*$","",line,flags=re.I)
                     line=re.sub(r"\s+[ivxlcdm\d]+\s*$","",line,flags=re.I)
                     line=f"{line.rstrip()}  ........  {page}"
@@ -1230,13 +1476,18 @@ def search_tavily(query):
 def _figure_meta(block):
     """Extract label, caption, width from a tp-figure HTML block."""
     label_m = re.search(r'data-fig-label="([^"]+)"', block, flags=re.I)
-    cap_m = re.search(r'class="fig-caption"[^>]*>(.*?)</(?:span|div)>', block, flags=re.I|re.S)
+    data_caption_m = re.search(r'data-fig-caption="([^"]*)"', block, flags=re.I)
+    cap_m = re.search(r'class="fig-caption"[^>]*>(.*?)</span>\s*</span>', block, flags=re.I|re.S)
+    if not cap_m:
+        cap_m = re.search(r'class="fig-caption"[^>]*>(.*?)</(?:span|div)>', block, flags=re.I|re.S)
     width_m = re.search(r'data-fig-width="(\d+)"', block, flags=re.I)
-    label = (label_m.group(1) if label_m else "Figure").strip()
+    label = html_unescape((label_m.group(1) if label_m else "Figure")).strip()
     caption = ""
-    if cap_m:
+    if data_caption_m:
+        caption = html_unescape(data_caption_m.group(1)).strip()
+    elif cap_m:
         caption = re.sub(r"<[^>]+>", "", cap_m.group(1)).strip()
-        caption = re.sub(r"^Fig\.?\s*[\d.]+\s*:?\s*", "", caption, flags=re.I).strip()
+    caption = re.sub(r"^Fig\.?\s*[\d.]+\s*:?\s*", "", caption, flags=re.I).strip()
     # Ensure width style from data-fig-width
     if width_m:
         w = width_m.group(1)
@@ -1248,6 +1499,43 @@ def _figure_meta(block):
         else:
             block = block.replace('class="tp-figure"', f'class="tp-figure" style="width: {w}%; max-width: 100%; margin-left: auto; margin-right: auto"', 1)
     return label, caption, block
+
+
+def _dedupe_figure_blocks(figure_blocks):
+    """Keep one copy of each figure, preferring its first saved occurrence."""
+    unique, seen = [], set()
+    for block in figure_blocks or []:
+        label, caption, normalized = _figure_meta(block)
+        id_match = re.search(r'data-fig-id="([^"]+)"', block, flags=re.I)
+        key = ("id:" + id_match.group(1).strip().casefold()) if id_match else ("label:" + re.sub(r"\s+", " ", label).strip().casefold())
+        if not key or key == "label:":
+            key = "caption:" + re.sub(r"\s+", " ", caption).strip().casefold()
+        if key and key in seen:
+            continue
+        if key: seen.add(key)
+        unique.append(normalized)
+    return unique
+
+
+def _strip_duplicate_figure_caption_lines(text, figure_blocks):
+    """Remove AI-emitted standalone caption lines; the preserved figure owns its caption."""
+    labels = []
+    for block in figure_blocks or []:
+        label, caption, _ = _figure_meta(block)
+        labels.append((label, caption))
+    kept = []
+    for line in str(text or "").splitlines():
+        plain = re.sub(r"[*#`]", "", line).strip()
+        duplicate = False
+        for label, caption in labels:
+            if not plain: continue
+            norm = re.sub(r"\s+", " ", plain).strip().casefold()
+            lab = re.sub(r"\s+", " ", label).strip().casefold()
+            cap = re.sub(r"\s+", " ", caption).strip().casefold()
+            if norm in {lab, f"{lab}: {cap}".strip(), f"{lab} {cap}".strip()}:
+                duplicate = True; break
+        if not duplicate: kept.append(line)
+    return "\n".join(kept).strip()
 
 
 def _place_figures_in_html(body_html, figure_blocks):
@@ -1462,6 +1750,22 @@ def remove_duplicate_sections(text: str, similarity_threshold: float = 0.92) -> 
     return out if out else normalized
 
 
+def _dedupe_repeated_headings(text):
+    """Remove repeated identical heading lines without touching repeated prose."""
+    seen = set()
+    output = []
+    for line in str(text or "").splitlines():
+        is_heading = bool(re.match(r"^\s*#{1,4}\s+", line) or re.match(r"^\s*\*\*.+\*\*\s*$", line) or re.match(r"^\s*\d+(?:\.\d+)+[.)]?\s+", line))
+        if is_heading:
+            key = re.sub(r"^\s*#{1,4}\s*", "", line).strip().strip("*").strip()
+            key = re.sub(r"\s+", " ", key).casefold()
+            if key and key in seen:
+                continue
+            if key: seen.add(key)
+        output.append(line)
+    return "\n".join(output).strip()
+
+
 def _chapter_quality_issues(text: str, title: str = "", toc_text: str = ""):
     """Cheap local checks; avoids extra model calls unless a chapter looks incomplete."""
     issues = []
@@ -1526,7 +1830,7 @@ def _repair_incomplete_chapter(content: str, title: str, prompt_text: str, toc_t
         "Do not invent sources or citations.\n\nDetected issues:\n- " + "\n- ".join(issues) +
         f"\n\nSaved requirements:\n{prompt_text}\n\nSaved TOC:\n{toc_text}\n\nResearch notes (use only when relevant):\n{research}\n\nExisting chapter to repair:\n{content}"
     )
-    repaired = remove_duplicate_sections(generate_with_groq(repair_prompt))
+    repaired = _dedupe_repeated_headings(remove_duplicate_sections(generate_with_groq(repair_prompt)))
     # Do not replace the original with a much shorter failed repair.
     if len(repaired.split()) < max(100, int(len(content.split()) * 0.65)):
         return content, issues + ["Repair response was too short; original chapter retained."]
