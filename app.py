@@ -739,6 +739,12 @@ def prompt_builder():
     cover_lines = "\n".join(f"- {label}: {config[field] if config[field] else '[Leave a blank line for the student to fill in]'}" for field, label in cover_fields.items())
     automatic_rules = '''AUTOMATIC TEMPAPER STRUCTURE RULES — ALWAYS APPLY TO THIS PAPER AND EVERY NEXT PULL:
 PAGE-COUNT RULE (IMPORTANT): The requested page count in the prompt builder applies ONLY to the main body, starting at Chapter One and ending at the final chapter. Do NOT count the cover page, certification/approval, declaration, dedication, acknowledgements, abstract, table of contents, lists of tables/figures, references/bibliography, or appendices toward this requested number. Those pages are additional. Across all chapters combined, aim for the requested number of rendered A4 pages. Each chapter prompt will provide its own proportional page and word target; follow that target rather than applying a fixed minimum or an oversized page target to every chapter. As a rough drafting guide, aim for about 280–320 words per body page, adjusted naturally for headings, lists, tables, equations, and topic complexity. Do not claim an exact page count in the prose.
+
+FIELD AND DISCIPLINE RULE: Faculty, department, and course information exist only to set the correct academic register and definitions. 
+Use the definitions, examples, units, and conceptual framing appropriate to that field without ever announcing the choice. 
+Never write “as used in civil engineering”, “in contrast to electrical engineering”, “from the department’s perspective”, or any similar meta-statement. 
+Simply write the content in the proper professional register for the topic. The cover page may list the faculty and department; the body must not discuss or highlight them unless the research topic itself requires it.
+
 CHAPTER 1 (opening/introduction/background): use the allocated page target; usually 2–3 numbered subheadings and one simple numbered list for objectives/questions; no nested A/B list unless genuinely required.
 MIDDLE CHAPTERS: allocate depth according to each chapter's supplied target. A literature/conceptual review can receive a larger share than other chapters when the budget allows. Rotate heading and list structures naturally; do not force irrelevant lists or exceed the total requested main-body page budget.
 FINAL NUMBERED CHAPTER: follow its allocated page target and cover the final chapter-specific analysis/findings required by its TOC. Do NOT place a standalone Conclusion or Recommendations inside this chapter. The document-level Conclusion is a separate heading generated immediately after the final numbered chapter; Recommendations, when required, follow that separate Conclusion. Do not force the final chapter to exceed its allocated share.
@@ -797,8 +803,18 @@ def build_toc():
             cur.execute("SELECT toc_code,toc_text FROM paper_tocs WHERE user_id=%s AND prompt_code=%s",(int(uid),code)); existing=cur.fetchone()
         if existing: return jsonify({"message":"Retrieved the saved table of contents.","toc_code":existing[0],"toc":existing[1],"updated":True}),200
         _,title,config,prompt_text=row
-        prompt=("Create a complete academic TABLE OF CONTENTS for ONE coherent research project. The approved topic is fixed and must govern every chapter; do not split the document into unrelated topics. Include exactly the requested number of chapters, numbered sequentially from Chapter 1 to Chapter N. Each chapter must have a meaningful title and topic-specific numbered subsections (1.1, 1.2, 2.1...). Do not treat subsections as separate chapters. After the final chapter, include a standalone heading exactly 'Conclusion', then Recommendations if appropriate, References, and Appendices if relevant. Conclusion is separate end matter, never numbered as the final chapter's subsection. Include relevant preliminary pages in conventional order. One entry per line; no page numbers; no duplicate headings. Do not write the paper.\n\n"
-                f"SAVED PROJECT TOPIC (LOCKED): {title}\nEXACT CHAPTER COUNT: {config.get('chapters',5)}\nSaved instructions:\n{prompt_text}")
+        prompt=("Create a professional, university-textbook-style TABLE OF CONTENTS for one coherent research project. "
+                "The approved topic is fixed and must govern every chapter. Do not split the document into unrelated topics. "
+                "Produce exactly the requested number of chapters, numbered Chapter 1 to Chapter N. "
+                "Each chapter title should be concise and substantive (textbook style), followed by topic-specific numbered subsections (1.1, 1.2, 2.1…). "
+                "Do not treat subsections as separate chapters. After the final chapter, include a standalone heading exactly 'Conclusion', "
+                "then Recommendations if appropriate, References, and Appendices if relevant. "
+                "Conclusion is separate end matter, never a numbered subsection of the final chapter. "
+                "Include conventional preliminary pages in standard academic order. "
+                "One entry per line. No page numbers. No duplicate headings. Do not write the paper.\n\n"
+                f"SAVED PROJECT TOPIC (LOCKED): {title}\n"
+                f"EXACT CHAPTER COUNT: {config.get('chapters', 5)}\n"
+                f"Saved instructions:\n{prompt_text}")
         toc_text=normalize_server_text(generate_with_groq(prompt))
         toc_text=_normalize_separate_end_matter_toc(toc_text)
         sections=_section_items(toc_text,config); toc_code=_new_short_code(conn,"paper_tocs","toc_code")
@@ -1558,7 +1574,8 @@ def _place_figures_in_html(body_html, figure_blocks):
         patterns = []
         # Fig. 2.1 / Figure 2.1 / Fig 2.1
         lab = re.escape(label)
-        patterns.append(re.compile(rf"(?:{lab}|{lab.replace(r'\.', r'\\.?')})", re.I))
+        alt_lab = lab.replace(r'\.', r'\\.?')
+        patterns.append(re.compile(rf"(?:{lab}|{alt_lab})", re.I))
         # bare number form e.g. 2.1 from "Fig. 2.1"
         num_m = re.search(r"(\d+\.\d+)", label)
         if num_m:
@@ -1617,25 +1634,26 @@ def generate_with_groq(prompt, context_text=""):
             {
                 "role": "system",
                 "content": (
-                    "You are Tempaper, a professional academic document writer. "
-                    "Every output must look like a formal Microsoft Word term paper chapter — not a chatbot reply.\n\n"
+                    "You are a professional academic writer producing formal university term-paper chapters in the style of a modern textbook. "
+                    "Write continuous, coherent, print-ready academic prose. Stay strictly on the given topic and TOC. "
+                    "Do not jump topics, do not announce disciplinary choices, and do not write meta-commentary about the field or department.\n\n"
                     "ABSOLUTE OUTPUT RULES:\n"
-                    "1. Return ONLY the section body. Zero prefaces, zero meta text, zero AI voice "
-                    "(ban: As an AI, Here is, Certainly, Hope this helps, In this response, I will now, Below is).\n"
-                    "2. ZERO repetition of any kind: no repeated ideas, sentences, paragraphs, conclusions, or figure labels.\n"
-                    "3. Human formal academic English. Concrete claims. Varied sentence length. Not robotic.\n"
-                    "4. NUMBERING: under any heading, numbered items must run 1, 2, 3… in order. "
-                    "Never label every item as 1. Objectives and research questions must be sequential.\n"
-                    "5. Headings: markdown ## / ### with exact TOC numbers (example: ## 2.3 Energy and Momentum). "
-                    "Do not repeat the heading wording in the first sentence of the body.\n"
-                    "6. Bold key terms on first use only with **term**. Sparse *italics* only when needed.\n"
-                    "7. Equations on their own line in plain readable form (K = 1/2 m v^2 or KE = ½mv²). "
-                    "NEVER LaTeX: no \\frac \\text \\( \\) \\[ \\] \\omega \\tfrac \\cdot etc.\n"
-                    "8. Figures: at most one or two natural references using the exact label once "
-                    "(As shown in Fig. 2.1, …). Never 'Fig. 2.1 Fig. 2.1'.\n"
+                    "1. Return ONLY the section body. Zero prefaces, zero meta text, zero AI voice.\n"
+                    "2. ZERO repetition of any kind: no repeated ideas, sentences, paragraphs, or figure labels.\n"
+                    "3. Use field-appropriate definitions and framing naturally. Never write phrases such as "
+                    "'as defined in civil engineering', 'unlike electrical engineering', 'from the perspective of [department]', "
+                    "or any similar meta-statement. Just use the correct conceptual language for the topic and field.\n"
+                    "4. NUMBERING: under any heading, numbered items must run 1, 2, 3… in order. Never label every item as 1.\n"
+                    "5. Headings: markdown ## / ### with exact TOC numbers. Do not repeat the heading wording in the first sentence of the body.\n"
+                    "6. Bold key terms on first use only with **term**. Sparse italics only when needed.\n"
+                    "7. Equations on their own line in plain readable form. NEVER LaTeX.\n"
+                    "8. Figures: at most one or two natural references using the exact label once.\n"
                     "9. Do not invent citations, data, authors, or years. No HTML. No code fences.\n"
-                    "10. Write as a careful student or supervisor preparing a formal dissertation — "
-                    "professional, print-ready, Word-document quality."
+                    "10. At the very end of the section, after all academic content, you may add a short block starting with "
+                    "'FIGURE SUGGESTIONS:' followed by 0–3 lines in the exact format: "
+                    "Fig. X.Y – Brief description of what the image should show | Place after subsection X.Y\n"
+                    "Only suggest figures that genuinely help the reader. If none are needed, omit the block entirely.\n"
+                    "11. Write as a careful student preparing a formal submission — professional, continuous, and textbook-quality."
                 ),
             },
             {"role": "user", "content": final_prompt},
