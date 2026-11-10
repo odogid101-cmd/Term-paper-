@@ -49,6 +49,9 @@ CORS(
     supports_credentials=True,
     resources={r"/*": {"origins": [
         "https://odogid101-cmd.github.io",
+        "https://monkeyscout.cv",
+        "http://monkeyscout.cv",
+        "https://www.monkeyscout.cv",
         "http://localhost:3000",
         "http://localhost:5000",
         "https://localhost:3000",
@@ -97,12 +100,40 @@ if DATABASE_URL:
 def get_db():
     if not db_pool:
         raise RuntimeError("DB not initialized")
-    return db_pool.getconn()
+    conn = db_pool.getconn()
+    # Lightweight health check — discard dead connections from the pool
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+    except Exception:
+        try:
+            db_pool.putconn(conn, close=True)
+        except Exception:
+            pass
+        conn = db_pool.getconn()
+    return conn
 
 
 def release_db(conn):
     if db_pool and conn:
-        db_pool.putconn(conn)
+        try:
+            db_pool.putconn(conn)
+        except Exception:
+            try:
+                db_pool.putconn(conn, close=True)
+            except Exception:
+                pass
+
+
+def _safe_rollback(conn):
+    """Rollback only if the connection is still usable."""
+    if not conn:
+        return
+    try:
+        if not conn.closed:
+            conn.rollback()
+    except Exception:
+        pass
 
 
 def init_db():
@@ -778,7 +809,7 @@ Write like a professional Word term-paper, not a chatbot.
         conn.commit()
         return jsonify({"message":"Prompt saved to your account.","prompt_code":code,"title":title,"prompt_text":prompt_text}),201
     except Exception as e:
-        if conn: conn.rollback()
+        _safe_rollback(conn)
         logger.exception("Prompt save failed")
         return jsonify({"error":"Could not save prompt.","details":str(e)[:200]}),500
     finally:
@@ -808,7 +839,7 @@ def build_toc():
         conn.commit()
         return jsonify({"message":"Table of contents created and saved.","toc_code":toc_code,"toc":toc_text,"sections":sections,"updated":False}),201
     except Exception as e:
-        if conn: conn.rollback()
+        _safe_rollback(conn)
         logger.exception("TOC creation failed")
         return jsonify({"error":"Could not create the table of contents.","details":str(e)[:200]}),500
     finally:
@@ -856,7 +887,7 @@ def paper_start():
                         "sources":sources,"word_count":len(prelim.split()),
                         "page_count":max(1,(len(prelim.split())+249)//250)}),201
     except Exception as e:
-        if conn: conn.rollback()
+        _safe_rollback(conn)
         logger.exception("Paper start failed")
         return jsonify({"error":"Could not start the paper.","details":str(e)[:200]}),500
     finally:
@@ -1247,7 +1278,7 @@ def pull_next():
             resp["quality_notes"] = quality_notes
         return jsonify(resp),201
     except Exception as e:
-        if conn: conn.rollback()
+        _safe_rollback(conn)
         logger.exception("Pull next failed")
         return jsonify({"error":"Could not generate the next section.","details":str(e)[:200]}),500
     finally:
@@ -1310,7 +1341,7 @@ def merge_paper():
         return jsonify({"message":"Paper merged into one document. Inline Edit is now disabled for this merged file.",
                         "merged":True,"merged_content":merged_content,"title":"Complete Term Paper"}),200
     except Exception as e:
-        if conn: conn.rollback()
+        _safe_rollback(conn)
         logger.exception("Paper merge failed")
         return jsonify({"error":"Could not merge the paper.","details":str(e)[:200]}),500
     finally:
