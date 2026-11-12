@@ -84,7 +84,7 @@ IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY")
 groq_client = None
 if GROQ_API_KEY:
     try:
-        groq_client = Groq(api_key=GROQ_API_KEY)
+        groq_client = Groq(api_key=GROQ_API_KEY, max_retries=0)
         logger.info(f"Groq initialized with model {GROQ_MODEL}")
     except Exception as e:
         logger.error(f"Groq init failed: {e}")
@@ -1003,11 +1003,11 @@ def pull_next():
             title=row[0]
             resend_topic = str(config.get("topic") or "").strip()
             resend_toc_block = _chapter_toc_block(toc_text, title)
-            prior_limit = 12 if title.strip().lower() in {"conclusion", "references", "bibliography", "works cited"} else 3
+            prior_limit = 4 if title.strip().lower() in {"conclusion", "references", "bibliography", "works cited"} else 2
             with conn.cursor() as cur:
                 cur.execute("SELECT section_title,content_text FROM paper_sections WHERE project_id=%s AND order_no>0 AND order_no<%s ORDER BY order_no DESC LIMIT %s", (int(pid), order_no, prior_limit))
                 resend_previous = cur.fetchall()
-            resend_context = "\n\n".join(f"PREVIOUS SECTION: {r[0]}\n{content_plain_text(r[1])[:1200]}" for r in reversed(resend_previous))
+            resend_context = "\n\n".join(f"PREVIOUS SECTION: {r[0]}\n{_chapter_continuity_summary(r[1], 650)}" for r in reversed(resend_previous))
             # Prefer client-sent content (includes figures the user just placed)
             incoming = str(data.get("content") or "").strip()
             source_content = incoming if incoming else (row[1] or "")
@@ -1195,13 +1195,13 @@ def pull_next():
         else:
             chapter_role = "middle chapter"
         # Give the model concrete continuity context from already-saved chapters.
-        prior_limit = 12 if title.strip().lower() in {"conclusion", "references", "bibliography", "works cited"} else 3
+        prior_limit = 4 if title.strip().lower() in {"conclusion", "references", "bibliography", "works cited"} else 2
         with conn.cursor() as cur:
             cur.execute("SELECT section_title,content_text FROM paper_sections WHERE project_id=%s AND order_no>0 AND order_no<%s ORDER BY order_no DESC LIMIT %s", (int(pid), next_index, prior_limit))
             previous_rows = cur.fetchall()
-        context_limit = 1000 if prior_limit > 3 else 1800
+        context_limit = 650 if prior_limit > 2 else 900
         previous_context = "\n\n".join(
-            f"PREVIOUS SECTION: {r[0]}\n{content_plain_text(r[1])[:context_limit]}" for r in reversed(previous_rows)
+            f"PREVIOUS SECTION: {r[0]}\n{_chapter_continuity_summary(r[1], context_limit)}" for r in reversed(previous_rows)
         ) or "No earlier chapter has been generated yet."
         project_topic = str(config.get("topic") or "").strip()
         chapter_toc_text = _chapter_toc_block(toc_text, title)
@@ -1233,6 +1233,7 @@ def pull_next():
                        "Do not invent authors, publication titles, journal names, dates, volume/issue numbers, page ranges, DOIs, or URLs. Use the requested citation style where specified. "
                        "Return real reference entries; never return only a heading or a blank page.")
         research,sources=search_tavily(f"{project_topic} scholarly sources references {title}")
+        research = (research or "")[:4000]
         content=_dedupe_repeated_headings(remove_duplicate_sections(generate_with_groq(prompt,research)))
         if _chapter_number(title) is not None:
             topic_issues = _topic_alignment_issues(content, project_topic)
@@ -1279,6 +1280,20 @@ def pull_next():
         return jsonify(resp),201
     except Exception as e:
         _safe_rollback(conn)
+        status_code = getattr(e, "status_code", None)
+        error_text = str(e).lower()
+        if status_code == 429 or "rate_limit_exceeded" in error_text or "too many requests" in error_text:
+            logger.warning("Groq rate limit reached while generating a section.")
+            return jsonify({
+                "error": "Tempaper is temporarily at its AI usage limit.",
+                "details": "Your saved chapters are safe. Wait about 60 seconds, then try again. Avoid pressing Generate repeatedly."
+            }), 429
+        if status_code == 413 or "tokens per minute" in error_text:
+            logger.warning("Groq token-per-minute budget exceeded while generating a section.")
+            return jsonify({
+                "error": "This section request exceeded the current AI token budget.",
+                "details": "Your saved chapters are safe. Try again shortly; the generation prompt has been compacted to reduce token use."
+            }), 413
         logger.exception("Pull next failed")
         return jsonify({"error":"Could not generate the next section.","details":str(e)[:200]}),500
     finally:
@@ -1645,65 +1660,84 @@ def _place_figures_in_html(body_html, figure_blocks):
     return html
 
 
-def generate_with_groq(prompt, context_text=""):
+def _bound_groq_prompt(prompt, max_chars=9000):
+    """Bound prompt size while preserving opening requirements and final task/TOC."""
+    prompt = str(prompt or "")
+    if len(prompt) <= max_chars:
+        return prompt
+    head = int(max_chars * 0.62)
+    tail = max_chars - head
+    return (
+        prompt[:head].rsplit(" ", 1)[0]
+        + "\n\n[Repeated/background prompt text compacted to protect the model token budget; "
+          "the task and final section instructions are retained.]\n\n"
+        + prompt[-tail:].lstrip()
+    )
+
+
+def generate_with_groq(prompt, context_text="", max_tokens=2800):
     if not groq_client:
         raise RuntimeError("GROQ_API_KEY missing - get free key at console.groq.com")
-    final_prompt = f"{context_text}\n\n{prompt}" if context_text else prompt
+
+    # Retain the academic quality rules in a shorter system message on every request.
+    system_prompt = (
+        "You are Tempaper, an expert academic term-paper and textbook chapter writer. "
+        "Produce substantial, well-developed university-level writing, not short summaries. "
+        "Explain concepts in depth; define technical terms; develop relevant theories, principles, "
+        "applications, examples, limitations and critical analysis. Adapt depth to the discipline "
+        "and the stated page/word target. Develop every required TOC subsection in order. "
+        "Use coherent paragraphs, logical transitions and precise academic language. Avoid padding, "
+        "repetition and generic filler. Return only the requested section body with exact saved "
+        "heading numbering. Use plain readable equations, never LaTeX. Number lists sequentially. "
+        "Bold key terms on first use. Refer to supplied figures by exact labels. Never invent sources, "
+        "citations, authors, dates, statistics, DOIs, findings or data. Distinguish published evidence, "
+        "proposed methods, supplied data and hypothetical examples. Do not add unrelated chapters, "
+        "a new TOC, HTML, code fences or chatbot prefaces. Preserve academic depth and write enough "
+        "detail to meet the chapter's stated length target without artificial padding."
+    )
+    combined = f"{context_text}\n\n{prompt}" if context_text else str(prompt or "")
+    final_prompt = _bound_groq_prompt(combined)
 
     response = groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are Tempaper, a professional academic document writer producing university-level term papers and textbook-quality chapters.\n"
-                    "Every output must read and look like a carefully researched, professionally written university textbook chapter or high-quality undergraduate/postgraduate academic research document — not a chatbot reply or generic essay.\n\n"
-                    "ABSOLUTE OUTPUT RULES:\n"
-                    "1. Return ONLY the section body. Zero prefaces, zero meta text, zero AI voice "
-                    "(ban: As an AI, Here is, Certainly, Hope this helps, In this response, I will now, Below is).\n"
-                    "2. ZERO repetition of any kind: no repeated ideas, sentences, paragraphs, conclusions, or figure labels. Each paragraph must contribute a distinct idea, explanation, argument, example or piece of evidence.\n"
-                    "3. Human formal academic English that is precise, mature and readable. Concrete claims. Varied sentence length and structure. Not robotic or template-like. Avoid empty phrases such as 'Furthermore', 'Moreover', 'In addition', 'It is important to note'.\n"
-                    "4. NUMBERING: under any heading, numbered items must run 1, 2, 3… in order. "
-                    "Never label every item as 1. Objectives and research questions must be sequential.\n"
-                    "5. Headings: markdown ## / ### with exact TOC numbers (example: ## 2.3 Energy and Momentum). "
-                    "Do not repeat the heading wording in the first sentence of the body. Ensure content under each heading actually discusses that subject in depth.\n"
-                    "6. Bold key terms on first use only with **term**. Sparse *italics* only when needed.\n"
-                    "7. Equations on their own line in plain readable form (K = 1/2 m v^2 or KE = ½mv²). "
-                    "NEVER LaTeX: no \\frac \\text \\( \\) \\[ \\] \\omega \\tfrac \\cdot etc.\n"
-                    "8. Figures: at most one or two natural references using the exact label once "
-                    "(As shown in Fig. 2.1, …). Never 'Fig. 2.1 Fig. 2.1'.\n"
-                    "9. Do not invent citations, data, authors, years, statistics, research findings, sample sizes, or DOIs. No HTML. No code fences. "
-                    "If a source cannot be verified from the provided research notes, do not present it as confirmed; mark for student verification if necessary.\n"
-                    "10. Write as a careful student or supervisor preparing a formal dissertation — professional, print-ready, Word-document quality.\n\n"
-                    "ACADEMIC DEPTH AND TEXTBOOK STANDARD (mandatory):\n"
-                    "- Explain concepts thoroughly rather than merely mentioning them. Introduce important concepts before discussing complex arguments.\n"
-                    "- Define technical terms accurately and in their proper academic context.\n"
-                    "- Explain the background, development and significance of the subject.\n"
-                    "- Present relevant theories, models, principles and scholarly perspectives where appropriate.\n"
-                    "- Connect paragraphs logically so that ideas develop progressively. Explain why a point matters, not merely state that it matters.\n"
-                    "- Use examples, illustrations and relevant evidence where appropriate. Demonstrate critical thinking, interpretation and academic reasoning.\n"
-                    "- Where relevant, organize discussions with: introduction to the concept, definition and explanation, historical or theoretical background, major components or principles, how it works, relevant theories and scholarly interpretations, practical applications and examples, benefits/limitations/challenges, critical discussion and implications, and a concise concluding synthesis. Adapt this intelligently to the discipline and section; do not force it everywhere.\n"
-                    "- A reader should finish each major discussion with a clear understanding of the subject, including its meaning, importance, applications and limitations.\n"
-                    "- Avoid shallow writing, inflated paragraphs with little information, restating introductions under every subsection, unnecessary summaries after every paragraph, and artificially extending sections merely to reach a word count.\n"
-                    "- When discussing scholarly literature: explain different perspectives, compare and contrast arguments, identify agreements and disagreements, discuss strengths and limitations of theories, relate to the topic, identify research gaps where supported, and explain implications. Distinguish description from critical evaluation.\n"
-                    "- Adapt writing to the actual discipline (e.g., education: theories and classroom applications; computer science: principles, architecture, algorithms and limitations; business: management theories and organizational practices; etc.). Do not introduce unrelated technical concepts.\n"
-                    "- Never invent real-world research activities, findings, surveys, interviews, experiments, or data. Distinguish proposed methodology, existing published research, student-supplied data, illustrative hypothetical examples, and actual analyzed findings.\n"
-                    "- Generate original academic explanations. Vary sentence structure naturally. Optimize for genuine academic quality, source attribution, originality and student understanding.\n"
-                    "- Maintain a consistent scholarly tone appropriate to the academic level. Use credible, traceable references that match the citation style. In-text citations must correspond to reference list entries.\n"
-                    "- Chapters must have clear title, meaningful introduction, logical major headings, properly nested subsections with consistent numbering, detailed discussion under each heading, relevant examples and evidence, logical transitions, and a coherent chapter conclusion where appropriate. Do not create headings with only one or two sentences unless genuinely appropriate.\n"
-                ),
-            },
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": final_prompt},
         ],
         temperature=0.55,
-        max_tokens=8192,
+        max_tokens=max(1200, min(int(max_tokens), 2800)),
         top_p=0.9,
     )
-    text = response.choices[0].message.content
-    if not text or not text.strip():
+    choice = response.choices[0]
+    generated = (choice.message.content or "").strip()
+    if not generated:
         raise RuntimeError("Empty Groq response")
-    # Always post-process: strip LaTeX, fix 1./1./1. lists, collapse duplicate Fig labels
-    return normalize_server_text(text.strip())
+
+    # If a long chapter hits the output ceiling, continue once with a short tail,
+    # not the original long prompt or all prior chapter material.
+    if getattr(choice, "finish_reason", None) == "length":
+        continuation_prompt = (
+            "Continue the academic section directly from where the text below ends. "
+            "Do not repeat its last paragraph, heading or earlier material. Maintain the same "
+            "depth, academic tone, numbering and topic. Complete unfinished explanations and "
+            "continue the remaining required subsections. Return only the continuation.\n\n"
+            "END OF GENERATED SECTION:\n" + generated[-1800:]
+        )
+        continuation = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": continuation_prompt},
+            ],
+            temperature=0.55,
+            max_tokens=1600,
+            top_p=0.9,
+        )
+        extra = (continuation.choices[0].message.content or "").strip()
+        if extra:
+            generated = generated.rstrip() + "\n\n" + extra
+
+    return normalize_server_text(generated)
 
 
 def normalize_server_text(text: str) -> str:
@@ -1805,6 +1839,23 @@ def remove_duplicate_sections(text: str, similarity_threshold: float = 0.92) -> 
     return out if out else normalized
 
 
+def _chapter_continuity_summary(text, max_chars=900):
+    """Build a compact continuity note without spending tokens on another AI call."""
+    plain = content_plain_text(text or "")
+    lines = [re.sub(r"\s+", " ", line).strip() for line in plain.splitlines() if line.strip()]
+    headings = [line for line in lines if re.match(r"^(?:#{1,4}\s*)?(?:\d+(?:\.\d+)*[.)]?\s+|[A-Z][^.!?]{2,80}$)", line)]
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", plain) if p.strip()]
+    selected = headings[:8]
+    if paragraphs:
+        selected.append(paragraphs[0])
+        if len(paragraphs) > 1:
+            selected.append(paragraphs[-1])
+    summary = "\n".join(dict.fromkeys(selected))
+    if len(summary) > max_chars:
+        summary = summary[:max_chars].rsplit(" ", 1)[0] + "…"
+    return summary
+
+
 def _dedupe_repeated_headings(text):
     """Remove repeated identical heading lines without touching repeated prose."""
     seen = set()
@@ -1871,27 +1922,57 @@ def _chapter_quality_issues(text: str, title: str = "", toc_text: str = ""):
 
 
 def _repair_incomplete_chapter(content: str, title: str, prompt_text: str, toc_text: str, research: str = ""):
-    """Run a targeted repair only if deterministic checks find likely omissions."""
+    """Repair one weak subsection surgically instead of resending the whole chapter."""
     issues = _chapter_quality_issues(content, title, toc_text)
     if not issues:
         return content, []
+
+    # Find the first existing subsection explicitly flagged as underdeveloped.
+    target_number = None
+    for issue in issues:
+        match = re.search(r"Subheading\s+(\d+(?:\.\d+)+)", issue)
+        if match:
+            target_number = match.group(1)
+            break
+    if not target_number:
+        # Missing-heading/list checks remain visible as quality notes. Do not trigger
+        # an expensive full-chapter rewrite just to address a structural warning.
+        return content, issues
+
+    lines = str(content or "").splitlines()
+    heading_re = re.compile(r"^\s*(?:#{1,3}\s*)?(?:\*\*)?(\d+\.\d+(?:\.\d+)?)[.)]?\s+(.+?)(?:\*\*)?\s*$")
+    heading_positions = []
+    for index, line in enumerate(lines):
+        match = heading_re.match(line.strip())
+        if match:
+            heading_positions.append((index, match.group(1), line))
+    target_pos = next((i for i, item in enumerate(heading_positions) if item[1] == target_number), None)
+    if target_pos is None:
+        return content, issues
+
+    start_line, _, original_heading = heading_positions[target_pos]
+    end_line = heading_positions[target_pos + 1][0] if target_pos + 1 < len(heading_positions) else len(lines)
+    original_block = "\n".join(lines[start_line:end_line]).strip()
     repair_prompt = (
-        f"Review and repair ONLY the existing chapter titled: {title}. Return the complete corrected chapter, not a report. "
-        "Preserve correct material and the original heading names/order. Do not rewrite the whole paper or add unrelated sections. "
-        "Elevate the academic quality to university textbook standard: explain concepts thoroughly, provide critical analysis, logical development, examples and evidence. "
-        "Avoid repetition, shallow writing and padding. "
-        "Check every numbered subheading has the content its topic requires. Explanatory subsections need a meaningful developed explanation; "
-        "a calculation/solution section may show the method and answer without artificial padding. Where a list is introduced as types, factors, causes, "
-        "reasons, characteristics, elements, functions, advantages/disadvantages, stages or methods requiring discussion, explain each item under its parent heading. "
-        "Do not explain simple objective lists or short enumerations unnecessarily. Keep lists, examples, equations and their explanations under the correct subheading. "
-        "Do not invent sources, citations, research findings or data.\n\nDetected issues:\n- " + "\n- ".join(issues) +
-        f"\n\nSaved requirements:\n{prompt_text}\n\nSaved TOC:\n{toc_text}\n\nResearch notes (use only when relevant):\n{research}\n\nExisting chapter to repair:\n{content}"
+        f"Improve ONLY subsection {target_number} in the academic chapter '{title}'. "
+        "Return the complete replacement for this subsection, beginning with its exact existing heading. "
+        "Preserve its meaning and topic, but develop the explanation to an appropriate university textbook "
+        "standard with relevant definitions, reasoning, examples and critical discussion where suitable. "
+        "Do not add unrelated material, invent citations or data, or repeat the chapter introduction.\n\n"
+        f"Saved requirements:\n{str(prompt_text or '')[:900]}\n\n"
+        f"Relevant TOC:\n{str(toc_text or '')[:1000]}\n\n"
+        f"Existing subsection to improve:\n{original_block}"
     )
-    repaired = _dedupe_repeated_headings(remove_duplicate_sections(generate_with_groq(repair_prompt)))
-    # Do not replace the original with a much shorter failed repair.
-    if len(repaired.split()) < max(100, int(len(content.split()) * 0.65)):
-        return content, issues + ["Repair response was too short; original chapter retained."]
-    return repaired, issues
+    revised = generate_with_groq(repair_prompt, max_tokens=1200).strip()
+    revised_lines = revised.splitlines()
+    if not revised or len(revised.split()) < max(45, int(len(original_block.split()) * 0.8)):
+        return content, issues + ["Targeted subsection repair was too short; original subsection retained."]
+    if not any(heading_re.match(line.strip()) and heading_re.match(line.strip()).group(1) == target_number for line in revised_lines):
+        revised = original_heading + "\n" + revised
+
+    updated_lines = lines[:start_line] + revised.splitlines() + lines[end_line:]
+    updated = "\n".join(updated_lines).strip()
+    return updated, issues
 
 
 # --- ROUTES (original term-paper logic preserved) ---
