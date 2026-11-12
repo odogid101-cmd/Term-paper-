@@ -84,7 +84,7 @@ IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY")
 groq_client = None
 if GROQ_API_KEY:
     try:
-        groq_client = Groq(api_key=GROQ_API_KEY, max_retries=0)
+        groq_client = Groq(api_key=GROQ_API_KEY, max_retries=0, timeout=90.0)
         logger.info(f"Groq initialized with model {GROQ_MODEL}")
     except Exception as e:
         logger.error(f"Groq init failed: {e}")
@@ -278,7 +278,7 @@ _ALLOWED_RICH_TAGS = {
     "img", "figure", "figcaption"
 }
 # Extra attrs kept for Monkey Scout figures (move/resize/caption persistence)
-_FIGURE_DATA_ATTRS = {"data-fig-id", "data-fig-label", "data-fig-url", "data-fig-caption", "data-bound"}
+_FIGURE_DATA_ATTRS = {"data-fig-id", "data-fig-label", "data-fig-url", "data-fig-caption", "data-bound", "data-fig-main-label", "data-auto-placeholder"}
 _VOID_RICH_TAGS = {"br", "img"}
 _ALLOWED_STYLE_PROPS = {
     "font-family", "font-size", "color", "background-color", "text-align",
@@ -752,6 +752,7 @@ def prompt_builder():
             "topic":title, "pages":max(1,min(500,int(config.get("pages",20)))),
             "chapters":max(1,min(12,int(config.get("chapters",5)))),
             "conclusion_mode":"separate",
+            "include_images": bool(config.get("include_images", False)),
             "body_font_size":max(8,min(24,int(config.get("body_font_size",12)))),
             "heading1_size":max(8,min(36,int(config.get("heading1_size",14)))),
             "heading2_size":max(8,min(32,int(config.get("heading2_size",14)))),
@@ -799,7 +800,8 @@ Write like a professional Word term-paper, not a chatbot.
         f"Structure and preliminary pages: {config.get('structure','Flexible academic structure (1–12 chapters)')}.\n"
         f"Chapter count: {config['chapters']} (user-selectable flexible range: 1–12). Conclusion arrangement: separate heading after the final chapter.\n"
         f"Additional instructions: {config.get('instructions','Use formal academic writing, credible sources, and consistent citations.')}\n\n"
-        f"{automatic_rules}")
+        f"{automatic_rules}"
+        + ("\n\nILLUSTRATION MODE: ON. In every relevant body chapter, identify only genuinely useful visual illustration opportunities. At a natural point in the explanation, insert a standalone marker on its own line using this exact syntax: [[ADD_IMAGE_HERE|MAIN LABEL|SUB-LABEL]]. MAIN LABEL is a short topic label (e.g. Vector Motion); SUB-LABEL is a concise descriptive caption for the illustration. Usually 1–3 markers per chapter, only when they add educational value. Do not invent image URLs or generate images. The student uploads the actual image after generation. Never place markers in references, bibliography, or contents pages.\n" if config.get('include_images') else "\n\nILLUSTRATION MODE: OFF. Do not create image placeholders or image markers.\n"))
     conn=None
     try:
         conn=get_db(); code=_new_short_code(conn,"paper_prompts","prompt_code")
@@ -1075,10 +1077,59 @@ def pull_next():
             page_budget = _chapter_page_budget(config, title, sections)
             budget_note = (f"\nTHIS CHAPTER'S SHARE OF THE MAIN-BODY PAGE TARGET: approximately {page_budget['pages']} A4 pages and about {page_budget['words']} words. This is chapter {page_budget['chapter_index']} of {page_budget['chapter_count']}; the complete main body target is {page_budget['total_pages']} pages total. Preliminary pages and references are excluded.\n" if page_budget else "")
 
+            if resend_mode == "full":
+                # The button is a chapter refinement, not a full chapter rewrite. Groq returns
+                # only a few exact phrase replacements; the backend applies them to the saved HTML.
+                original_plain = content_plain_text(source_content)
+                patch_system = (
+                    "You are a precise academic copy editor. Return ONLY valid JSON with this shape: "
+                    '{"edits":[{"find":"exact unique text copied from the supplied chapter","replace":"improved replacement text"}]}. '
+                    "Suggest at most 8 small, high-value wording or sentence improvements. Do not rewrite paragraphs wholesale. "
+                    "Do not edit headings, numbering, figure captions, image markup, URLs, citations, equations, or factual claims unless correcting a clear language error. "
+                    "Every find value must be copied exactly and occur only once in the chapter. If no useful edits are needed, return {\"edits\":[]}."
+                )
+                patch_prompt = (
+                    f"LOCKED TOPIC: {resend_topic}\nSECTION: {title}\n"
+                    "Refine only wording that is unclear, repetitive, grammatically weak, or unnecessarily awkward. "
+                    "Preserve the author's meaning, academic depth, all facts, all headings, and every image/placeholder. "
+                    "Use saved instructions and TOC only as context; do not generate a new chapter.\n\n"
+                    f"SAVED REQUIREMENTS (brief context):\n{prompt_text[:1800]}\n\n"
+                    f"SECTION TO REVIEW (read all supplied text):\n{original_plain}"
+                )
+                patch_raw = generate_with_groq(patch_prompt, max_tokens=1600, system_override=patch_system)
+                try:
+                    json_match = re.search(r"\{.*\}", patch_raw, re.S)
+                    patch_data = json.loads(json_match.group(0)) if json_match else {}
+                except Exception:
+                    patch_data = {}
+                patched, patch_count = _apply_targeted_text_edits(source_content, patch_data.get("edits", []))
+                if not patched:
+                    return jsonify({
+                        "error": "No safe, unique text changes were returned. Your saved chapter was left unchanged.",
+                        "details": "Try giving a more specific editing instruction, or use Edit to change the exact paragraph."
+                    }), 422
+                saved = patched
+                msg_ok = f"Applied {patch_count} targeted wording improvement(s). Existing chapter structure and images were preserved."
+                plain = content_plain_text(saved)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE paper_sections SET content_text=%s,word_count=%s,updated_at=CURRENT_TIMESTAMP WHERE project_id=%s AND order_no=%s",
+                        (saved, len(plain.split()), int(pid), order_no),
+                    )
+                    cur.execute("UPDATE paper_tocs SET updated_at=CURRENT_TIMESTAMP WHERE toc_code=%s", (tc,))
+                conn.commit()
+                return jsonify({"message": msg_ok, "title": title, "result": saved, "order_no": order_no, "mode": "targeted"}), 200
+
             if resend_mode == "local":
                 # Surgical update: only touch text near figures when caption matches context
-                if not figure_blocks:
-                    return jsonify({"error": "Add at least one image before using Update near image."}), 400
+                manual_figure_blocks = [b for b in figure_blocks if not re.search(r'data-auto-image=["\']1["\']', b, re.I)]
+                if not manual_figure_blocks:
+                    return jsonify({"error": "Update near image is only available for images you added manually. AI-suggested image slots are preserved without triggering this action."}), 400
+                figure_blocks = manual_figure_blocks
+                figure_notes = [
+                    "- " + _figure_meta(block)[0] + (": " + _figure_meta(block)[1] if _figure_meta(block)[1] else "")
+                    for block in figure_blocks
+                ]
                 existing_plain = content_plain_text(source_content)
                 local_prompt = (
                     "You are editing ONE academic chapter. Your job is SURGICAL — do not rewrite the whole chapter.\n"
@@ -1266,15 +1317,17 @@ def pull_next():
             if post_repair_topic_issues:
                 return jsonify({"error":"The repaired chapter no longer matches the approved project topic. Nothing was saved.", "checks":post_repair_topic_issues}),502
         content = _strip_separate_end_matter_from_final_chapter(content, title, config)
+        if config.get("include_images") and not re.match(r"^(references?|bibliography|works cited|table of contents|list of figures|list of tables)$", title.strip(), re.I):
+            content = _render_ai_image_placeholders(content)
         if len(content_plain_text(content).split()) < 35:
             return jsonify({"error":f"{title} returned too little usable content. Nothing was saved; please retry."}),502
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO paper_sections (project_id,order_no,section_key,section_title,content_text,word_count) VALUES (%s,%s,%s,%s,%s,%s)",(int(pid),next_index,key,title,content,len(content.split())))
+            cur.execute("INSERT INTO paper_sections (project_id,order_no,section_key,section_title,content_text,word_count) VALUES (%s,%s,%s,%s,%s,%s)",(int(pid),next_index,key,title,content,len(content_plain_text(content).split())))
             cur.execute("UPDATE paper_projects SET current_index=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s",(next_index,int(pid)))
             cur.execute("UPDATE paper_tocs SET updated_at=CURRENT_TIMESTAMP WHERE toc_code=%s",(tc,))
         conn.commit()
         resp = {"message":f"{title} generated.","title":title,"result":content,"order_no":next_index,"current_index":next_index,
-                        "sources":sources,"word_count":len(content.split()),"page_count":max(1,(len(content.split())+249)//250),"toc_code":tc,"toc":toc_text}
+                        "sources":sources,"word_count":len(content_plain_text(content).split()),"page_count":max(1,(len(content_plain_text(content).split())+249)//250),"toc_code":tc,"toc":toc_text}
         if quality_notes:
             resp["quality_notes"] = quality_notes
         return jsonify(resp),201
@@ -1675,7 +1728,7 @@ def _bound_groq_prompt(prompt, max_chars=9000):
     )
 
 
-def generate_with_groq(prompt, context_text="", max_tokens=2800):
+def generate_with_groq(prompt, context_text="", max_tokens=2800, system_override=None):
     if not groq_client:
         raise RuntimeError("GROQ_API_KEY missing - get free key at console.groq.com")
 
@@ -1695,6 +1748,8 @@ def generate_with_groq(prompt, context_text="", max_tokens=2800):
         "a new TOC, HTML, code fences or chatbot prefaces. Preserve academic depth and write enough "
         "detail to meet the chapter's stated length target without artificial padding."
     )
+    if system_override:
+        system_prompt = str(system_override)
     combined = f"{context_text}\n\n{prompt}" if context_text else str(prompt or "")
     final_prompt = _bound_groq_prompt(combined)
 
@@ -1738,6 +1793,75 @@ def generate_with_groq(prompt, context_text="", max_tokens=2800):
             generated = generated.rstrip() + "\n\n" + extra
 
     return normalize_server_text(generated)
+
+
+def _render_ai_image_placeholders(text):
+    """Convert Groq's explicit image markers into safe, clickable editor placeholders."""
+    source = str(text or "")
+    marker_re = re.compile(r"^\s*\[\[ADD_IMAGE_HERE\|([^|\]]{1,100})\|([^\]]{1,240})\]\]\s*$", re.I | re.M)
+    matches = list(marker_re.finditer(source))
+    if not matches:
+        return source
+    # Build rich HTML from prose chunks so placeholders remain real DOM blocks.
+    parts = []
+    cursor = 0
+    for index, match in enumerate(matches, 1):
+        before = source[cursor:match.start()].strip()
+        if before:
+            parts.append(content_rich_html(before))
+        main = html_escape(match.group(1).strip(), quote=True)
+        sub = html_escape(match.group(2).strip(), quote=True)
+        token = f"auto-image-{index}-{random.randint(1000,9999)}"
+        parts.append(
+            f'<div class="tp-image-placeholder" data-auto-placeholder="1" data-placeholder-id="{token}" '
+            f'data-fig-main-label="{main}" data-fig-caption="{sub}" role="button" tabindex="0">'
+            f'<span class="tp-placeholder-icon">＋</span><strong>{main}</strong>'
+            f'<span class="tp-placeholder-action">ADD IMAGE HERE</span><small>{sub}</small></div>'
+        )
+        cursor = match.end()
+    after = source[cursor:].strip()
+    if after:
+        parts.append(content_rich_html(after))
+    return RICH_HTML_MARKER + "".join(parts)
+
+
+def _apply_targeted_text_edits(source_content, edits):
+    """Apply only unique exact-text replacements, preserving rich HTML and figure markup."""
+    raw = str(source_content or "")
+    rich = raw.startswith(RICH_HTML_MARKER)
+    body = raw[len(RICH_HTML_MARKER):] if rich else raw
+    protected_text = []
+    if rich:
+        for pattern in (
+            r'<span class="fig-main-label"[^>]*>(.*?)</span>',
+            r'<span class="fig-caption"[^>]*>(.*?)</span>',
+            r'<small[^>]*>(.*?)</small>',
+        ):
+            protected_text.extend(html_unescape(re.sub(r"<[^>]+>", "", value)).strip() for value in re.findall(pattern, body, re.I | re.S))
+        for attr in ("data-fig-main-label", "data-fig-caption"):
+            protected_text.extend(html_unescape(value) for value in re.findall(rf'{attr}="([^"]*)"', body, re.I))
+    applied = 0
+    for item in edits[:8] if isinstance(edits, list) else []:
+        if not isinstance(item, dict):
+            continue
+        old = str(item.get("find") or "").strip()
+        new = str(item.get("replace") or "").strip()
+        if not old or not new or len(old) > 700 or len(new) > 1000 or old == new:
+            continue
+        # Do not permit a model patch to alter HTML tags or attributes.
+        if re.search(r"</?[A-Za-z][^>]*>|\b(?:src|href|data-fig-[\w-]+)\s*=", old, re.I):
+            continue
+        if any(old in protected for protected in protected_text):
+            continue
+        needle = html_escape(old, quote=False) if rich else old
+        replacement = html_escape(new, quote=False) if rich else new
+        if body.count(needle) != 1:
+            continue
+        body = body.replace(needle, replacement, 1)
+        applied += 1
+    if not applied:
+        return None, 0
+    return (RICH_HTML_MARKER + body if rich else body), applied
 
 
 def normalize_server_text(text: str) -> str:
