@@ -75,19 +75,101 @@ if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_API_KEY_2 = os.environ.get("GROQ_API_KEY_2")
+GROQ_API_KEY_3 = os.environ.get("GROQ_API_KEY_3")
+# Optional comma-separated list, e.g. "key1,key2,key3" (merged with the three named vars)
+GROQ_API_KEYS_CSV = os.environ.get("GROQ_API_KEYS", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY")
 
-groq_client = None
-if GROQ_API_KEY:
+def _collect_groq_keys():
+    """Build an ordered unique list of Groq API keys from env."""
+    keys = []
+    for candidate in (
+        GROQ_API_KEY,
+        GROQ_API_KEY_2,
+        GROQ_API_KEY_3,
+        *[part.strip() for part in (GROQ_API_KEYS_CSV or "").split(",") if part.strip()],
+    ):
+        if candidate and candidate not in keys:
+            keys.append(candidate)
+    return keys
+
+# Multi-key Groq pool: rotate across keys to reduce rate-limit impact
+_groq_keys = _collect_groq_keys()
+_groq_clients = []
+_groq_key_index = 0
+_groq_index_lock = None
+try:
+    import threading
+    _groq_index_lock = threading.Lock()
+except Exception:
+    _groq_index_lock = None
+
+for _k in _groq_keys:
     try:
-        groq_client = Groq(api_key=GROQ_API_KEY, max_retries=0, timeout=90.0)
-        logger.info(f"Groq initialized with model {GROQ_MODEL}")
+        _groq_clients.append(Groq(api_key=_k, max_retries=0, timeout=90.0))
     except Exception as e:
-        logger.error(f"Groq init failed: {e}")
+        logger.error(f"Groq client init failed for a key ending …{_k[-4:]}: {e}")
+
+# Backward-compatible single client (first available key)
+groq_client = _groq_clients[0] if _groq_clients else None
+if _groq_clients:
+    logger.info(f"Groq initialized with model {GROQ_MODEL} using {len(_groq_clients)} API key(s)")
+else:
+    logger.warning("No GROQ_API_KEY configured — set GROQ_API_KEY, GROQ_API_KEY_2, GROQ_API_KEY_3")
+
+def _next_groq_client():
+    """Round-robin pick of the next Groq client."""
+    global _groq_key_index
+    if not _groq_clients:
+        return None
+    if _groq_index_lock:
+        with _groq_index_lock:
+            client = _groq_clients[_groq_key_index % len(_groq_clients)]
+            _groq_key_index = (_groq_key_index + 1) % len(_groq_clients)
+            return client
+    client = _groq_clients[_groq_key_index % len(_groq_clients)]
+    _groq_key_index = (_groq_key_index + 1) % len(_groq_clients)
+    return client
+
+def _is_rate_limit_error(exc):
+    msg = str(exc or "").lower()
+    return (
+        "429" in msg
+        or "rate limit" in msg
+        or "rate_limit" in msg
+        or "tokens per day" in msg
+        or "tokens per minute" in msg
+        or "tpm" in msg
+        or "tpd" in msg
+        or "quota" in msg
+    )
+
+def _groq_chat_create(**kwargs):
+    """Call chat.completions.create, rotating keys and retrying on rate limits."""
+    if not _groq_clients:
+        raise RuntimeError("GROQ_API_KEY missing - get free key at console.groq.com")
+    last_err = None
+    attempts = max(1, len(_groq_clients))
+    for attempt in range(attempts):
+        client = _next_groq_client()
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as e:
+            last_err = e
+            if _is_rate_limit_error(e) and attempt < attempts - 1:
+                logger.warning(
+                    "Groq rate/quota limit on key slot %s/%s — rotating to next key",
+                    attempt + 1,
+                    attempts,
+                )
+                continue
+            raise
+    raise last_err
 
 db_pool = None
 if DATABASE_URL:
@@ -1729,7 +1811,7 @@ def _bound_groq_prompt(prompt, max_chars=9000):
 
 
 def generate_with_groq(prompt, context_text="", max_tokens=2800, system_override=None):
-    if not groq_client:
+    if not _groq_clients:
         raise RuntimeError("GROQ_API_KEY missing - get free key at console.groq.com")
 
     # Retain the academic quality rules in a shorter system message on every request.
@@ -1753,7 +1835,7 @@ def generate_with_groq(prompt, context_text="", max_tokens=2800, system_override
     combined = f"{context_text}\n\n{prompt}" if context_text else str(prompt or "")
     final_prompt = _bound_groq_prompt(combined)
 
-    response = groq_client.chat.completions.create(
+    response = _groq_chat_create(
         model=GROQ_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
@@ -1778,7 +1860,7 @@ def generate_with_groq(prompt, context_text="", max_tokens=2800, system_override
             "continue the remaining required subsections. Return only the continuation.\n\n"
             "END OF GENERATED SECTION:\n" + generated[-1800:]
         )
-        continuation = groq_client.chat.completions.create(
+        continuation = _groq_chat_create(
             model=GROQ_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -2153,7 +2235,7 @@ def workflow_projects():
 
 @app.route("/", methods=["GET", "HEAD"])
 def health_check():
-    return jsonify({"status": "ok", "message": f"Monkey Scout API running - Groq {GROQ_MODEL}"}), 200
+    return jsonify({"status": "ok", "message": f"Monkey Scout API running - Groq {GROQ_MODEL}", "groq_keys": len(_groq_clients)}), 200
 
 
 @app.route("/register", methods=["POST"])
@@ -2363,8 +2445,8 @@ def generate_paper():
         return jsonify({"error": "Prompt required"}), 400
     if len(prompt) > 20000:
         return jsonify({"error": "Prompt too long"}), 413
-    if not GROQ_API_KEY:
-        return jsonify({"error": "GROQ_API_KEY missing"}), 503
+    if not _groq_clients:
+        return jsonify({"error": "GROQ_API_KEY missing — set GROQ_API_KEY (and optionally GROQ_API_KEY_2 / GROQ_API_KEY_3)"}), 503
 
     try:
         tavily_context, sources = search_tavily(prompt)
@@ -2491,8 +2573,8 @@ def chat():
 
     if not prompt:
         return jsonify({"error": "Prompt required"}), 400
-    if not GROQ_API_KEY:
-        return jsonify({"error": "GROQ_API_KEY missing"}), 503
+    if not _groq_clients:
+        return jsonify({"error": "GROQ_API_KEY missing — set GROQ_API_KEY (and optionally GROQ_API_KEY_2 / GROQ_API_KEY_3)"}), 503
 
     try:
         tavily_context, sources = search_tavily(prompt)
@@ -2500,7 +2582,7 @@ def chat():
 
         system_msg = system_prompt if system_prompt else "You are a helpful, concise assistant. Answer user questions clearly and honestly. If you don't know, say you don't know."
 
-        response = groq_client.chat.completions.create(
+        response = _groq_chat_create(
             model=GROQ_MODEL,
             messages=[
                 {"role": "system", "content": system_msg},
