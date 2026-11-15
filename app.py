@@ -1528,7 +1528,10 @@ def sync_toc_pages():
             continue
         key = normalize_toc_title(title)
         if key and str(info.get("page_start", "")).strip():
-            normalized_map[key] = info
+            # Keep the first occurrence: the section-card title is inserted at
+            # its actual section start before any repeated in-body heading.
+            # Overwriting with a later duplicate can move a TOC entry forward.
+            normalized_map.setdefault(key, info)
 
     conn = None
     try:
@@ -1548,13 +1551,20 @@ def sync_toc_pages():
                 key = normalize_toc_title(plain)
                 match = normalized_map.get(key)
 
-                if match is None and key:
+                # End-matter titles must match independently. Prefix and
+                # chapter-number fallbacks are unsafe here: "References" must
+                # never inherit the page for another ending section.
+                is_end_matter_line = bool(re.match(
+                    r"^(?:conclusions?|recommendations?|references?|bibliography|works cited|appendices?|appendix)\b",
+                    re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s*", "", plain), re.I
+                ))
+                if match is None and key and not is_end_matter_line:
                     candidates = [(title, info) for title, info in normalized_map.items()
                                   if key.startswith(title) and (len(key) == len(title) or key[len(title)] in " :.-–—")]
                     if candidates:
                         match = max(candidates, key=lambda item: len(item[0]))[1]
 
-                if match is None:
+                if match is None and not is_end_matter_line:
                     line_chapter = _chapter_number(plain)
                     if line_chapter is not None:
                         for title, info in page_map.items():
