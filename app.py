@@ -1500,50 +1500,88 @@ def merge_paper():
 
 @app.route("/sync-toc-pages", methods=["POST"])
 def sync_toc_pages():
-    data=request.get_json(silent=True) or {}; uid=str(data.get("user_id","")); code=str(data.get("toc_code","")).upper(); page_map=data.get("page_map") or {}
-    if not uid.isdigit() or not re.fullmatch(r"[A-Z0-9]{5}",code): return jsonify({"error":"Valid account and TOC code required."}),400
-    conn=None
+    data = request.get_json(silent=True) or {}
+    uid = str(data.get("user_id", ""))
+    code = str(data.get("toc_code", "")).upper()
+    page_map = data.get("page_map") or {}
+    if not uid.isdigit() or not re.fullmatch(r"[A-Z0-9]{5}", code):
+        return jsonify({"error": "Valid account and TOC code required."}), 400
+    if not isinstance(page_map, dict):
+        return jsonify({"error": "Invalid page map."}), 400
+
+    def normalize_toc_title(value):
+        value = re.sub(r"[*#`_]", "", str(value or ""))
+        value = re.sub(r"\s*(?:\.{2,}|…+)\s*[ivxlcdm\d]+\s*$", "", value, flags=re.I)
+        value = re.sub(r"\s+[ivxlcdm\d]+\s*$", "", value, flags=re.I)
+        value = re.sub(r"^\s*[ivxlcdm]+[.)]\s+", "", value, flags=re.I)
+        value = re.sub(r"\s+", " ", value).strip(" .:-–—")
+        # Ignore common heading numbering when comparing a TOC label with a
+        # rendered heading (e.g. "4. Recommendations" vs "Recommendations").
+        value = re.sub(r"^(?:(?:chapter|section)\s+)?(?:\d+(?:\.\d+)*|[ivxlcdm]+)[.)]?\s+", "", value, flags=re.I)
+        return value.casefold()
+
+    # Build an exact-title index first. Prefix matching is only a guarded fallback
+    # and prefers the longest title, avoiding e.g. "References" matching a longer entry.
+    normalized_map = {}
+    for title, info in page_map.items():
+        if not isinstance(info, dict):
+            continue
+        key = normalize_toc_title(title)
+        if key and str(info.get("page_start", "")).strip():
+            normalized_map[key] = info
+
+    conn = None
     try:
-        conn=get_db()
+        conn = get_db()
         with conn.cursor() as cur:
-            cur.execute("SELECT toc_text FROM paper_tocs WHERE user_id=%s AND toc_code=%s",(int(uid),code))
-            saved=cur.fetchone()
-            if not saved:return jsonify({"error":"TOC code not found in this account."}),404
-            toc_text=saved[0] or ""
-            # Keep the existing TOC code but refresh displayed page numbers from the current layout.
-            refreshed=[]
+            cur.execute("SELECT toc_text FROM paper_tocs WHERE user_id=%s AND toc_code=%s", (int(uid), code))
+            saved = cur.fetchone()
+            if not saved:
+                return jsonify({"error": "TOC code not found in this account."}), 404
+            toc_text = saved[0] or ""
+            refreshed = []
             for line in toc_text.splitlines():
-                plain=re.sub(r"[*#`]", "", line).strip()
-                # Treat a leading Roman numeral on a preliminary item as its page value,
-                # not as part of the entry title; the final page number belongs in the right column.
+                plain = re.sub(r"[*#`]", "", line).strip()
                 leading_roman = re.match(r"^([ivxlcdm]+)[.)]\s+(.+)$", plain, re.I)
                 if leading_roman and re.search(r"\b(certification|declaration|dedication|acknowledg|abstract|table of contents|list of (?:tables|figures|abbreviations|symbols))\b", leading_roman.group(2), re.I):
                     plain = leading_roman.group(2).strip()
-                match=None
-                for title, info in page_map.items():
-                    if plain.lower().startswith(str(title).lower()):
-                        match=info
-                        break
+                key = normalize_toc_title(plain)
+                match = normalized_map.get(key)
+
+                if match is None and key:
+                    candidates = [(title, info) for title, info in normalized_map.items()
+                                  if key.startswith(title) and (len(key) == len(title) or key[len(title)] in " :.-–—")]
+                    if candidates:
+                        match = max(candidates, key=lambda item: len(item[0]))[1]
+
                 if match is None:
                     line_chapter = _chapter_number(plain)
                     if line_chapter is not None:
                         for title, info in page_map.items():
-                            if _chapter_number(str(title)) == line_chapter:
+                            if isinstance(info, dict) and _chapter_number(str(title)) == line_chapter:
                                 match = info
                                 break
+
                 if match is not None:
-                    page=match.get("page_start","")
-                    line=re.sub(r"^\s*[ivxlcdm]+[.)]\s+", "", line, flags=re.I)
-                    line=re.sub(r"\s*(?:\.{2,}|…+)\s*[ivxlcdm\d]+\s*$","",line,flags=re.I)
-                    line=re.sub(r"\s+[ivxlcdm\d]+\s*$","",line,flags=re.I)
-                    line=f"{line.rstrip()}  ........  {page}"
+                    page = str(match.get("page_start", "")).strip()
+                    if page:
+                        # Remove old page values before appending the current rendered value.
+                        clean_line = re.sub(r"\s*(?:\.{2,}|…+)\s*[ivxlcdm\d]+\s*$", "", line, flags=re.I)
+                        clean_line = re.sub(r"\s+[ivxlcdm\d]+\s*$", "", clean_line, flags=re.I)
+                        refreshed.append(f"{clean_line.rstrip()}  ........  {page}")
+                        continue
                 refreshed.append(line)
-            new_toc="\n".join(refreshed)
-            cur.execute("UPDATE paper_tocs SET toc_text=%s,page_map_json=%s::jsonb,updated_at=CURRENT_TIMESTAMP WHERE user_id=%s AND toc_code=%s",
-                        (new_toc,json.dumps(page_map),int(uid),code))
-        conn.commit(); return jsonify({"message":"TOC page numbers updated; TOC code unchanged.","toc_code":code,"toc":new_toc}),200
+
+            new_toc = "\n".join(refreshed)
+            cur.execute(
+                "UPDATE paper_tocs SET toc_text=%s,page_map_json=%s::jsonb,updated_at=CURRENT_TIMESTAMP WHERE user_id=%s AND toc_code=%s",
+                (new_toc, json.dumps(page_map), int(uid), code)
+            )
+        conn.commit()
+        return jsonify({"message": "TOC page numbers updated; TOC code unchanged.", "toc_code": code, "toc": new_toc}), 200
     finally:
-        if conn:release_db(conn)
+        if conn:
+            release_db(conn)
 
 
 
