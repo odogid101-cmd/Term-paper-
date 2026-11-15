@@ -1551,26 +1551,27 @@ def sync_toc_pages():
                 key = normalize_toc_title(plain)
                 match = normalized_map.get(key)
 
-                # End-matter titles must match independently. Prefix and
-                # chapter-number fallbacks are unsafe here: "References" must
-                # never inherit the page for another ending section.
-                is_end_matter_line = bool(re.match(
-                    r"^(?:conclusions?|recommendations?|references?|bibliography|works cited|appendices?|appendix)\b",
-                    re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s*", "", plain), re.I
-                ))
-                if match is None and key and not is_end_matter_line:
+                # Apply the same matching rules to every generated section.
+                # Exact normalized title wins; a guarded prefix fallback is
+                # allowed only when it identifies one unambiguous source title.
+                if match is None and key:
                     candidates = [(title, info) for title, info in normalized_map.items()
                                   if key.startswith(title) and (len(key) == len(title) or key[len(title)] in " :.-–—")]
                     if candidates:
-                        match = max(candidates, key=lambda item: len(item[0]))[1]
+                        longest = max(len(item[0]) for item in candidates)
+                        best = [item for item in candidates if len(item[0]) == longest]
+                        if len(best) == 1:
+                            match = best[0][1]
 
-                if match is None and not is_end_matter_line:
+                # Chapter-number fallback is also shared by all section types;
+                # only accept it when there is exactly one matching source.
+                if match is None:
                     line_chapter = _chapter_number(plain)
                     if line_chapter is not None:
-                        for title, info in page_map.items():
-                            if isinstance(info, dict) and _chapter_number(str(title)) == line_chapter:
-                                match = info
-                                break
+                        numbered = [info for title, info in page_map.items()
+                                    if isinstance(info, dict) and _chapter_number(str(title)) == line_chapter]
+                        if len(numbered) == 1:
+                            match = numbered[0]
 
                 if match is not None:
                     page = str(match.get("page_start", "")).strip()
