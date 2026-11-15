@@ -1509,10 +1509,27 @@ def sync_toc_pages():
     if not isinstance(page_map, dict):
         return jsonify({"error": "Invalid page map."}), 400
 
+    # Canonical end-matter labels that must never share a TOC line or page slot.
+    _END_MATTER_CANON = (
+        "conclusion", "conclusions", "recommendations", "recommendation",
+        "references", "bibliography", "works cited", "appendices", "appendix", "summary",
+    )
+
+    def strip_all_page_leaders(value):
+        """Remove every dotted/spaced page leader, not only a trailing one."""
+        text = str(value or "")
+        # Repeat until stable so jammed "Title ...... 17 Other ...... 18" cleans fully.
+        for _ in range(6):
+            nxt = re.sub(r"\s*(?:\.{2,}|…+)\s*[ivxlcdm\d]+\b", "", text, flags=re.I)
+            nxt = re.sub(r"\s+[ivxlcdm\d]+\s*$", "", nxt, flags=re.I)
+            if nxt == text:
+                break
+            text = nxt
+        return re.sub(r"\s+", " ", text).strip(" .:-–—\t")
+
     def normalize_toc_title(value):
         value = re.sub(r"[*#`_]", "", str(value or ""))
-        value = re.sub(r"\s*(?:\.{2,}|…+)\s*[ivxlcdm\d]+\s*$", "", value, flags=re.I)
-        value = re.sub(r"\s+[ivxlcdm\d]+\s*$", "", value, flags=re.I)
+        value = strip_all_page_leaders(value)
         value = re.sub(r"^\s*[ivxlcdm]+[.)]\s+", "", value, flags=re.I)
         value = re.sub(r"\s+", " ", value).strip(" .:-–—")
         # Ignore common heading numbering when comparing a TOC label with a
@@ -1520,18 +1537,112 @@ def sync_toc_pages():
         value = re.sub(r"^(?:(?:chapter|section)\s+)?(?:\d+(?:\.\d+)*|[ivxlcdm]+)[.)]?\s+", "", value, flags=re.I)
         return value.casefold()
 
+    def split_jammed_end_matter_line(plain):
+        """Split a polluted single line like 'Conclusion ...... 17 Recommendations' into separate titles.
+
+        Returns a list of clean title strings (original casing preserved where possible).
+        """
+        text = strip_all_page_leaders(plain)
+        if not text:
+            return []
+        # Explicit "Conclusion and Recommendations" → two entries.
+        if re.fullmatch(r"conclusions?\s+and\s+recommendations?", text, re.I):
+            return ["Conclusion", "Recommendations"]
+        # Detect two or more known end-matter titles jammed into one string.
+        found = []
+        for m in re.finditer(
+            r"\b(conclusions?|recommendations?|references?|bibliography|works\s+cited|appendices|appendix|summary)\b",
+            text,
+            re.I,
+        ):
+            token = m.group(1)
+            low = re.sub(r"\s+", " ", token).strip().casefold()
+            if low.startswith("conclusion"):
+                label = "Conclusion"
+            elif low.startswith("recommendation"):
+                label = "Recommendations"
+            elif low in {"references", "bibliography"} or low == "works cited":
+                label = "References" if "work" not in low and "biblio" not in low else token.title() if low != "works cited" else "Works Cited"
+                if low == "references":
+                    label = "References"
+                elif low == "bibliography":
+                    label = "Bibliography"
+            elif low.startswith("append"):
+                label = "Appendices"
+            elif low == "summary":
+                label = "Summary"
+            else:
+                label = token
+            if label not in found:
+                found.append(label)
+        if len(found) >= 2:
+            return found
+        return [text]
+
+    def is_pure_end_matter_key(key):
+        key = (key or "").casefold().strip()
+        return key in _END_MATTER_CANON or key in {
+            "conclusion", "conclusions", "recommendation", "recommendations",
+            "references", "bibliography", "works cited", "appendix", "appendices", "summary",
+        }
+
     # Build an exact-title index first. Prefix matching is only a guarded fallback
     # and prefers the longest title, avoiding e.g. "References" matching a longer entry.
+    # Prefer section-card starts (source contains 'section') over in-body heading scans
+    # when both exist for the same normalized key.
     normalized_map = {}
+    normalized_priority = {}
     for title, info in page_map.items():
         if not isinstance(info, dict):
             continue
         key = normalize_toc_title(title)
-        if key and str(info.get("page_start", "")).strip():
-            # Keep the first occurrence: the section-card title is inserted at
-            # its actual section start before any repeated in-body heading.
-            # Overwriting with a later duplicate can move a TOC entry forward.
-            normalized_map.setdefault(key, info)
+        if not key or not str(info.get("page_start", "")).strip():
+            continue
+        source = str(info.get("source") or "")
+        # Higher priority: explicit section starts and end-matter from section cards.
+        priority = 0
+        if "section-start" in source or "merged-section-start" in source:
+            priority = 3
+        elif info.get("kind") in {"end-matter", "chapter"} and info.get("order_no") is not None:
+            priority = 2
+        elif info.get("kind") == "end-matter":
+            priority = 1
+        prev = normalized_priority.get(key, -1)
+        if key not in normalized_map or priority > prev:
+            normalized_map[key] = info
+            normalized_priority[key] = priority
+        elif priority == prev and key not in normalized_map:
+            normalized_map[key] = info
+
+    def match_title_key(key, plain_for_chapter=None):
+        if not key:
+            return None
+        match = normalized_map.get(key)
+        if match is not None:
+            return match
+        # Guarded prefix fallback — skip pure end-matter keys so "conclusion"
+        # cannot absorb "conclusion and recommendations" leftovers incorrectly.
+        if not is_pure_end_matter_key(key):
+            candidates = [
+                (title, info) for title, info in normalized_map.items()
+                if key.startswith(title) and (len(key) == len(title) or key[len(title)] in " :.-–—")
+            ]
+            if candidates:
+                longest = max(len(item[0]) for item in candidates)
+                best = [item for item in candidates if len(item[0]) == longest]
+                if len(best) == 1:
+                    return best[0][1]
+        # Chapter-number fallback only for numbered chapter lines.
+        if plain_for_chapter is not None:
+            line_chapter = _chapter_number(plain_for_chapter)
+            if line_chapter is not None:
+                numbered = [
+                    info for title, info in page_map.items()
+                    if isinstance(info, dict) and _chapter_number(str(title)) == line_chapter
+                ]
+                if len(numbered) == 1:
+                    return numbered[0]
+        return None
 
     conn = None
     try:
@@ -1545,43 +1656,64 @@ def sync_toc_pages():
             refreshed = []
             for line in toc_text.splitlines():
                 plain = re.sub(r"[*#`]", "", line).strip()
+                if not plain:
+                    refreshed.append(line)
+                    continue
                 leading_roman = re.match(r"^([ivxlcdm]+)[.)]\s+(.+)$", plain, re.I)
-                if leading_roman and re.search(r"\b(certification|declaration|dedication|acknowledg|abstract|table of contents|list of (?:tables|figures|abbreviations|symbols))\b", leading_roman.group(2), re.I):
+                if leading_roman and re.search(
+                    r"\b(certification|declaration|dedication|acknowledg|abstract|table of contents|list of (?:tables|figures|abbreviations|symbols))\b",
+                    leading_roman.group(2),
+                    re.I,
+                ):
                     plain = leading_roman.group(2).strip()
+
+                # Repair jammed end-matter lines into separate TOC rows.
+                pieces = split_jammed_end_matter_line(plain)
+                # If this is a normal single title (not jammed), pieces has one item.
+                if len(pieces) >= 2 and any(
+                    re.search(r"\b(conclusion|recommendation|reference|appendi)", p, re.I) for p in pieces
+                ):
+                    for piece in pieces:
+                        key = normalize_toc_title(piece)
+                        match = match_title_key(key, piece)
+                        page = str((match or {}).get("page_start", "")).strip() if match else ""
+                        if page:
+                            refreshed.append(f"{piece.strip()}  ........  {page}")
+                        else:
+                            refreshed.append(piece.strip())
+                    continue
+
                 key = normalize_toc_title(plain)
-                match = normalized_map.get(key)
-
-                # Apply the same matching rules to every generated section.
-                # Exact normalized title wins; a guarded prefix fallback is
-                # allowed only when it identifies one unambiguous source title.
-                if match is None and key:
-                    candidates = [(title, info) for title, info in normalized_map.items()
-                                  if key.startswith(title) and (len(key) == len(title) or key[len(title)] in " :.-–—")]
-                    if candidates:
-                        longest = max(len(item[0]) for item in candidates)
-                        best = [item for item in candidates if len(item[0]) == longest]
-                        if len(best) == 1:
-                            match = best[0][1]
-
-                # Chapter-number fallback is also shared by all section types;
-                # only accept it when there is exactly one matching source.
-                if match is None:
-                    line_chapter = _chapter_number(plain)
-                    if line_chapter is not None:
-                        numbered = [info for title, info in page_map.items()
-                                    if isinstance(info, dict) and _chapter_number(str(title)) == line_chapter]
-                        if len(numbered) == 1:
-                            match = numbered[0]
+                match = match_title_key(key, plain)
 
                 if match is not None:
                     page = str(match.get("page_start", "")).strip()
                     if page:
-                        # Remove old page values before appending the current rendered value.
-                        clean_line = re.sub(r"\s*(?:\.{2,}|…+)\s*[ivxlcdm\d]+\s*$", "", line, flags=re.I)
-                        clean_line = re.sub(r"\s+[ivxlcdm\d]+\s*$", "", clean_line, flags=re.I)
-                        refreshed.append(f"{clean_line.rstrip()}  ........  {page}")
+                        # Always rebuild from the cleaned title — never keep old leaders.
+                        clean_title = strip_all_page_leaders(plain)
+                        # If cleaning left multiple end-matter words, use the matched key's preferred form.
+                        if not clean_title:
+                            clean_title = plain
+                        # Prefer a short canonical label for pure end-matter.
+                        if is_pure_end_matter_key(key):
+                            canon = {
+                                "conclusion": "Conclusion",
+                                "conclusions": "Conclusion",
+                                "recommendation": "Recommendations",
+                                "recommendations": "Recommendations",
+                                "references": "References",
+                                "bibliography": "Bibliography",
+                                "works cited": "Works Cited",
+                                "appendix": "Appendices",
+                                "appendices": "Appendices",
+                                "summary": "Summary",
+                            }.get(key, clean_title)
+                            clean_title = canon
+                        refreshed.append(f"{clean_title}  ........  {page}")
                         continue
-                refreshed.append(line)
+                # Keep original line but still strip duplicated trailing leaders if present.
+                cleaned_keep = strip_all_page_leaders(line) if re.search(r"\.{2,}|…", line) else line
+                refreshed.append(cleaned_keep if cleaned_keep else line)
 
             new_toc = "\n".join(refreshed)
             cur.execute(
@@ -1593,6 +1725,7 @@ def sync_toc_pages():
     finally:
         if conn:
             release_db(conn)
+
 
 
 
