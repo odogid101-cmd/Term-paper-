@@ -673,13 +673,69 @@ def _chapter_number(label):
     return int(token) if token.isdigit() else words.get(token, romans.get(token))
 
 
+def _expand_jammed_toc_lines(toc_text):
+    """Split polluted single lines that contain multiple end-matter titles + page leaders.
+
+    Example input line:
+      References ........ 11 Appendices ........ 15 Conclusion ........ 8 Recommendations ........ 9
+    becomes four separate lines (leaders preserved per title when present).
+    """
+    end_token_re = re.compile(
+        r"(?P<title>conclusions?|recommendations?|references?|bibliography|works\s+cited|appendices|appendix|summary)"
+        r"(?:\s*(?:\.{2,}|…+)\s*(?P<page>[ivxlcdm\d]+))?",
+        re.I,
+    )
+    canon = {
+        "conclusion": "Conclusion", "conclusions": "Conclusion",
+        "recommendation": "Recommendations", "recommendations": "Recommendations",
+        "references": "References", "bibliography": "Bibliography",
+        "works cited": "Works Cited",
+        "appendix": "Appendices", "appendices": "Appendices",
+        "summary": "Summary",
+    }
+    out = []
+    for raw in str(toc_text or "").splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            out.append(line)
+            continue
+        # Count distinct end-matter titles on this line.
+        hits = list(end_token_re.finditer(line))
+        distinct = []
+        for h in hits:
+            key = re.sub(r"\s+", " ", h.group("title")).strip().casefold()
+            label = canon.get(key, h.group("title"))
+            if label not in distinct:
+                distinct.append(label)
+        if len(distinct) >= 2:
+            # Rebuild one clean line per end-matter title; keep a page if the match had one.
+            seen = set()
+            for h in hits:
+                key = re.sub(r"\s+", " ", h.group("title")).strip().casefold()
+                label = canon.get(key, h.group("title"))
+                if label in seen:
+                    continue
+                seen.add(label)
+                page = (h.group("page") or "").strip()
+                if page:
+                    out.append(f"{label}  ........  {page}")
+                else:
+                    out.append(label)
+            continue
+        out.append(line)
+    return "\n".join(out).strip()
+
+
 def _normalize_separate_end_matter_toc(toc_text):
     """Ensure Conclusion/Recommendations are standalone TOC entries, not 5.x subsections."""
+    toc_text = _expand_jammed_toc_lines(toc_text)
     output = []
     moved = []
     for raw in str(toc_text or "").splitlines():
         line = raw.strip()
-        bare = re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s*", "", line).strip()
+        # Drop leaders for classification only
+        bare = re.sub(r"\s*(?:\.{2,}|…+)\s*[ivxlcdm\d]+\s*$", "", line, flags=re.I).strip()
+        bare = re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s*", "", bare).strip()
         if re.match(r"^(conclusion|conclusions)\b", bare, re.I):
             moved.append("Conclusion")
             continue
@@ -690,7 +746,10 @@ def _normalize_separate_end_matter_toc(toc_text):
     # Preserve only one standalone entry, in the agreed order, at the end of main matter.
     if not any(x.lower() == "conclusion" for x in moved): moved.insert(0, "Conclusion")
     for item in ("Conclusion", "Recommendations"):
-        if item in moved and not any(re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s*", "", x).strip().lower() == item.lower() for x in output):
+        if item in moved and not any(
+            re.sub(r"\s*(?:\.{2,}|…+)\s*[ivxlcdm\d]+\s*$", "", re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s*", "", x), flags=re.I).strip().lower() == item.lower()
+            for x in output
+        ):
             output.append(item)
     return "\n".join(output).strip()
 
@@ -997,15 +1056,17 @@ def pull_next():
         if action == "edit_toc":
             incoming=str(data.get("content",""))
             edited_toc=_normalize_separate_end_matter_toc(content_plain_text(incoming).strip())
+            edited_toc=_expand_jammed_toc_lines(edited_toc)
             if not edited_toc:
                 return jsonify({"error":"Table of contents cannot be empty."}),400
             inline_enabled=bool(data.get("inline_enabled",False))
             if inline_enabled:
                 refined=generate_with_groq(
                     "Clean up and refine ONLY this academic table of contents. Preserve all chapter and subsection names, their numbering, and their order. "
-                    "Use one entry per line. Do not write the paper and do not invent page numbers. Return only the corrected TOC.\n\n"+edited_toc
+                    "Use one entry per line. Keep Conclusion, Recommendations, References and Appendices as separate lines. "
+                    "Do not write the paper and do not invent page numbers. Return only the corrected TOC.\n\n"+edited_toc
                 )
-                edited_toc=normalize_server_text(refined)
+                edited_toc=_expand_jammed_toc_lines(normalize_server_text(refined))
             with conn.cursor() as cur:
                 cur.execute("UPDATE paper_tocs SET toc_text=%s,sections_json=%s::jsonb,updated_at=CURRENT_TIMESTAMP WHERE user_id=%s AND toc_code=%s",
                             (edited_toc,json.dumps(_section_items(edited_toc,config)),int(uid),tc))
@@ -1715,7 +1776,7 @@ def sync_toc_pages():
                 cleaned_keep = strip_all_page_leaders(line) if re.search(r"\.{2,}|…", line) else line
                 refreshed.append(cleaned_keep if cleaned_keep else line)
 
-            new_toc = "\n".join(refreshed)
+            new_toc = _expand_jammed_toc_lines("\n".join(refreshed))
             cur.execute(
                 "UPDATE paper_tocs SET toc_text=%s,page_map_json=%s::jsonb,updated_at=CURRENT_TIMESTAMP WHERE user_id=%s AND toc_code=%s",
                 (new_toc, json.dumps(page_map), int(uid), code)
