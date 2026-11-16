@@ -679,7 +679,7 @@ def _expand_jammed_toc_lines(toc_text):
     Example input line:
       References ........ 11 Appendices ........ 15 Conclusion ........ 8 Recommendations ........ 9
     becomes four separate lines (leaders preserved per title when present).
-    Also strips accidental HTML tags that may have been saved into toc_text.
+    Also strips accidental HTML tags / markdown heading markers that may have been saved into toc_text.
     """
     text = str(toc_text or "")
     if re.search(r"</?(?:h[1-6]|p|div|span|br|ul|ol|li)\b", text, re.I) or text.startswith("[[TEMPAPER_RICH_HTML]]"):
@@ -703,12 +703,28 @@ def _expand_jammed_toc_lines(toc_text):
         "appendix": "Appendices", "appendices": "Appendices",
         "summary": "Summary",
     }
+
+    def _dedupe_key(line):
+        bare = re.sub(r"\s*(?:\.{2,}|…+)\s*[ivxlcdm\d]+\b", "", str(line or ""), flags=re.I)
+        bare = re.sub(r"^\s*#{1,6}\s+", "", bare)
+        bare = re.sub(r"^\s*\*\*\s*|\s*\*\*\s*$", "", bare)
+        return re.sub(r"\s+", " ", bare).strip().casefold()
+
+    def _has_page(line):
+        return bool(re.search(r"(?:\.{2,}|…+)\s*[ivxlcdm\d]+\b|\s+[ivxlcdm\d]+\s*$", str(line or ""), re.I))
+
     out = []
+    seen_keys = {}
     for raw in text.splitlines():
         line = raw.rstrip()
         if not line.strip():
             out.append(line)
             continue
+        # Strip markdown heading markers (## Chapter 1) so draft TOC blocks
+        # do not appear as a second page-less copy of the real entries.
+        line = re.sub(r"^\s*#{1,6}\s+", "", line)
+        line = re.sub(r"^\s*\*\*\s*", "", line)
+        line = re.sub(r"\s*\*\*\s*$", "", line)
         # Count distinct end-matter titles on this line.
         hits = list(end_token_re.finditer(line))
         distinct = []
@@ -727,13 +743,24 @@ def _expand_jammed_toc_lines(toc_text):
                     continue
                 seen.add(label)
                 page = (h.group("page") or "").strip()
-                if page:
-                    out.append(f"{label}  ........  {page}")
-                else:
-                    out.append(label)
+                rebuilt = f"{label}  ........  {page}" if page else label
+                dkey = _dedupe_key(rebuilt)
+                if dkey in seen_keys:
+                    if _has_page(rebuilt) and not _has_page(out[seen_keys[dkey]]):
+                        out[seen_keys[dkey]] = rebuilt
+                    continue
+                seen_keys[dkey] = len(out)
+                out.append(rebuilt)
             continue
+        dkey = _dedupe_key(line)
+        if dkey in seen_keys:
+            if _has_page(line) and not _has_page(out[seen_keys[dkey]]):
+                out[seen_keys[dkey]] = line
+            continue
+        seen_keys[dkey] = len(out)
         out.append(line)
     return "\n".join(out).strip()
+
 
 
 def _normalize_separate_end_matter_toc(toc_text):
