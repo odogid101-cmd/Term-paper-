@@ -679,7 +679,17 @@ def _expand_jammed_toc_lines(toc_text):
     Example input line:
       References ........ 11 Appendices ........ 15 Conclusion ........ 8 Recommendations ........ 9
     becomes four separate lines (leaders preserved per title when present).
+    Also strips accidental HTML tags that may have been saved into toc_text.
     """
+    text = str(toc_text or "")
+    if re.search(r"</?(?:h[1-6]|p|div|span|br|ul|ol|li)\b", text, re.I) or text.startswith("[[TEMPAPER_RICH_HTML]]"):
+        text = re.sub(r"^\[\[TEMPAPER_RICH_HTML\]\]", "", text)
+        text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+        text = re.sub(r"</(?:p|div|h[1-6]|li|tr)>", "\n", text, flags=re.I)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = html_unescape(text)
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
     end_token_re = re.compile(
         r"(?P<title>conclusions?|recommendations?|references?|bibliography|works\s+cited|appendices|appendix|summary)"
         r"(?:\s*(?:\.{2,}|…+)\s*(?P<page>[ivxlcdm\d]+))?",
@@ -694,7 +704,7 @@ def _expand_jammed_toc_lines(toc_text):
         "summary": "Summary",
     }
     out = []
-    for raw in str(toc_text or "").splitlines():
+    for raw in text.splitlines():
         line = raw.rstrip()
         if not line.strip():
             out.append(line)
