@@ -280,10 +280,15 @@ def init_db():
                     prompt_text TEXT,
                     result_text TEXT,
                     word_count INTEGER,
+                    messages_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    client_session_id VARCHAR(128),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
+            # Existing deployments: add fields needed for cross-device chat history.
+            cur.execute("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS messages_json JSONB NOT NULL DEFAULT '[]'::jsonb")
+            cur.execute("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS client_session_id VARCHAR(128)")
 
             # migration-safe: add last_login if it doesn't already exist
             cur.execute(
@@ -2462,6 +2467,112 @@ def _repair_incomplete_chapter(content: str, title: str, prompt_text: str, toc_t
 
 
 # --- ROUTES (original term-paper logic preserved) ---
+
+@app.route("/chat-sessions", methods=["GET", "POST"])
+def chat_sessions():
+    """Synchronize a user's recent chat sessions across devices. Local copies remain usable offline."""
+    if request.method == "GET":
+        uid = request.args.get("user_id", "")
+        if not uid.isdigit() or int(uid) <= 0:
+            return jsonify({"sessions": []}), 200
+        conn = None
+        try:
+            conn = get_db()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT client_session_id,session_id,title,messages_json,created_at,prompt_text,result_text FROM chat_sessions WHERE user_id=%s ORDER BY created_at DESC LIMIT 50",
+                    (int(uid),),
+                )
+                rows = cur.fetchall()
+            sessions = []
+            for row in rows:
+                messages = row[3] or []
+                if isinstance(messages, str):
+                    try:
+                        messages = json.loads(messages)
+                    except Exception:
+                        messages = []
+                if not isinstance(messages, list) or not messages:
+                    # Backward compatibility for chat rows saved before full message history existed.
+                    prompt_text = str(row[5] or "").strip()
+                    result_text = str(row[6] or "").strip()
+                    messages = ([{"prompt": prompt_text, "result": result_text, "isPaper": bool(result_text)}]
+                                if prompt_text or result_text else [])
+                if not messages:
+                    continue
+                sessions.append({
+                    "id": row[0] or row[1],
+                    "title": row[2] or "Paper",
+                    "messages": messages,
+                    "time": int(row[4].timestamp() * 1000) if row[4] else 0,
+                    "workflow": False,
+                })
+            return jsonify({"sessions": sessions}), 200
+        except Exception as exc:
+            logger.exception("chat-sessions GET failed")
+            return jsonify({"error": "Could not load chat history"}), 500
+        finally:
+            if conn:
+                release_db(conn)
+
+    data = request.get_json(silent=True) or {}
+    uid = str(data.get("user_id", ""))
+    client_id = str(data.get("session_id", "")).strip()[:128]
+    title = str(data.get("title", "Paper")).strip()[:200] or "Paper"
+    messages = data.get("messages", [])
+    if not uid.isdigit() or int(uid) <= 0 or not client_id or not isinstance(messages, list):
+        return jsonify({"error": "Valid user and chat session are required"}), 400
+
+    # Bound payload size and keep only the fields the dashboard needs to restore a chat.
+    safe_messages = []
+    for item in messages[-100:]:
+        if not isinstance(item, dict):
+            continue
+        safe_messages.append({
+            "prompt": str(item.get("prompt", ""))[:20000],
+            "result": str(item.get("result", ""))[:200000],
+            "isPaper": bool(item.get("isPaper")),
+            "workflow": bool(item.get("workflow")),
+            "project_id": item.get("project_id"),
+            "order_no": item.get("order_no"),
+            "kind": str(item.get("kind", ""))[:40],
+        })
+    if not safe_messages:
+        return jsonify({"error": "Chat contains no restorable messages"}), 400
+
+    import hashlib
+    db_session_id = "u{}_{}".format(int(uid), hashlib.sha256(client_id.encode("utf-8")).hexdigest()[:40])
+    first_prompt = next((m["prompt"] for m in safe_messages if m["prompt"]), title)
+    last_result = next((m["result"] for m in reversed(safe_messages) if m["result"]), "")
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE id=%s", (int(uid),))
+            if not cur.fetchone():
+                return jsonify({"error": "User account not found"}), 404
+            cur.execute(
+                """INSERT INTO chat_sessions
+                   (user_id,session_id,client_session_id,title,prompt_text,result_text,word_count,messages_json)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                   ON CONFLICT (session_id) DO UPDATE SET
+                     client_session_id=EXCLUDED.client_session_id,title=EXCLUDED.title,
+                     prompt_text=EXCLUDED.prompt_text,result_text=EXCLUDED.result_text,
+                     word_count=EXCLUDED.word_count,messages_json=EXCLUDED.messages_json,created_at=CURRENT_TIMESTAMP
+                   WHERE chat_sessions.user_id=EXCLUDED.user_id""",
+                (int(uid), db_session_id, client_id, title, first_prompt, last_result, len(last_result.split()), json.dumps(safe_messages)),
+            )
+            conn.commit()
+        return jsonify({"message": "Chat synchronized", "session_id": client_id}), 200
+    except Exception as exc:
+        if conn:
+            conn.rollback()
+        logger.exception("chat-sessions POST failed")
+        return jsonify({"error": "Could not synchronize chat"}), 500
+    finally:
+        if conn:
+            release_db(conn)
+
 
 @app.route("/workflow-projects", methods=["GET"])
 def workflow_projects():
