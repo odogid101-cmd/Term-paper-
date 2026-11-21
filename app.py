@@ -362,7 +362,8 @@ RICH_HTML_MARKER = "[[TEMPAPER_RICH_HTML]]"
 _ALLOWED_RICH_TAGS = {
     "p", "div", "span", "h1", "h2", "h3", "h4", "strong", "b", "em", "i",
     "u", "s", "del", "ul", "ol", "li", "blockquote", "br", "sub", "sup", "font",
-    "img", "figure", "figcaption"
+    "img", "figure", "figcaption", "table", "thead", "tbody", "tr", "th", "td",
+    "hr", "section", "article"
 }
 # Extra attrs kept for Monkey Scout figures (move/resize/caption persistence)
 _FIGURE_DATA_ATTRS = {"data-fig-id", "data-fig-label", "data-fig-url", "data-fig-caption", "data-bound", "data-fig-main-label", "data-auto-placeholder"}
@@ -493,6 +494,14 @@ class _PlainTextExtractor(HTMLParser):
 
 def content_plain_text(value):
     value = str(value or "")
+    pages_marker = "[[MERGED_PAGES_HTML]]"
+    if value.startswith(pages_marker):
+        value = value[len(pages_marker):]
+        # Page snapshots are HTML
+        parser = _PlainTextExtractor()
+        parser.feed(value)
+        parser.close()
+        return parser.get_text()
     if value.startswith(RICH_HTML_MARKER):
         parser = _PlainTextExtractor()
         parser.feed(value[len(RICH_HTML_MARKER):])
@@ -1117,9 +1126,13 @@ def pull_next():
 
         if action in {"edit", "edit_merged"}:
             incoming=str(data.get("content",""))
-            plain_check=content_plain_text(incoming).strip()
-            has_figure = bool(re.search(r"<img\b|<figure\b", incoming, re.I))
-            if not plain_check and not has_figure:
+            pages_marker = "[[MERGED_PAGES_HTML]]"
+            body_for_check = incoming[len(pages_marker):] if incoming.startswith(pages_marker) else incoming
+            plain_check=content_plain_text(
+                body_for_check if body_for_check.startswith(RICH_HTML_MARKER) else (RICH_HTML_MARKER + body_for_check if "<" in body_for_check else body_for_check)
+            ).strip()
+            has_figure = bool(re.search(r"<img\b|<figure\b|tp-figure|data-fig-url", incoming, re.I))
+            if not plain_check and not has_figure and len(body_for_check.strip()) < 20:
                 return jsonify({"error":"Edited content cannot be empty."}),400
 
             if action == "edit_merged":
@@ -1128,10 +1141,31 @@ def pull_next():
                     merged_row=cur.fetchone()
                     if not merged_row or not merged_row[0]:
                         return jsonify({"error":"This paper has not been merged yet."}),409
-                    saved = sanitize_rich_html(incoming[len(RICH_HTML_MARKER):]) if incoming.startswith(RICH_HTML_MARKER) else incoming.strip()
-                    cur.execute("UPDATE paper_projects SET merged_content=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s AND user_id=%s",(saved,int(pid),int(uid)))
+                    PAGES_MARKER = "[[MERGED_PAGES_HTML]]"
+                    if incoming.startswith(PAGES_MARKER):
+                        # Full A4 page snapshot from edit.html (figures, layout, captions).
+                        body = incoming[len(PAGES_MARKER):]
+                        body = re.sub(r"<script\b[^>]*>.*?</script>", "", body, flags=re.I|re.S)
+                        body = re.sub(r"\son\w+=([\'"]).*?\1", "", body, flags=re.I|re.S)
+                        # Cap extreme payloads
+                        if len(body) > 8_000_000:
+                            return jsonify({"error":"Document is too large to save."}),413
+                        saved = PAGES_MARKER + body
+                    elif incoming.startswith(RICH_HTML_MARKER):
+                        saved = sanitize_rich_html(incoming[len(RICH_HTML_MARKER):])
+                    else:
+                        saved = sanitize_rich_html(incoming)
+                    cur.execute(
+                        "UPDATE paper_projects SET merged=TRUE, merged_content=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s AND user_id=%s",
+                        (saved, int(pid), int(uid)),
+                    )
                 conn.commit()
-                return jsonify({"message":"Merged document changes saved directly.","title":"Complete Term Paper","result":saved,"merged":True}),200
+                return jsonify({
+                    "message": "Merged document saved permanently to your account.",
+                    "title": "Complete Term Paper",
+                    "result": saved,
+                    "merged": True,
+                }), 200
 
             edited_plain=content_plain_text(incoming).strip()
             order_no=int(data.get("order_no",current_index))
