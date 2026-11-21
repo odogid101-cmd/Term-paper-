@@ -2624,6 +2624,15 @@ def workflow_projects():
             release_db(conn)
 
 
+@app.route("/edit.html", methods=["GET"])
+def termpaper_editor():
+    from flask import send_file
+    editor_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "edit.html")
+    if not os.path.isfile(editor_path):
+        return jsonify({"error": "Editor file is not installed."}), 404
+    return send_file(editor_path, mimetype="text/html")
+
+
 @app.route("/", methods=["GET", "HEAD"])
 def health_check():
     return jsonify({"status": "ok", "message": f"Monkey Scout API running - Groq {GROQ_MODEL}", "groq_keys": len(_groq_clients)}), 200
