@@ -8,3 +8,5 @@ Werkzeug
 groq
 gunicorn
 python-dotenv
+pywebpush
+py-vapid
