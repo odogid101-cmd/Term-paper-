@@ -85,6 +85,12 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY")
 
+# Web Push (VAPID) — generate once: python -c "from py_vapid import Vapid01; v=Vapid01(); v.generate_keys(); print(v.public_key); print(v.private_key)"
+# Or: npx web-push generate-vapid-keys
+VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
+VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "mailto:admin@monkeyscout.cv")
+
 def _collect_groq_keys():
     """Build an ordered unique list of Groq API keys from env."""
     keys = []
@@ -289,6 +295,22 @@ def init_db():
             # Existing deployments: add fields needed for cross-device chat history.
             cur.execute("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS messages_json JSONB NOT NULL DEFAULT '[]'::jsonb")
             cur.execute("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS client_session_id VARCHAR(128)")
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS push_subscriptions (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    endpoint TEXT NOT NULL,
+                    p256dh TEXT NOT NULL,
+                    auth TEXT NOT NULL,
+                    user_agent TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, endpoint)
+                )
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_push_subs_user ON push_subscriptions(user_id)")
 
             # migration-safe: add last_login if it doesn't already exist
             cur.execute(
@@ -1146,7 +1168,7 @@ def pull_next():
                         # Full A4 page snapshot from edit.html (figures, layout, captions).
                         body = incoming[len(PAGES_MARKER):]
                         body = re.sub(r"<script\b[^>]*>.*?</script>", "", body, flags=re.I|re.S)
-                        body = re.sub(r"\son\w+=([\'"]).*?\1", "", body, flags=re.I|re.S)
+                        body = re.sub(r"\son\w+=(['\"]).*?\1", "", body, flags=re.I|re.S)
                         # Cap extreme payloads
                         if len(body) > 8_000_000:
                             return jsonify({"error":"Document is too large to save."}),413
@@ -2672,6 +2694,104 @@ def health_check():
     return jsonify({"status": "ok", "message": f"Monkey Scout API running - Groq {GROQ_MODEL}", "groq_keys": len(_groq_clients)}), 200
 
 
+
+
+# --- Web Push helpers ---
+def _push_available():
+    return bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY)
+
+
+def send_web_push(user_id, title, body, url="/dashboard.html", tag=None, icon=None):
+    """Send a Web Push notification to all devices registered for this user.
+    Returns number of successful deliveries. Safe no-op if VAPID not configured.
+    """
+    if not _push_available() or not user_id:
+        return 0
+    try:
+        from pywebpush import webpush, WebPushException
+    except ImportError:
+        logger.warning("pywebpush not installed — skip push. pip install pywebpush")
+        return 0
+
+    payload = {
+        "title": str(title or "Monkey Scout")[:120],
+        "body": str(body or "")[:300],
+        "url": str(url or "/dashboard.html"),
+        "tag": tag or "monkey-scout",
+        "icon": icon or "https://i.postimg.cc/3xqH7Z6F/20261110-205017.png",
+    }
+    import json as _json
+    data = _json.dumps(payload)
+
+    conn = None
+    sent = 0
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE user_id=%s",
+                (int(user_id),),
+            )
+            rows = cur.fetchall()
+        dead_ids = []
+        for row in rows:
+            sub_id, endpoint, p256dh, auth = row
+            subscription_info = {
+                "endpoint": endpoint,
+                "keys": {"p256dh": p256dh, "auth": auth},
+            }
+            try:
+                webpush(
+                    subscription_info=subscription_info,
+                    data=data,
+                    vapid_private_key=VAPID_PRIVATE_KEY,
+                    vapid_claims={"sub": VAPID_SUBJECT},
+                )
+                sent += 1
+            except Exception as e:
+                msg = str(e).lower()
+                # Gone / unsubscribed
+                if "410" in msg or "404" in msg or "expired" in msg or "unsubscribed" in msg:
+                    dead_ids.append(sub_id)
+                else:
+                    logger.warning(f"Push failed for sub {sub_id}: {e}")
+        if dead_ids:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM push_subscriptions WHERE id = ANY(%s)",
+                    (dead_ids,),
+                )
+                conn.commit()
+    except Exception as e:
+        logger.exception(f"send_web_push error: {e}")
+    finally:
+        if conn:
+            release_db(conn)
+    return sent
+
+
+def send_web_push_broadcast(title, body, url="/dashboard.html", tag="admin"):
+    """Notify every subscribed user (admin feature announcements)."""
+    if not _push_available():
+        return {"sent": 0, "users": 0}
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT user_id FROM push_subscriptions")
+            uids = [r[0] for r in cur.fetchall()]
+    except Exception as e:
+        logger.exception(f"broadcast list failed: {e}")
+        return {"sent": 0, "users": 0, "error": str(e)[:200]}
+    finally:
+        if conn:
+            release_db(conn)
+    total = 0
+    for uid in uids:
+        total += send_web_push(uid, title, body, url=url, tag=tag)
+    return {"sent": total, "users": len(uids)}
+
+
 @app.route("/register", methods=["POST"])
 def register():
     data = request.get_json(silent=True) or {}
@@ -2848,6 +2968,129 @@ def reset_pwd():
             release_db(conn)
 
 
+
+
+@app.route("/push/vapid-public-key", methods=["GET"])
+def push_vapid_public():
+    if not VAPID_PUBLIC_KEY:
+        return jsonify({"error": "Web Push not configured", "publicKey": ""}), 503
+    return jsonify({"publicKey": VAPID_PUBLIC_KEY}), 200
+
+
+@app.route("/push/subscribe", methods=["POST"])
+def push_subscribe():
+    data = request.get_json(silent=True) or {}
+    uid = str(data.get("user_id", "")).strip()
+    sub = data.get("subscription") or {}
+    if not uid.isdigit() or int(uid) <= 0:
+        return jsonify({"error": "Valid user_id required"}), 400
+    endpoint = str((sub.get("endpoint") if isinstance(sub, dict) else "") or "").strip()
+    keys = (sub.get("keys") if isinstance(sub, dict) else {}) or {}
+    p256dh = str(keys.get("p256dh") or "").strip()
+    auth = str(keys.get("auth") or "").strip()
+    if not endpoint or not p256dh or not auth:
+        return jsonify({"error": "Invalid push subscription"}), 400
+    ua = (request.headers.get("User-Agent") or "")[:300]
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE id=%s", (int(uid),))
+            if not cur.fetchone():
+                return jsonify({"error": "User not found"}), 404
+            cur.execute(
+                """
+                INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, user_agent)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (user_id, endpoint) DO UPDATE SET
+                  p256dh = EXCLUDED.p256dh,
+                  auth = EXCLUDED.auth,
+                  user_agent = EXCLUDED.user_agent
+                """,
+                (int(uid), endpoint, p256dh, auth, ua),
+            )
+            conn.commit()
+        return jsonify({"message": "Subscribed to notifications"}), 200
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.exception("push subscribe failed")
+        return jsonify({"error": "Could not save subscription"}), 500
+    finally:
+        if conn:
+            release_db(conn)
+
+
+@app.route("/push/unsubscribe", methods=["POST"])
+def push_unsubscribe():
+    data = request.get_json(silent=True) or {}
+    uid = str(data.get("user_id", "")).strip()
+    endpoint = str(data.get("endpoint") or "").strip()
+    if not uid.isdigit():
+        return jsonify({"error": "Valid user_id required"}), 400
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            if endpoint:
+                cur.execute(
+                    "DELETE FROM push_subscriptions WHERE user_id=%s AND endpoint=%s",
+                    (int(uid), endpoint),
+                )
+            else:
+                cur.execute("DELETE FROM push_subscriptions WHERE user_id=%s", (int(uid),))
+            conn.commit()
+        return jsonify({"message": "Unsubscribed"}), 200
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.exception("push unsubscribe failed")
+        return jsonify({"error": "Could not unsubscribe"}), 500
+    finally:
+        if conn:
+            release_db(conn)
+
+
+@app.route("/push/test", methods=["POST"])
+def push_test():
+    """Send a test notification to the current user."""
+    data = request.get_json(silent=True) or {}
+    uid = str(data.get("user_id", "")).strip()
+    if not uid.isdigit():
+        return jsonify({"error": "Valid user_id required"}), 400
+    if not _push_available():
+        return jsonify({"error": "VAPID keys not configured on server"}), 503
+    n = send_web_push(
+        int(uid),
+        title="Monkey Scout",
+        body="Notifications are working on this device.",
+        url="/dashboard.html",
+        tag="test",
+    )
+    if n == 0:
+        return jsonify({"error": "No active subscriptions for this account. Enable notifications in Settings first."}), 400
+    return jsonify({"message": f"Sent to {n} device(s)"}), 200
+
+
+@app.route("/push/broadcast", methods=["POST"])
+def push_broadcast():
+    """Admin: announce a new feature to all subscribed users.
+    Protect with ADMIN_PUSH_SECRET env var.
+    Body: { "secret": "...", "title": "...", "body": "...", "url": "/dashboard.html" }
+    """
+    data = request.get_json(silent=True) or {}
+    secret = str(data.get("secret") or "")
+    expected = os.environ.get("ADMIN_PUSH_SECRET", "")
+    if not expected or secret != expected:
+        return jsonify({"error": "Unauthorized"}), 401
+    title = str(data.get("title") or "Monkey Scout update")[:120]
+    body = str(data.get("body") or "Something new is available.")[:300]
+    url = str(data.get("url") or "/dashboard.html")
+    result = send_web_push_broadcast(title, body, url=url, tag="admin")
+    return jsonify({"message": "Broadcast queued", **result}), 200
+
+
+
 @app.route("/me", methods=["GET"])
 @cache.cached(timeout=300, query_string=True)
 def get_me():
@@ -2908,6 +3151,19 @@ def generate_paper():
             finally:
                 if conn:
                     release_db(conn)
+
+        # Device notification when a paper finishes generating
+        try:
+            if str(user_id).isdigit():
+                send_web_push(
+                    int(user_id),
+                    title="Term paper ready",
+                    body=f"Your paper is ready ({word_count} words, ~{page_count} pages).",
+                    url="/dashboard.html",
+                    tag="paper-ready",
+                )
+        except Exception as push_err:
+            logger.warning(f"paper-ready push skipped: {push_err}")
 
         return jsonify({"result": result_text, "sources": sources, "word_count": word_count, "page_count": page_count}), 200
     except Exception as e:
