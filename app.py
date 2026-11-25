@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from html import escape as html_escape, unescape as html_unescape
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 
 # Cache fallback
@@ -384,7 +384,7 @@ RICH_HTML_MARKER = "[[TEMPAPER_RICH_HTML]]"
 _ALLOWED_RICH_TAGS = {
     "p", "div", "span", "h1", "h2", "h3", "h4", "strong", "b", "em", "i",
     "u", "s", "del", "ul", "ol", "li", "blockquote", "br", "sub", "sup", "font",
-    "img", "figure", "figcaption", "table", "thead", "tbody", "tr", "th", "td",
+    "img", "figure", "figcaption", "table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption", "a",
     "hr", "section", "article"
 }
 # Extra attrs kept for Monkey Scout figures (move/resize/caption persistence)
@@ -394,7 +394,9 @@ _ALLOWED_STYLE_PROPS = {
     "font-family", "font-size", "color", "background-color", "text-align",
     "margin-left", "margin-right", "margin-top", "margin-bottom", "text-indent",
     "width", "max-width", "height", "max-height", "object-fit", "display",
-    "float", "clear"
+    "float", "clear", "border", "border-collapse", "border-width", "border-color", "border-style",
+    "padding", "padding-left", "padding-right", "padding-top", "padding-bottom", "vertical-align",
+    "min-width", "box-sizing", "line-height"
 }
 
 class _RichHTMLSanitizer(HTMLParser):
@@ -437,6 +439,34 @@ class _RichHTMLSanitizer(HTMLParser):
                     safe_attrs.append((key, value))
                 elif key in {"width", "height"} and re.fullmatch(r"\d{1,4}%?", value):
                     safe_attrs.append((key, value))
+                continue
+            # Quill formatting classes, hyperlinks, and editable table structure.
+            if key == "class" and re.fullmatch(r"[A-Za-z0-9 _\-]{1,160}", value):
+                safe_attrs.append((key, value))
+                continue
+            if tag == "a" and key == "href":
+                if re.match(r"^(https?://|mailto:)[^\s<>]{1,1800}$", value, re.I):
+                    safe_attrs.append((key, value))
+                continue
+            if tag == "a" and key in {"target", "rel"}:
+                if (key == "target" and value in {"_blank", "_self"}) or (key == "rel" and re.fullmatch(r"[A-Za-z ]{1,80}", value)):
+                    safe_attrs.append((key, value))
+                continue
+            if tag in {"table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption"}:
+                if key in {"colspan", "rowspan"} and re.fullmatch(r"[1-9][0-9]?", value):
+                    safe_attrs.append((key, value))
+                    continue
+                if key in {"width", "height"} and re.fullmatch(r"\d{1,4}%?", value):
+                    safe_attrs.append((key, value))
+                    continue
+                if tag == "tr" and key == "data-row" and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", value):
+                    safe_attrs.append((key, value))
+                    continue
+                if tag in {"td", "th"} and key == "scope" and value in {"row", "col", "rowgroup", "colgroup"}:
+                    safe_attrs.append((key, value))
+                    continue
+            if tag in {"li"} and key == "data-list" and value in {"ordered", "bullet", "checked", "unchecked"}:
+                safe_attrs.append((key, value))
                 continue
             if tag in {"div", "figure", "span", "figcaption"} and (
                 key in {"class", "data-fig-label", "data-fig-url", "data-fig-caption", "title"} or key.startswith("data-")
@@ -503,7 +533,7 @@ class _PlainTextExtractor(HTMLParser):
     def handle_data(self, data):
         self.parts.append(data)
     def handle_starttag(self, tag, attrs):
-        if tag in {"p", "div", "h1", "h2", "h3", "h4", "li", "br", "blockquote", "figure", "figcaption"}:
+        if tag in {"p", "div", "h1", "h2", "h3", "h4", "li", "br", "blockquote", "figure", "figcaption", "table", "tr", "td", "th"}:
             self.parts.append("\n")
         if tag == "img":
             # Prefer alt text so word counts stay meaningful
@@ -3323,6 +3353,369 @@ def chat():
         if "429" in msg:
             return jsonify({"error": "Groq rate limit, wait"}), 429
         return jsonify({"error": "Chat generation failed", "details": msg[:300]}), 500
+
+
+
+# ---------------------------------------------------------------------------
+# Monkey Scout Quill full-document editor
+# Quill runs in the browser; no Python Quill package or API key is required.
+# The merged_content column remains the single authoritative whole-paper copy.
+# ---------------------------------------------------------------------------
+QUILL_EDITOR_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Monkey Scout Editor</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.snow.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/quill-table-up@3.6.0/index.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/quill-table-up@3.6.0/table-creator.css">
+<style>
+:root{--green:#13834b;--ink:#17231d;--muted:#718078;--line:#e2e9e4;--bg:#f2f5f3}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;font-family:Inter,Arial,sans-serif;color:var(--ink);background:var(--bg)}
+.topbar{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:12px;min-height:64px;padding:10px 18px;background:#fff;border-bottom:1px solid var(--line);box-shadow:0 3px 14px #15251b0a}
+.brand{font-weight:800;letter-spacing:-.3px;color:var(--green);white-space:nowrap}
+.doc-title{flex:1;min-width:0;font-size:14px;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.status{font-size:12px;color:var(--muted);white-space:nowrap}
+.btn{border:1px solid var(--line);border-radius:9px;padding:10px 14px;background:#fff;color:var(--ink);font-weight:650;cursor:pointer}
+.btn.primary{background:var(--green);border-color:var(--green);color:#fff}
+.btn:disabled{opacity:.55;cursor:wait}
+#toolbar{position:sticky;top:64px;z-index:25;background:#fff;border:0;border-bottom:1px solid var(--line);padding:8px 12px;display:flex;flex-wrap:wrap;justify-content:center;gap:4px}
+#toolbar .ql-formats{margin-right:7px}
+#toolbar button,#toolbar select{height:30px}
+.workspace{min-height:calc(100vh - 120px);overflow:auto;padding:24px 14px 70px}
+.paper-wrap{width:max-content;min-width:100%;margin:0 auto}
+#editor{width:794px;margin:0 auto;background:#fff;box-shadow:0 8px 34px #14291c18;border:1px solid #e3e8e4}
+.ql-container.ql-snow{border:0;font-family:"Times New Roman",serif}
+.ql-editor{min-height:1123px;padding:82px 86px 90px;font-family:"Times New Roman",serif;font-size:12pt;line-height:1.5;color:#111;overflow:visible}
+.ql-editor p{margin:0 0 8px;text-align:justify}
+.ql-editor h1,.ql-editor h2,.ql-editor h3{font-family:"Times New Roman",serif;font-weight:700;color:#111}
+.ql-editor h1{font-size:16pt}.ql-editor h2{font-size:14pt}.ql-editor h3{font-size:12pt}
+.ql-editor img{max-width:100%;height:auto;cursor:pointer}
+.ql-editor table{width:100%;border-collapse:collapse;table-layout:fixed}
+.ql-editor td,.ql-editor th{border:1px solid #555;padding:6px;vertical-align:top;overflow-wrap:anywhere}
+.ql-editor th{font-weight:700;background:#f3f5f3}
+.ql-editor a{color:#1768b0;text-decoration:underline}
+.ql-tooltip{z-index:40}
+.hint{max-width:794px;margin:0 auto 12px;color:#6b786f;font-size:12px;text-align:center}
+@media(max-width:850px){.topbar{padding:9px 10px;gap:7px}.brand{font-size:13px}.doc-title{font-size:12px}.status{display:none}.btn{padding:9px 10px;font-size:12px}#toolbar{top:58px;justify-content:flex-start;overflow-x:auto;flex-wrap:nowrap}.workspace{padding:14px 8px 50px}#editor{margin:0;width:min(794px,calc(100vw - 16px))}.ql-editor{min-height:1123px;padding:58px 42px;font-size:12pt}.paper-wrap{width:100%}}
+@media print{.topbar,#toolbar,.hint{display:none!important}.workspace{padding:0;background:#fff}#editor{width:auto;margin:0;border:0;box-shadow:none}.ql-editor{padding:20mm 22mm;min-height:initial}}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">MONKEY SCOUT</div>
+  <div class="doc-title" id="documentTitle">Complete Term Paper</div>
+  <div class="status" id="saveStatus" role="status">Loading paper…</div>
+  <button class="btn" id="backBtn" type="button">Back</button>
+  <button class="btn primary" id="saveBtn" type="button" disabled>Save changes</button>
+</header>
+<div id="toolbar">
+  <span class="ql-formats">
+    <select class="ql-font"><option selected></option><option value="serif"></option><option value="monospace"></option></select>
+    <select class="ql-size"><option value="small"></option><option selected></option><option value="large"></option><option value="huge"></option></select>
+    <select class="ql-header"><option selected></option><option value="1"></option><option value="2"></option><option value="3"></option></select>
+  </span>
+  <span class="ql-formats">
+    <button class="ql-bold"></button><button class="ql-italic"></button><button class="ql-underline"></button><button class="ql-strike"></button>
+  </span>
+  <span class="ql-formats">
+    <select class="ql-color"></select><select class="ql-background"></select>
+  </span>
+  <span class="ql-formats">
+    <button class="ql-list" value="ordered"></button><button class="ql-list" value="bullet"></button>
+    <button class="ql-indent" value="-1"></button><button class="ql-indent" value="+1"></button>
+    <select class="ql-align"></select>
+  </span>
+  <span class="ql-formats">
+    <button class="ql-link"></button><button class="ql-image" title="Insert image"></button>
+    <button class="ql-clean"></button>
+  </span>
+  <span class="ql-formats" id="tableToolbar"></span>
+</div>
+<main class="workspace">
+  <div class="hint">Your complete paper is saved to your Monkey Scout account. Use the table tool to insert and edit rows, columns and cells.</div>
+  <div class="paper-wrap"><div id="editor"></div></div>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.js"></script>
+<script>
+window.MS_EDITOR_CONFIG = {
+  userId: __USER_ID__,
+  projectId: __PROJECT_ID__,
+  returnTo: __RETURN_TO__,
+  title: __TITLE_JSON__
+};
+</script>
+<script type="module">
+const cfg = window.MS_EDITOR_CONFIG;
+const statusEl = document.getElementById('saveStatus');
+const saveBtn = document.getElementById('saveBtn');
+const backBtn = document.getElementById('backBtn');
+const API = location.origin;
+let quill = null;
+let dirty = false;
+let saveTimer = null;
+let saving = false;
+let savePromise = null;
+let editRevision = 0;
+let loadingDocument = true;
+let tableModuleReady = false;
+
+function setStatus(text, bad=false){
+  statusEl.textContent = text;
+  statusEl.style.color = bad ? '#b42318' : '';
+}
+function safeReturn(){
+  const target = cfg.returnTo || 'https://monkeyscout.cv/dashboard';
+  location.href = target;
+}
+async function saveDocument(){
+  if(!quill) return;
+  if(saving) return savePromise;
+  if(!dirty) { setStatus('All changes saved'); return; }
+  saving = true; saveBtn.disabled = true; backBtn.disabled = true;
+  setStatus('Saving…');
+  savePromise = (async()=>{
+    while(dirty){
+      const revisionAtStart = editRevision;
+      const html = quill.root.innerHTML;
+      const response = await fetch(`${API}/api/monkey-scout/quill/save`,{
+        method:'POST',credentials:'include',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({user_id:cfg.userId,project_id:cfg.projectId,html})
+      });
+      const data = await response.json().catch(()=>({}));
+      if(!response.ok) throw new Error(data.error || 'Could not save this paper.');
+      if(editRevision === revisionAtStart){
+        dirty = false;
+        setStatus('All changes saved');
+      }else{
+        dirty = true;
+        setStatus('Saving latest changes…');
+      }
+    }
+  })();
+  try{
+    await savePromise;
+  }catch(err){
+    setStatus(err.message || 'Save failed', true);
+    throw err;
+  }finally{
+    saving = false; savePromise = null;
+    saveBtn.disabled = false; backBtn.disabled = false;
+  }
+}
+function scheduleSave(){
+  if(loadingDocument) return;
+  editRevision += 1;
+  dirty = true; setStatus('Unsaved changes');
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(()=>saveDocument().catch(()=>{}), 1400);
+}
+async function uploadImage(file){
+  if(!file || !file.type.startsWith('image/')) throw new Error('Choose an image file.');
+  if(file.size > 8*1024*1024) throw new Error('Image must be smaller than 8 MB.');
+  const form = new FormData(); form.append('image',file);
+  const response = await fetch(`${API}/upload-image`,{method:'POST',body:form,credentials:'include'});
+  const data = await response.json().catch(()=>({}));
+  if(!response.ok || !data.url) throw new Error(data.error || 'Image upload failed.');
+  return data.url;
+}
+async function boot(){
+  if(!window.Quill) throw new Error('Quill did not load. Refresh this page when your connection is stable.');
+  let TableUp = null, defaultCustomSelect = null;
+  try{
+    const mod = await import('https://cdn.jsdelivr.net/npm/quill-table-up@3.6.0/+esm');
+    TableUp = mod.default; defaultCustomSelect = mod.defaultCustomSelect;
+    if(TableUp){
+      Quill.register({[`modules/${TableUp.moduleName}`]:TableUp},true);
+      tableModuleReady = true;
+      document.getElementById('tableToolbar').innerHTML = `<span class="ql-formats"><button type="button" class="ql-${TableUp.toolName}" title="Insert and edit table"></button></span>`;
+    }
+  }catch(tableErr){
+    console.warn('Table extension unavailable:',tableErr);
+    document.getElementById('tableToolbar').innerHTML = '<span style="font-size:12px;color:#9b4a12;padding:6px">Table tools did not load — refresh to retry</span>';
+  }
+  const modules = {
+    toolbar:{container:'#toolbar',handlers:{
+      image:function(){
+        const input=document.createElement('input');input.type='file';input.accept='image/*';
+        input.onchange=async()=>{
+          const file=input.files && input.files[0]; if(!file)return;
+          const range=quill.getSelection(true) || {index:quill.getLength()};
+          setStatus('Uploading image…');
+          try{
+            const url=await uploadImage(file);
+            quill.insertEmbed(range.index,'image',url,'user');
+            quill.setSelection(range.index+1,0,'silent');
+            scheduleSave();
+          }catch(err){setStatus(err.message,true);alert(err.message);}
+        };
+        input.click();
+      }
+    }},
+    history:{delay:1200,maxStack:100,userOnly:true}
+  };
+  if(tableModuleReady && TableUp){
+    const extModules = [mod.TableVirtualScrollbar,mod.TableAlign,mod.TableResizeLine || mod.TableResizeBox,mod.TableResizeScale,mod.TableSelection,mod.TableMenuContextmenu].filter(Boolean).map(module=>({module}));
+    modules[TableUp.moduleName]={customSelect:defaultCustomSelect,full:true,modules:extModules};
+  }
+  quill = new Quill('#editor',{theme:'snow',modules});
+  quill.on('text-change',scheduleSave);
+  quill.root.addEventListener('click',e=>{
+    if(e.target && e.target.tagName==='IMG'){
+      const current=e.target.style.width || '100%';
+      const next=prompt('Image width (for example 60% or 420px):',current);
+      if(next===null)return;
+      if(!/^(\d{1,3}%|\d{2,4}px)$/.test(next.trim())){alert('Enter a width such as 60% or 420px.');return;}
+      e.target.style.width=next.trim();e.target.style.maxWidth='100%';scheduleSave();
+    }
+  });
+  document.getElementById('documentTitle').textContent=cfg.title || 'Complete Term Paper';
+  const response=await fetch(`${API}/api/monkey-scout/quill/load?project_id=${encodeURIComponent(cfg.projectId)}&user_id=${encodeURIComponent(cfg.userId)}`,{credentials:'include'});
+  const data=await response.json().catch(()=>({}));
+  if(!response.ok) throw new Error(data.error || 'Could not load your saved paper.');
+  quill.clipboard.dangerouslyPasteHTML(data.content_html || '<p><br></p>');
+  clearTimeout(saveTimer);
+  loadingDocument=false; dirty=false; editRevision=0;
+  setStatus('All changes saved'); saveBtn.disabled=false;
+}
+saveBtn.addEventListener('click',()=>saveDocument().catch(err=>alert(err.message)));
+backBtn.addEventListener('click',async()=>{
+  if(dirty){
+    try{await saveDocument();}catch(_){if(!confirm('The latest changes could not be saved. Leave this editor anyway?'))return;}
+  }
+  safeReturn();
+});
+window.addEventListener('beforeunload',e=>{if(dirty){e.preventDefault();e.returnValue='';}});
+boot().catch(err=>{console.error(err);setStatus(err.message || 'Editor could not start',true);alert(err.message || 'Editor could not start.');});
+</script>
+</body>
+</html>"""
+
+def _quill_project_row(conn, user_id, project_id):
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT p.merged, p.merged_content, pr.title
+               FROM paper_projects p
+               JOIN paper_prompts pr ON pr.prompt_code=p.prompt_code
+               WHERE p.id=%s AND p.user_id=%s""",
+            (int(project_id), int(user_id)),
+        )
+        return cur.fetchone()
+
+@app.route("/monkey-scout/editor", methods=["GET"])
+def monkey_scout_quill_editor():
+    uid = str(request.args.get("user_id", "")).strip()
+    pid = str(request.args.get("project_id", "")).strip()
+    if not uid.isdigit() or not pid.isdigit():
+        return "Sign in and open a saved paper first.", 400
+    conn = None
+    try:
+        conn = get_db()
+        row = _quill_project_row(conn, uid, pid)
+        if not row:
+            return "Saved paper not found in this account.", 404
+        if not row[0] or not row[1]:
+            return "Merge the complete paper before opening the editor.", 409
+        title = str(row[2] or "Complete Term Paper")
+        return_to = str(request.args.get("return_to") or "https://monkeyscout.cv/dashboard")
+        # Prevent an arbitrary external redirect from being injected into the editor.
+        allowed_return = (
+            return_to.startswith("https://monkeyscout.cv/")
+            or return_to.startswith("https://www.monkeyscout.cv/")
+            or return_to.startswith("https://odogid101-cmd.github.io/")
+        )
+        if not allowed_return:
+            return_to = "https://monkeyscout.cv/dashboard"
+        html = QUILL_EDITOR_HTML.replace("__USER_ID__", json.dumps(int(uid)))
+        html = html.replace("__PROJECT_ID__", json.dumps(int(pid)))
+        html = html.replace("__RETURN_TO__", json.dumps(return_to))
+        html = html.replace("__TITLE_JSON__", json.dumps(title))
+        return Response(html, mimetype="text/html")
+    except Exception:
+        logger.exception("Could not open Quill editor")
+        return "Could not open the editor. Please try again.", 500
+    finally:
+        if conn:
+            release_db(conn)
+
+@app.route("/api/monkey-scout/quill/load", methods=["GET"])
+def monkey_scout_quill_load():
+    uid = str(request.args.get("user_id", "")).strip()
+    pid = str(request.args.get("project_id", "")).strip()
+    if not uid.isdigit() or not pid.isdigit():
+        return jsonify({"error": "Valid account and project are required."}), 400
+    conn = None
+    try:
+        conn = get_db()
+        row = _quill_project_row(conn, uid, pid)
+        if not row:
+            return jsonify({"error": "Saved paper not found in this account."}), 404
+        if not row[0] or not row[1]:
+            return jsonify({"error": "Merge the complete paper before editing it."}), 409
+        stored = str(row[1] or "")
+        if stored.startswith(RICH_HTML_MARKER):
+            html = stored[len(RICH_HTML_MARKER):]
+        elif stored.startswith("[[MERGED_PAGES_HTML]]"):
+            html = stored[len("[[MERGED_PAGES_HTML]]"):]
+        else:
+            html = content_rich_html(stored)
+        return jsonify({"content_html": html, "title": row[2] or "Complete Term Paper"}), 200
+    except Exception:
+        logger.exception("Quill document load failed")
+        return jsonify({"error": "Could not load the saved paper."}), 500
+    finally:
+        if conn:
+            release_db(conn)
+
+@app.route("/api/monkey-scout/quill/save", methods=["POST"])
+def monkey_scout_quill_save():
+    data = request.get_json(silent=True) or {}
+    uid = str(data.get("user_id", "")).strip()
+    pid = str(data.get("project_id", "")).strip()
+    incoming = str(data.get("html") or "")
+    if not uid.isdigit() or not pid.isdigit():
+        return jsonify({"error": "Valid account and project are required."}), 400
+    if not incoming.strip():
+        return jsonify({"error": "The document cannot be empty."}), 400
+    if len(incoming) > 8_000_000:
+        return jsonify({"error": "Document is too large to save (8 MB limit)."}), 413
+    conn = None
+    try:
+        conn = get_db()
+        row = _quill_project_row(conn, uid, pid)
+        if not row:
+            return jsonify({"error": "Saved paper not found in this account."}), 404
+        if not row[0]:
+            return jsonify({"error": "This paper is no longer merged. Merge it again before editing."}), 409
+        # Store as the same rich-HTML format already consumed by the dashboard/export code.
+        clean = sanitize_rich_html(incoming)
+        plain = content_plain_text(clean)
+        if not plain and not re.search(r"<img\b|<table\b", clean, re.I):
+            return jsonify({"error": "The document appears to be empty."}), 400
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE paper_projects
+                   SET merged=TRUE, merged_content=%s, updated_at=CURRENT_TIMESTAMP
+                   WHERE id=%s AND user_id=%s""",
+                (clean, int(pid), int(uid)),
+            )
+        conn.commit()
+        return jsonify({
+            "message": "Your complete paper has been saved.",
+            "saved": True,
+            "word_count": len(plain.split()),
+        }), 200
+    except Exception:
+        _safe_rollback(conn)
+        logger.exception("Quill document save failed")
+        return jsonify({"error": "Could not save the complete paper. Your previous saved version is unchanged."}), 500
+    finally:
+        if conn:
+            release_db(conn)
+
 
 
 if __name__ == "__main__":
